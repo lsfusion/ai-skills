@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "lsfusion-ai": {
+      "type": "http",
+      "url": "https://ai.lsfusion.org/mcp"
+    }
+  }
+}

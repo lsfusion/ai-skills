@@ -1,0 +1,10 @@
+# Python caches from skill scripts
+__pycache__/
+*.pyc
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

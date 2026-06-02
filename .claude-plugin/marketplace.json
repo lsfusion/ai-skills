@@ -1,0 +1,18 @@
+{
+  "name": "lsfusion",
+  "owner": {
+    "name": "lsFusion",
+    "url": "https://github.com/lsfusion"
+  },
+  "metadata": {
+    "description": "lsFusion AI assistant skills and MCP integration",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "lsfusion-ai-skills",
+      "source": "./",
+      "description": "Skills for developing, deploying, and evaluating lsFusion apps, plus the ai.lsfusion.org MCP server."
+    }
+  ]
+}
