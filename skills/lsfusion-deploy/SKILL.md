@@ -5,6 +5,24 @@ description: Deploy an lsFusion application to a remote Linux server (Ubuntu/Deb
 
 # lsFusion remote deploy
 
+> **Companion MCP server — `lsfusion-ai`.** This skill is paired with the
+> [`ai.lsfusion.org`](https://ai.lsfusion.org/mcp) MCP server (registered under the
+> name `lsfusion-ai` by the `lsfusion-ai-skills` plugin). Prefer its tools over
+> guessing lsFusion syntax or behaviour:
+>
+> - **`mcp__lsfusion-ai__lsfusion_get_guidance`** — call this **first**, at the start
+>   of any lsFusion task, if its guidance isn't already in context, and then follow
+>   every rule it returns.
+> - **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** — semantic search over the official
+>   docs (`language` / `paradigm` / `how-to` / `brief` / `rules`); use it to confirm
+>   syntax, operators, and concepts instead of guessing.
+> - **`mcp__lsfusion-ai__lsfusion_report_feedback`** — submit a docs/behaviour feedback
+>   signal, but **only after the user explicitly consents**, and never send source
+>   code, file paths, or schema/customer names.
+>
+> If these tools aren't available the server isn't installed — see the
+> [ai-skills README](https://github.com/lsfusion/ai-skills#readme) to add it.
+
 This skill takes an lsFusion configuration — whether a Maven project from GitHub or `.lsf` files written from scratch — and gets it serving on a remote Linux server managed by systemd, talking to a real PostgreSQL.
 
 ## Before you start: switch to accept-edits mode

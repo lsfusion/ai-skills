@@ -14,6 +14,24 @@ description: >-
 
 # lsFusion development
 
+> **Companion MCP server — `lsfusion-ai`.** This skill is paired with the
+> [`ai.lsfusion.org`](https://ai.lsfusion.org/mcp) MCP server (registered under the
+> name `lsfusion-ai` by the `lsfusion-ai-skills` plugin). Prefer its tools over
+> guessing lsFusion syntax or behaviour:
+>
+> - **`mcp__lsfusion-ai__lsfusion_get_guidance`** — call this **first**, at the start
+>   of any lsFusion task, if its guidance isn't already in context, and then follow
+>   every rule it returns.
+> - **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** — semantic search over the official
+>   docs (`language` / `paradigm` / `how-to` / `brief` / `rules`); use it to confirm
+>   syntax, operators, and concepts instead of guessing.
+> - **`mcp__lsfusion-ai__lsfusion_report_feedback`** — submit a docs/behaviour feedback
+>   signal, but **only after the user explicitly consents**, and never send source
+>   code, file paths, or schema/customer names.
+>
+> If these tools aren't available the server isn't installed — see the
+> [ai-skills README](https://github.com/lsfusion/ai-skills#readme) to add it.
+
 This skill turns the current folder into a runnable lsFusion project: it checks
 the environment, downloads the platform binaries, scaffolds the project,
 launches the server, monitors startup, and verifies the result in a headless
