@@ -24,6 +24,7 @@ param(
     [string]$TopModule = "",
     [string]$Url = "",
     [string]$Script = "",
+    [string]$ScriptFile = "",
     [int]$RmiPort = 7652,
     [int]$HttpPort = 7651,
     [int]$WebPort = 8080,
@@ -40,6 +41,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+
+# Emit UTF-8 on stdout so non-ASCII output (Action API responses, log tails with
+# Cyrillic, etc.) survives. Without this, Write-Host re-encodes strings to the
+# console's OEM code page and turns every non-ASCII character into '?' — even
+# when the underlying data and the .NET string are perfectly correct.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 # Parameters the caller actually passed (captured at script scope for nested use).
 $ScriptBound = $PSBoundParameters
@@ -1253,20 +1260,41 @@ function Cmd-Verify {
 function Cmd-Api {
     Head "Action API call"
     $cfg = Get-ConfigOrFail
-    if (-not $Script) { throw "Provide lsFusion action code via -Script (uses the EVAL ACTION endpoint)." }
+
+    # Resolve the script text. -ScriptFile is the robust channel for any script
+    # containing non-ASCII characters (Cyrillic, etc.): it is read straight from
+    # disk as UTF-8, so the text never crosses the bash -> PowerShell argv
+    # boundary where the Windows ANSI code page would mangle it into '?'.
+    if ($ScriptFile) {
+        if (-not (Test-Path $ScriptFile)) { throw "ScriptFile not found: $ScriptFile" }
+        $scriptText = Get-Content -Raw -Encoding UTF8 $ScriptFile
+    } elseif ($Script) {
+        $scriptText = $Script
+    } else {
+        throw "Provide lsFusion action code via -Script `"<code>`" or -ScriptFile `"<path>`" (uses the EVAL ACTION endpoint). For any non-ASCII text prefer -ScriptFile, which is read as UTF-8 from disk."
+    }
+
     $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($cfg.adminUser):$($cfg.adminPassword)"))
-    $enc = [uri]::EscapeDataString($Script)
+    # The script travels as a percent-encoded query parameter (NOT a POST form
+    # body): EscapeDataString emits the UTF-8 bytes as %XX, which the server
+    # decodes as UTF-8 reliably. A raw form body is decoded with the server's
+    # default charset and corrupts every non-ASCII character to '?'.
+    $enc = [uri]::EscapeDataString($scriptText)
     $uri = "http://localhost:$($cfg.httpPort)/eval/action?script=$enc"
     Info "POST $uri"
     try {
         $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers @{ Authorization = "Basic $auth" } `
             -UseBasicParsing -TimeoutSec 30
         Ok "HTTP $($resp.StatusCode)"
-        Write-Host $resp.Content
+        # Decode the response body explicitly as UTF-8 so non-ASCII output
+        # (e.g. EXPORT FROM with Cyrillic values) prints correctly.
+        $bytes = $resp.RawContentStream.ToArray()
+        if ($bytes.Length) { Write-Host ([System.Text.Encoding]::UTF8.GetString($bytes)) }
+        else { Write-Host $resp.Content }
     } catch {
         Bad "API call failed: $($_.Exception.Message)"
         if ($_.Exception.Response) {
-            $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream(), [System.Text.Encoding]::UTF8)
             Write-Host $sr.ReadToEnd()
         }
     }
@@ -1360,7 +1388,8 @@ lsfdev.ps1 - lsFusion development CLI
   log            Print the server log tail and a verdict.
   verify         Playwright (headless Chromium) screenshot + DOM dump of the web UI.
   open           Open the web UI in the default browser.
-  api            Call the Action API (-Script "<lsFusion action code>").
+  api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
+                 Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
   versions       List lsFusion versions on download.lsfusion.org and aliases.
 
 Common options:
@@ -1377,6 +1406,9 @@ Common options:
   -ShutdownPort <port>  Tomcat shutdown port (default 8005).
   -Timeout <seconds>    Startup wait (default 180).
   -Url <url>            Target URL for 'verify'.
+  -Script <code>        Inline lsFusion action code for 'api' (ASCII-safe only).
+  -ScriptFile <path>    UTF-8 file with lsFusion action code for 'api'. Preferred
+                        for non-ASCII scripts (read from disk, never via argv).
   -GitUrl <url>         Repository URL for 'clone'.
   -Target <dir>         Destination directory for 'clone' (default: subfolder named from the URL).
   -Branch <name>        Branch to check out for 'clone' (default: the repo's default branch).
