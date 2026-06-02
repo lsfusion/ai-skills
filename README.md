@@ -24,7 +24,7 @@ ai-skills/
     └── lsfusion-eval/
 ```
 
-## Install in Claude Code (one command)
+## Install in Claude Code (interactive)
 
 ```
 /plugin marketplace add lsfusion/ai-skills
@@ -35,12 +35,42 @@ This installs all three skills **and** registers the `lsfusion-ai` MCP server
 (`https://ai.lsfusion.org/mcp`). On first use Claude Code may prompt you to authenticate
 with the server.
 
+## Install when `/plugin` is unavailable (CLI)
+
+Some environments (embedded clients, Cowork, etc.) don't expose the interactive
+`/plugin` command — you'll see *"/plugin isn't available in this environment."* The
+`claude` CLI does exactly the same thing non-interactively:
+
+```bash
+claude plugin marketplace add lsfusion/ai-skills
+claude plugin install lsfusion-ai-skills@lsfusion
+```
+
+Verify and manage:
+
+```bash
+claude plugin list                                  # confirm it's enabled
+claude plugin details lsfusion-ai-skills@lsfusion   # show skills + MCP inventory
+claude plugin marketplace update lsfusion           # pull the latest commit later
+```
+
+Uninstall / remove:
+
+```bash
+claude plugin uninstall lsfusion-ai-skills@lsfusion
+claude plugin marketplace remove lsfusion
+```
+
+Skills and the `lsfusion-ai` MCP server become available in **new** Claude Code
+sessions (the MCP server may prompt for authentication on first use).
+
 ## Use the skills without the plugin
 
 The `skills/` folder follows the open Agent Skills format, so it works anywhere:
 
 - **Claude Code (manual):** copy a skill folder into `~/.claude/skills/` (global) or
-  `.claude/skills/` (per project).
+  `.claude/skills/` (per project). Add the MCP server separately with
+  `claude mcp add --transport http lsfusion-ai https://ai.lsfusion.org/mcp`.
 - **Claude.ai / Claude Desktop:** zip a skill folder and upload it under
   Settings → Capabilities → Skills.
 - **Claude API / Agent SDK:** mount the skill folder into the agent's working directory.
