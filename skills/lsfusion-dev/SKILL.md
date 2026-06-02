@@ -455,6 +455,19 @@ every 10–20 s — don't `-Timeout 600` and walk away. If a real long sync
 is genuinely in progress, the log keeps printing real work and you can
 extend the wait deliberately.
 
+**Run `start`/`restart` in the foreground — don't pipe it through `tail` or
+other filters.** `start-server` already polls the log itself and returns the
+moment it prints a verdict (started / failed / inconclusive) — usually 10–40 s
+on a lightstart restart — so the command's own stdout is your signal; it does
+**not** block for the full `-Timeout`. Wrapping the invocation in a pipe
+(`… | tail`) or attaching a very long timeout can make the agent's shell tool
+classify the command as long-running and **run it in the background**. You then
+sit waiting for a task-completion notification and polling `status` in a loop —
+pure dead time the command never needed. Let it run in the foreground and read
+the verdict it prints. If you really do want to background a long first-time
+sync, do it deliberately (the shell tool's `run_in_background`), not as an
+accidental side effect of a pipe.
+
 **Refresh PostgreSQL statistics after a first start or a big schema change —
 call `analyzeDBAction()`.** lsFusion emits large, join-heavy SQL. On a
 freshly-loaded dev DB — or after a sync that created/changed many tables —
