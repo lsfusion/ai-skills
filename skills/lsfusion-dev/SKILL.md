@@ -81,6 +81,17 @@ it with a bypassed execution policy so it runs regardless of system settings:
 powershell -ExecutionPolicy Bypass -File .claude/skills/lsfusion-dev/scripts/lsfdev.ps1 <command> [options]
 ```
 
+**Resolve the real script path first — it is often not `.claude/skills/…`.**
+The path above holds only for a project-local skill copy. When `lsfusion-dev`
+is installed as a **plugin** (the usual case), `lsfdev.ps1` lives under the
+plugin cache instead, e.g.
+`C:\Users\<user>\.claude\plugins\cache\lsfusion\lsfusion-ai-skills\<ver>\skills\lsfusion-dev\scripts\lsfdev.ps1`.
+Invoking the relative `.claude/skills/...` path there fails with *"The argument
+… does not exist"* (exit 127). This `SKILL.md` file's own directory is the
+skill root: take the absolute path of the `scripts/lsfdev.ps1` next to it and
+use that (quoted) in every invocation. The examples below keep writing the
+short relative form for brevity — substitute your resolved absolute path.
+
 `-ExecutionPolicy Bypass` is **required** on a default Windows install: without
 it PowerShell refuses to load unsigned `.ps1` files with
 `UnauthorizedAccess: running scripts is disabled on this system`. The flag
@@ -152,13 +163,13 @@ with and stay consistent within the project.
 | `log` | Print the tail of the server log and flag errors. |
 | `verify` | Headless-Chrome screenshot + DOM dump of the web UI into `.lsfusion-dev/`. |
 | `open` | Open the web UI in the user's default browser. |
-| `api` | Call the HTTP Action API (advanced verification — see workflow.md). |
+| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding — see workflow.md). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
 Key options: `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
 (`stable` — default; `dev`/`snapshot`; a major-version alias; or an exact
 tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
-`-WebPort`, `-ShutdownPort`, `-FullStart`, `-Url`, `-Script`, `-Timeout`. Run
-the script with no command to print full usage.
+`-WebPort`, `-ShutdownPort`, `-FullStart`, `-Url`, `-Script`, `-ScriptFile`,
+`-Timeout`. Run the script with no command to print full usage.
 
 If port `8080` is taken (e.g. another Tomcat), pass `setup -WebPort <free port>`
 — the skill rewrites Tomcat's `server.xml` accordingly, and every later command
@@ -456,18 +467,38 @@ server's own connection. This is *not* the same as lsFusion's
 `Recalculating stats and materializations at the first start` log line —
 that fills the platform's **internal optimizer** stat tables, which is
 separate. Once the log shows `Server has successfully started`, call it once
-over the lsfusion-eval endpoint (devmode → no `-u`):
+through the skill's `api` command (devmode auto-authenticates):
 
-```bash
-curl -sS -X POST -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
-  --data-urlencode "script=analyzeDBAction();" \
-  http://localhost:7651/eval/action
+```
+lsfdev.ps1 api -Script "analyzeDBAction();"
 ```
 
 Calling the action (rather than raw `psql`) works uniformly with no psql
 client on PATH and no DB credentials to dig out. Skip it for ordinary
 edit→restart cycles; it only matters after the first full schema load or a
 sync that touched many tables.
+
+> **UTF-8 / non-ASCII pitfall — read before sending Cyrillic (or any
+> non-ASCII) through the Action API.** The `api` command sends the script as a
+> **percent-encoded query parameter**, which the server decodes as UTF-8
+> reliably. Do **not** hand-roll a raw `curl --data-urlencode "script=…"`
+> against `/eval/action` for a script that contains non-ASCII text: a POST
+> **form body** is decoded with the server's default charset and silently
+> turns every non-ASCII character into `?` (you get rows full of `?????` while
+> the `.lsf` captions — read from disk as UTF-8 — still look fine, which makes
+> it look like an app bug rather than a transport bug). For ASCII-only scripts
+> (like `analyzeDBAction()`) either channel works; for anything with national
+> characters, always use the `api` command. And because an **inline** `-Script`
+> value still crosses the bash → PowerShell argv boundary (Windows ANSI code
+> page), put any non-ASCII script in a UTF-8 file and pass `-ScriptFile`:
+>
+> ```
+> lsfdev.ps1 api -ScriptFile "C:/Work/proj/.lsfusion-dev/seed.lsf"
+> ```
+>
+> `-ScriptFile` is read straight from disk as UTF-8, so the text never goes
+> through argv at all — this is the robust way to seed test data with names,
+> addresses, or any localized strings.
 
 **Restart only for schema changes. For runtime data operations, use
 lsfusion-eval — do NOT create a module and restart.** A `restart`
@@ -529,11 +560,14 @@ checking the unit-test output.
    debugging the wrong layer if you start with screenshots.
 
 2. **HTTP Action API.** Once the log is clean, run an lsFusion expression
-   via the **lsfusion-eval** skill — `curl` against `/eval/action`. The
-   server resolves names, types, and security exactly as the app would,
-   so a clean response proves your new class / property / form really
-   exists in the running schema. Cheap, scriptable, exact — and tells
-   you semantic truth without rendering.
+   over `/eval/action` — via `lsfdev.ps1 api` (or the **lsfusion-eval**
+   skill). The server resolves names, types, and security exactly as the
+   app would, so a clean response proves your new class / property / form
+   really exists in the running schema. Cheap, scriptable, exact — and
+   tells you semantic truth without rendering. If the response or the
+   script carries non-ASCII text, see the **UTF-8 / non-ASCII pitfall**
+   note in step 4 (use the `api` command / `-ScriptFile`, not a raw `curl`
+   POST body).
 
 3. **UI, last.** When log + API agree the build is healthy, run
    `verify`. It drives **Playwright** (headless Chromium) to:
