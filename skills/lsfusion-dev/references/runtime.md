@@ -93,6 +93,17 @@ the navigator with no login form, both in the user's browser and in headless
 `verify` runs. Outside devmode the default credentials (`admin` / empty
 password) apply and the login form is rendered as usual.
 
+Devmode auth has one trap that drives how the `api` command talks to the
+Action API: devmode grants access **only to a request that carries no
+`Authorization` header at all** (it treats it as the anonymous user). A request
+that *does* send Basic auth for `admin` with an **empty** password makes the
+server run a real credential check and reject it with **HTTP 401**. So the
+`api` command sends **no** `Authorization` header unless a non-empty admin
+password is configured (`-AdminPassword` at setup, or stored in
+`config.json`); with the default blank password it calls anonymously. This is
+the same rule the **lsfusion-eval** skill documents: devmode → no `-u`;
+password set / rotated → `-u admin:<password>`.
+
 The three `-Ddb.denyDrop{Modules,Tables,Properties}=false` flags let the
 schema sync remove modules, tables, and columns that disappear between
 runs (REQUIRE-graph changes, platform upgrades that ship a different
@@ -162,6 +173,7 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | Web UI loads but shows a connection error | The application server is not running or not on `7652`. Check `lsfdev.ps1 status` and the server log. |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
+| `api` returns **HTTP 401 Unauthorized** | A credentialed request hit the devmode server. Devmode only accepts requests with **no** `Authorization` header (anonymous); `admin` with an empty password is rejected. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
 
 ## Changing the lsFusion version
 

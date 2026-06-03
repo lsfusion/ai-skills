@@ -1274,7 +1274,25 @@ function Cmd-Api {
         throw "Provide lsFusion action code via -Script `"<code>`" or -ScriptFile `"<path>`" (uses the EVAL ACTION endpoint). For any non-ASCII text prefer -ScriptFile, which is read as UTF-8 from disk."
     }
 
-    $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($cfg.adminUser):$($cfg.adminPassword)"))
+    # Authentication. The local dev server is ALWAYS launched in devmode (see
+    # Cmd-StartServer), and devmode lets a request with NO Authorization header
+    # through as the anonymous user. Sending Basic auth for 'admin' with an
+    # EMPTY password makes the server run a real credential check and reject it
+    # with HTTP 401 — so we attach the header ONLY when a non-empty password is
+    # actually configured (admin password rotated, or a real account set up).
+    # With the default empty password we omit the header entirely and ride
+    # devmode's anonymous access. An explicitly-passed -AdminUser/-AdminPassword
+    # on the 'api' call overrides whatever setup stored in config.json.
+    $apiUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
+    $apiPass = if ($ScriptBound.ContainsKey("AdminPassword")) { $AdminPassword } else { $cfg.adminPassword }
+    $headers = @{}
+    if ($apiPass) {
+        $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($apiUser):$($apiPass)"))
+        $headers["Authorization"] = "Basic $auth"
+        Info "Authenticating as '$apiUser' (password configured)."
+    } else {
+        Info "Calling anonymously (devmode) - no admin password set; sending 'admin' with an empty password would 401."
+    }
     # The script travels as a percent-encoded query parameter (NOT a POST form
     # body): EscapeDataString emits the UTF-8 bytes as %XX, which the server
     # decodes as UTF-8 reliably. A raw form body is decoded with the server's
@@ -1283,7 +1301,7 @@ function Cmd-Api {
     $uri = "http://localhost:$($cfg.httpPort)/eval/action?script=$enc"
     Info "POST $uri"
     try {
-        $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers @{ Authorization = "Basic $auth" } `
+        $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
             -UseBasicParsing -TimeoutSec 30
         Ok "HTTP $($resp.StatusCode)"
         # Decode the response body explicitly as UTF-8 so non-ASCII output
