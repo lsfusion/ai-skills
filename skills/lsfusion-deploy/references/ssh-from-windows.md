@@ -72,6 +72,41 @@ ssh root@<host> 'cat /tmp/newkey.pub >> ~/.ssh/authorized_keys && rm /tmp/newkey
 
 `scp` is binary — no line-ending mangling. After this, verify with `cat -A` as shown above; lines should end in `$` not `^M$`.
 
+<a name="trap-3"></a>
+
+### Trap 3: non-ASCII (Cyrillic / CJK / accents) in a native command's arguments → `?`
+
+Git Bash (MSYS2) is UTF-8 internally, but when it launches a **native Windows executable** — and the bundled `curl` is one (`/mingw64/bin/curl`, a `w64-mingw32` build; so is System32 `curl.exe`) — it re-encodes the command-line arguments to the Windows **ANSI codepage** (e.g. CP1252). Any character that codepage can't represent (all Cyrillic, CJK, many accents) becomes a literal `?` (0x3F) **before the program even runs**. This bites hardest when seeding data through the Action API:
+
+```bash
+# BAD: the literal 'Проверка' is mangled to '????????' at the argv boundary;
+# curl percent-encodes the '?', the server stores '?'. Nothing is wrong server-side.
+curl -G --data-urlencode "script=NEWSESSION{ NEW u=Unit{ name(u)<-'Проверка'; } APPLY; }" "$URL"
+```
+
+It really is the argv boundary, not the shell or the server: MSYS-internal tools keep the bytes (`printf '%s' 'Проверка' | od -An -tx1` → `d0 9f d1 80 …`, correct UTF-8), and the *same* word sent from a file or from PowerShell stores correctly on the *same* server.
+
+**Workarounds (either one):**
+
+- Put the payload in a **file** and let curl read it with `@` — `@file` streams bytes directly, never through argv:
+
+  ```bash
+  # printf is MSYS-internal, so it keeps UTF-8 when writing the file
+  printf '%s' "NEWSESSION{ NEW u=Unit{ name(u)<-'Проверка'; } APPLY; }" > /tmp/s.lsf
+  curl -G --data-urlencode "script@/tmp/s.lsf" "$URL"
+  ```
+
+- Or send from **PowerShell**, which stays in .NET/UTF-16 and never crosses an ANSI argv boundary:
+
+  ```powershell
+  $s   = Get-Content -Raw -Encoding UTF8 .\script.lsf
+  $enc = [uri]::EscapeDataString($s)
+  $hdr = @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('admin:')) }
+  Invoke-WebRequest -Uri "$URL`?script=$enc" -Method Post -Headers $hdr -UseBasicParsing
+  ```
+
+Send the script in the **query string** (Tomcat decodes it as UTF-8), not the POST **body** (the servlet form-decodes the body as ISO-8859-1 → corruption). Large scripts can exceed the connector's `maxHttpHeaderSize` (8 KB default) → raise it on the SSL connector if you hit `Request header is too large`.
+
 ## First-time key install via SSH_ASKPASS
 
 You have `<host>`, `<user>`, password. Goal: get an ed25519 key onto the server's `authorized_keys` so all subsequent ssh/scp/rsync work non-interactively from tool calls.

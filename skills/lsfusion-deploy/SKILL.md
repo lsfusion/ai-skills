@@ -144,7 +144,7 @@ ssh root@<host> "nohup bash -c 'curl -s https://download.lsfusion.org/dnf/instal
 
 **Detecting completion: don't watch stdout, watch artifacts.** Neither `install-lsfusion6` nor `update-lsfusion6` writes a terminating "done" / "complete" / "finished" line. The last stdout lines are whatever apt's `dpkg --configure --pending` happened to print last — usually unrelated chatter like "No containers need to be restarted" — so any watcher that does `tail | grep -E "complete|finished"` will hang forever even though the script exited cleanly. Three reliable completion signals, pick whichever fits the situation:
 
-- **Process gone.** Match the lsFusion *orchestrator script* only — `pgrep -af 'install-lsfusion6'` (install) or `pgrep -af 'update-lsfusion6|wget'` (update). **Do NOT put generic `apt-get` / `dpkg` / `unattended-upgr` in this check.** Ubuntu runs apt and dpkg on its own daily timers (`apt-daily`, `unattended-upgrades`), so `pgrep apt-get|dpkg` routinely matches unrelated background activity and reports **"busy" forever even after the lsFusion install/update has already finished**. (Observed on Ubuntu 26.04: an update-poll gated on `apt-get|dpkg` going idle never exited, although the new platform was up and both services were `active` — see the apt-timer gotcha below.)
+- **Process gone.** Match the lsFusion *orchestrator script* only — `pgrep -af '[i]nstall-lsfusion6'` (install) or `pgrep -af '[u]pdate-lsfusion6|[w]get'` (update). **The bracket — `[i]nstall` not `install` — is mandatory, not cosmetic** (see the self-match gotcha below). **Do NOT put generic `apt-get` / `dpkg` / `unattended-upgr` in this check.** Ubuntu runs apt and dpkg on its own daily timers (`apt-daily`, `unattended-upgrades`), so `pgrep apt-get|dpkg` routinely matches unrelated background activity and reports **"busy" forever even after the lsFusion install/update has already finished**. (Observed on Ubuntu 26.04: an update-poll gated on `apt-get|dpkg` going idle never exited, although the new platform was up and both services were `active` — see the apt-timer gotcha below.)
 - **Package installed** (for install only). `dpkg -l | grep '^ii.*lsfusion6-server'` matches.
 - **Service back up after the swap** (for update only). Snapshot `grep "Server has successfully started" /var/log/lsfusion6-server/stdout.log | wc -l` BEFORE the upgrade, then wait until that count goes up — this is the **only** signal that the new platform jar actually started, not just landed on disk.
 
@@ -152,7 +152,7 @@ ssh root@<host> "nohup bash -c 'curl -s https://download.lsfusion.org/dnf/instal
 
 ```bash
 # install:  until the package is configured AND the installer script has exited
-until ! pgrep -f 'install-lsfusion6' >/dev/null && dpkg -l 2>/dev/null | grep -q '^ii.*lsfusion6-server'; do sleep 15; done
+until ! pgrep -f '[i]nstall-lsfusion6' >/dev/null && dpkg -l 2>/dev/null | grep -q '^ii.*lsfusion6-server'; do sleep 15; done
 # update:   until the success-count rose past baseline AND both units are active
 until [ "$(grep 'Server has successfully started' "$LOG" | wc -l)" -gt "$BASE" ] \
       && systemctl is-active lsfusion6-server lsfusion6-client >/dev/null; do sleep 15; done
@@ -160,7 +160,9 @@ until [ "$(grep 'Server has successfully started' "$LOG" | wc -l)" -gt "$BASE" ]
 
 Don't add a stdout-grep clause "for safety" — it doesn't add safety, it just prevents the loop from ever exiting.
 
-> **Gotcha — apt/dpkg run on OS timers, so "apt is idle" is not a completion signal.** On Ubuntu the `apt-daily.timer` / `unattended-upgrades` services fire `apt-get`/`dpkg` independently of your install. Any poll that treats `pgrep apt-get|dpkg` as "still working" can hang indefinitely on that background noise. Watch the lsFusion-specific artifact (package `ii` / success-count / service `active`), and if you must check a process, match `install-lsfusion6` / `update-lsfusion6` (and `wget` for the update's jar/war download), never bare `apt-get`/`dpkg`.
+> **Gotcha — apt/dpkg run on OS timers, so "apt is idle" is not a completion signal.** On Ubuntu the `apt-daily.timer` / `unattended-upgrades` services fire `apt-get`/`dpkg` independently of your install. Any poll that treats `pgrep apt-get|dpkg` as "still working" can hang indefinitely on that background noise. Watch the lsFusion-specific artifact (package `ii` / success-count / service `active`), and if you must check a process, match `[i]nstall-lsfusion6` / `[u]pdate-lsfusion6` (and `[w]get` for the update's jar/war download), never bare `apt-get`/`dpkg`.
+
+> **Gotcha — `pgrep` self-match: bracket the pattern or the poll never exits.** These checks run over SSH, so the command bash executes on the remote is literally `bash -c "… pgrep -af 'install-lsfusion6' …"` — a process whose *own command line contains the search string*. `pgrep -f` scans full command lines, so it matches the watcher itself → always ≥1 hit → a `! pgrep …` completion test is **always false** and the loop spins forever, even though the real installer exited minutes ago. (Observed on Ubuntu 26.04: `pgrep -af install-lsfusion6` returned a single line that *was the poll command itself*, PID and all.) Fix: bracket the first character — `pgrep -af '[i]nstall-lsfusion6'`. The regex `[i]nstall…` still matches the real `install-lsfusion6` process, but the watcher's own command line now holds the literal text `[i]nstall…` (where `i` is followed by `]`, not `n`), so it no longer matches itself. Same trick for `[u]pdate-lsfusion6` / `[w]get`. This is the deeper reason the **artifact** (package `ii` / success-count / service `active`) is the primary completion signal and the process check is only a secondary AND.
 
 > **Gotcha — counting log lines: use `grep | wc -l`, never `grep -c … || echo 0`.** `grep -c` on a file with **zero** matches both **prints `0` to stdout AND returns exit-status 1**. The "obvious" defensive form `$(grep -c PAT file 2>/dev/null || echo 0)` therefore appends a *second* `0` (so the variable becomes the string `"00"`, or worse, `"0\n0"` depending on how it's captured) and any `[ "$VAR" -gt "$BASE" ]` comparison below either evaluates wrong or errors out with "integer expression expected". This bites the success-line baseline pattern that this skill uses everywhere ("snapshot count BEFORE upgrade, wait for it to go up"). Always:
 >
@@ -180,11 +182,11 @@ ssh root@<host> "nohup bash -c 'curl -s https://download.lsfusion.org/apt/instal
 # 2. Local watcher — call as Bash(run_in_background=true). Each iteration prints
 #    one status line that Monitor surfaces as a separate event.
 while sleep 20; do
-    ssh -o BatchMode=yes root@<host> "tail -1 /tmp/install.log; printf 'pkg=%s ' \"\$(dpkg -l 2>/dev/null | grep -c '^ii.*lsfusion6-server')\"; pgrep -af 'install-lsfusion6' >/dev/null && echo running || echo idle"
+    ssh -o BatchMode=yes root@<host> "tail -1 /tmp/install.log; printf 'pkg=%s ' \"\$(dpkg -l 2>/dev/null | grep -c '^ii.*lsfusion6-server')\"; pgrep -af '[i]nstall-lsfusion6' >/dev/null && echo running || echo idle"
     # DONE = artifact present AND installer script gone. Note: match ONLY
-    # 'install-lsfusion6', never 'apt-get|dpkg' — Ubuntu's apt timers run those
+    # '[i]nstall-lsfusion6', never 'apt-get|dpkg' — Ubuntu's apt timers run those
     # on their own and would keep the loop "busy" forever (see apt-timer gotcha).
-    ssh -o BatchMode=yes root@<host> "! pgrep -af 'install-lsfusion6' >/dev/null && dpkg -l 2>/dev/null | grep -q '^ii.*lsfusion6-server'" && { echo DONE; break; }
+    ssh -o BatchMode=yes root@<host> "! pgrep -af '[i]nstall-lsfusion6' >/dev/null && dpkg -l 2>/dev/null | grep -q '^ii.*lsfusion6-server'" && { echo DONE; break; }
 done
 
 # 3. Monitor that background task. The until-clause re-invokes you when the
@@ -556,7 +558,7 @@ Three possible outcomes:
 
 - **`STARTED`** → run the external check below.
 - **`SERVICE DIED`** → read `stderr.log`; see [Troubleshooting](#troubleshooting).
-- **Timeout** (loop ran out) → JVM is still alive but not done. Either it's a huge config still working (raise the loop count and wait more), or stuck in a retry loop (read `stdout.log`).
+- **Timeout** (loop ran out) → JVM is still alive but not done. Causes, in order of likelihood on a fresh box: (a) **PostgreSQL JIT thrashing** — on a stats-less fresh DB the first-start recalc plans are wildly mis-costed, so PG fires LLVM JIT compilation that burns ~60 s **per query**; `stdout.log` sits for minutes on one step (often `Synchronizing property draws`) while `pg_stat_activity` shows a single `active` `INSERT … SELECT` and `systemctl is-active` is still `active`. Fix in the JIT callout below. (b) a genuinely huge config still working — raise the loop count and wait. (c) stuck in a retry loop — read `stdout.log`.
 
 When sending the heredoc through PowerShell on Windows, **base64-encode it first** to dodge the PowerShell 5.1 BOM bug — see [references/ssh-from-windows.md](references/ssh-from-windows.md#bom-workaround).
 
@@ -595,6 +597,38 @@ curl -sS -u 'admin:' -X POST -H 'Content-Type: application/x-www-form-urlencoded
 ```
 
 This is **not** the same as lsFusion's own `Recalculating stats and materializations at the first start` log line — that fills the platform's internal optimizer stat tables, which is separate from PostgreSQL's `ANALYZE`. Prefer the action over raw `psql` (no DB creds, no shell into PostgreSQL, works the same locally and remotely). Run it after the **first** deploy and after any deploy that adds/removes many classes/properties; for steady-state redeploys that only change resources (JS/CSS) or a handful of properties it's unnecessary.
+
+### If the first start itself HANGS for minutes — PostgreSQL JIT on a stats-less DB
+
+`analyzeDBAction()` fixes slowness *after* startup, but the **first** startup can hang *before* you can call it. On a brand-new DB with no planner statistics, the platform's first-start materialization recalc (`INSERT INTO t_N … SELECT …` with correlated subqueries) gets grossly mis-estimated costs, and PostgreSQL — **JIT on by default since PG11** — then spends roughly **60 s of LLVM compilation per query**. Symptoms: `stdout.log` frozen for minutes on a single step (typically `Synchronizing property draws`), `systemctl is-active lsfusion6-server` still `active` (not died), and `pg_stat_activity` showing one long `active` `INSERT … SELECT` with **no lock wait**. On a small config that is pure JIT overhead, not real work — diagnose with:
+
+```bash
+ssh root@<host> "sudo -u postgres psql -d lsfusion -P pager=off -c \"SELECT pid,state,wait_event_type,round(extract(epoch from(now()-query_start))) AS dur_s,left(query,60) FROM pg_stat_activity WHERE datname='lsfusion' AND state='active' AND pid<>pg_backend_pid();\""
+```
+
+Fix — turn JIT off (and give the planner SSD-appropriate costs); the setting is read on the next plan, so restart the server to re-run the recalc fast:
+
+```bash
+ssh root@<host> 'bash -s' <<'EOS'
+sudo -u postgres psql -q -c "ALTER SYSTEM SET jit = off;"
+sudo -u postgres psql -q -c "ALTER SYSTEM SET random_page_cost = 1.1;"   # SSD; the default 4 assumes a spinning disk
+sudo -u postgres psql -q -c "SELECT pg_reload_conf();"
+systemctl restart lsfusion6-server
+EOS
+```
+
+Observed on a 1-core VM: `Synchronizing property draws` took **363 s** with JIT on vs **0.4 s** with it off. `jit = off` is a safe, permanent setting for the large generated SQL lsFusion emits. **If the DB is disposable** (fresh install, nothing seeded yet), the cleanest reset is to nuke it so the first sync is a clean create — no leftover bare-platform tables to drop+recalc — which on its own avoids most of the recalc churn:
+
+```bash
+ssh root@<host> 'bash -s' <<'EOS'
+systemctl stop lsfusion6-server
+sudo -u postgres dropdb --force lsfusion
+sudo -u postgres createdb -O postgres lsfusion
+systemctl start lsfusion6-server
+EOS
+```
+
+(Clean fresh DB + `jit=off` → started in ~27 s.)
 
 ### Lock the drop guards back to `true` once the deploy succeeded
 

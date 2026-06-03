@@ -263,6 +263,31 @@ ssh root@<host> 'systemctl daemon-reload && systemctl restart lsfusion6-server'
 
 Match heap to host RAM; leave at least 512 MB headroom for PostgreSQL and the OS.
 
+### 12. First start hangs for minutes — log frozen on a sync/recalc step, service still `active`
+
+**Cause:** PostgreSQL **JIT** compiling mis-estimated plans on a stats-less fresh DB — roughly 60 s of LLVM compilation **per** first-start materialization-recalc query. The log sits for minutes on one line (often `Synchronizing property draws`), `systemctl is-active` stays `active` (it didn't die), and `pg_stat_activity` shows a single long-running `active` `INSERT … SELECT` with no `Lock` wait.
+
+**Diagnostic:**
+
+```bash
+ssh root@<host> "sudo -u postgres psql -d lsfusion -P pager=off -c \"SELECT pid,state,wait_event_type,round(extract(epoch from(now()-query_start))) dur_s,left(query,60) FROM pg_stat_activity WHERE datname='lsfusion' AND state='active' AND pid<>pg_backend_pid();\""
+```
+
+**Fix:** disable JIT and set SSD-appropriate planner costs, then restart so the recalc re-runs fast:
+
+```bash
+ssh root@<host> 'sudo -u postgres psql -q -c "ALTER SYSTEM SET jit = off;"; sudo -u postgres psql -q -c "ALTER SYSTEM SET random_page_cost = 1.1;"; sudo -u postgres psql -q -c "SELECT pg_reload_conf();"; systemctl restart lsfusion6-server'
+```
+
+Observed: one step went **363 s → 0.4 s**. If the DB is disposable, `dropdb --force lsfusion; createdb -O postgres lsfusion` before the start is even cleaner (no leftover bare-platform tables to drop+recalc). `jit=off` is a safe permanent setting for lsFusion's large generated SQL.
+
+### 13. Stored / displayed text is `?` for every non-ASCII char (Cyrillic, accents, CJK)
+
+Two independent culprits — check both:
+
+- **Server side — JVM charset.** It derives from the service's `LANG`. A systemd service **does** inherit the system locale, so if `localectl` shows a `.UTF-8` locale (and the bundled JDK is 18+, where `file.encoding` is UTF-8 regardless) the server handles UTF-8 correctly. Only if the **system** locale is non-UTF-8 (`C`/`POSIX` → US-ASCII, `*.ISO-8859-1`, …) does the JVM get that charset and store `?`. Fix per [§1 locale](../SKILL.md#1-provision-a-fresh-server): set a `.UTF-8` system locale (or add `-Dfile.encoding=UTF-8` + a `LANG=…UTF-8` line to both `lsfusion.conf`s) and restart.
+- **Client side (Windows) — the more common cause when seeding via the Action API.** Passing non-ASCII as an **inline `curl` argument** from Git Bash corrupts it *before it leaves your machine*: Git Bash re-encodes argv to the Windows ANSI codepage when spawning the native `curl.exe`, so non-CP1252 characters become `?` — the server only ever receives `?`. Tell-tale: rows sent from **PowerShell** come back correct while rows sent via inline `curl` are `?`, on the *same* server. Fix: send the script from a **file** (`curl --data-urlencode "script@file.lsf"`, which bypasses argv) or from **PowerShell** (`[uri]::EscapeDataString(...)` into the `?script=` query). See [references/ssh-from-windows.md](ssh-from-windows.md#trap-3).
+
 ## Recovery checklist (deploy is broken, can't quickly fix)
 
 When you need the host back to a working state while you investigate locally:
