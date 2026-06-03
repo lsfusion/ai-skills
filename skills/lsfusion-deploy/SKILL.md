@@ -558,7 +558,7 @@ Three possible outcomes:
 
 - **`STARTED`** → run the external check below.
 - **`SERVICE DIED`** → read `stderr.log`; see [Troubleshooting](#troubleshooting).
-- **Timeout** (loop ran out) → JVM is still alive but not done. Causes, in order of likelihood on a fresh box: (a) **PostgreSQL JIT thrashing** — on a stats-less fresh DB the first-start recalc plans are wildly mis-costed, so PG fires LLVM JIT compilation that burns ~60 s **per query**; `stdout.log` sits for minutes on one step (often `Synchronizing property draws`) while `pg_stat_activity` shows a single `active` `INSERT … SELECT` and `systemctl is-active` is still `active`. Fix in the JIT callout below. (b) a genuinely huge config still working — raise the loop count and wait. (c) stuck in a retry loop — read `stdout.log`.
+- **Timeout** (loop ran out) → JVM is still alive but not done. Either it's a huge config still working (raise the loop count and wait more), or stuck in a retry loop (read `stdout.log`).
 
 When sending the heredoc through PowerShell on Windows, **base64-encode it first** to dodge the PowerShell 5.1 BOM bug — see [references/ssh-from-windows.md](references/ssh-from-windows.md#bom-workaround).
 
@@ -597,38 +597,6 @@ curl -sS -u 'admin:' -X POST -H 'Content-Type: application/x-www-form-urlencoded
 ```
 
 This is **not** the same as lsFusion's own `Recalculating stats and materializations at the first start` log line — that fills the platform's internal optimizer stat tables, which is separate from PostgreSQL's `ANALYZE`. Prefer the action over raw `psql` (no DB creds, no shell into PostgreSQL, works the same locally and remotely). Run it after the **first** deploy and after any deploy that adds/removes many classes/properties; for steady-state redeploys that only change resources (JS/CSS) or a handful of properties it's unnecessary.
-
-### If the first start itself HANGS for minutes — PostgreSQL JIT on a stats-less DB
-
-`analyzeDBAction()` fixes slowness *after* startup, but the **first** startup can hang *before* you can call it. On a brand-new DB with no planner statistics, the platform's first-start materialization recalc (`INSERT INTO t_N … SELECT …` with correlated subqueries) gets grossly mis-estimated costs, and PostgreSQL — **JIT on by default since PG11** — then spends roughly **60 s of LLVM compilation per query**. Symptoms: `stdout.log` frozen for minutes on a single step (typically `Synchronizing property draws`), `systemctl is-active lsfusion6-server` still `active` (not died), and `pg_stat_activity` showing one long `active` `INSERT … SELECT` with **no lock wait**. On a small config that is pure JIT overhead, not real work — diagnose with:
-
-```bash
-ssh root@<host> "sudo -u postgres psql -d lsfusion -P pager=off -c \"SELECT pid,state,wait_event_type,round(extract(epoch from(now()-query_start))) AS dur_s,left(query,60) FROM pg_stat_activity WHERE datname='lsfusion' AND state='active' AND pid<>pg_backend_pid();\""
-```
-
-Fix — turn JIT off (and give the planner SSD-appropriate costs); the setting is read on the next plan, so restart the server to re-run the recalc fast:
-
-```bash
-ssh root@<host> 'bash -s' <<'EOS'
-sudo -u postgres psql -q -c "ALTER SYSTEM SET jit = off;"
-sudo -u postgres psql -q -c "ALTER SYSTEM SET random_page_cost = 1.1;"   # SSD; the default 4 assumes a spinning disk
-sudo -u postgres psql -q -c "SELECT pg_reload_conf();"
-systemctl restart lsfusion6-server
-EOS
-```
-
-Observed on a 1-core VM: `Synchronizing property draws` took **363 s** with JIT on vs **0.4 s** with it off. `jit = off` is a safe, permanent setting for the large generated SQL lsFusion emits. **If the DB is disposable** (fresh install, nothing seeded yet), the cleanest reset is to nuke it so the first sync is a clean create — no leftover bare-platform tables to drop+recalc — which on its own avoids most of the recalc churn:
-
-```bash
-ssh root@<host> 'bash -s' <<'EOS'
-systemctl stop lsfusion6-server
-sudo -u postgres dropdb --force lsfusion
-sudo -u postgres createdb -O postgres lsfusion
-systemctl start lsfusion6-server
-EOS
-```
-
-(Clean fresh DB + `jit=off` → started in ~27 s.)
 
 ### Lock the drop guards back to `true` once the deploy succeeded
 

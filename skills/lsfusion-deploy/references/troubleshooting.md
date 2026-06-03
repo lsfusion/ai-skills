@@ -263,25 +263,7 @@ ssh root@<host> 'systemctl daemon-reload && systemctl restart lsfusion6-server'
 
 Match heap to host RAM; leave at least 512 MB headroom for PostgreSQL and the OS.
 
-### 12. First start hangs for minutes — log frozen on a sync/recalc step, service still `active`
-
-**Cause:** PostgreSQL **JIT** compiling mis-estimated plans on a stats-less fresh DB — roughly 60 s of LLVM compilation **per** first-start materialization-recalc query. The log sits for minutes on one line (often `Synchronizing property draws`), `systemctl is-active` stays `active` (it didn't die), and `pg_stat_activity` shows a single long-running `active` `INSERT … SELECT` with no `Lock` wait.
-
-**Diagnostic:**
-
-```bash
-ssh root@<host> "sudo -u postgres psql -d lsfusion -P pager=off -c \"SELECT pid,state,wait_event_type,round(extract(epoch from(now()-query_start))) dur_s,left(query,60) FROM pg_stat_activity WHERE datname='lsfusion' AND state='active' AND pid<>pg_backend_pid();\""
-```
-
-**Fix:** disable JIT and set SSD-appropriate planner costs, then restart so the recalc re-runs fast:
-
-```bash
-ssh root@<host> 'sudo -u postgres psql -q -c "ALTER SYSTEM SET jit = off;"; sudo -u postgres psql -q -c "ALTER SYSTEM SET random_page_cost = 1.1;"; sudo -u postgres psql -q -c "SELECT pg_reload_conf();"; systemctl restart lsfusion6-server'
-```
-
-Observed: one step went **363 s → 0.4 s**. If the DB is disposable, `dropdb --force lsfusion; createdb -O postgres lsfusion` before the start is even cleaner (no leftover bare-platform tables to drop+recalc). `jit=off` is a safe permanent setting for lsFusion's large generated SQL.
-
-### 13. Stored / displayed text is `?` for every non-ASCII char (Cyrillic, accents, CJK)
+### 12. Stored / displayed text is `?` for every non-ASCII char (Cyrillic, accents, CJK)
 
 Two independent culprits — check both:
 
