@@ -1002,7 +1002,14 @@ function Cmd-StartServer {
         "-Xmx2g", "-Dfile.encoding=UTF-8", "-cp", $cp,
         "lsfusion.server.logics.BusinessLogicsBootstrap"
     )
-    Info "Launching: java $($jvmArgs -join ' ')"
+    # Do NOT echo the full java command line: the classpath alone can be ~30 KB,
+    # which bloats agent transcripts and tempts callers into piping start/restart
+    # through filters (| tail, | Select-String) - and a piped invocation is what
+    # gets a foreground start reclassified as a background task. Keep stdout
+    # compact; the full command line goes to a file for debugging.
+    $launchCmdFile = Join-Path $StateDir "launch-cmd.txt"
+    "$($java.Path) $($jvmArgs -join ' ')" | Set-Content -Path $launchCmdFile -Encoding UTF8
+    Info "Launching java ($(($cp -split ';').Count) classpath entries; full command line: $launchCmdFile)"
     Remove-Item $ServerOut, $ServerErr -ErrorAction SilentlyContinue
     $proc = Start-Process -FilePath $java.Path -ArgumentList $jvmArgs `
         -WorkingDirectory $ProjectDir -RedirectStandardOutput $ServerOut `

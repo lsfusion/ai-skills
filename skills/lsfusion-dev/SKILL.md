@@ -175,6 +175,27 @@ If port `8080` is taken (e.g. another Tomcat), pass `setup -WebPort <free port>`
 — the skill rewrites Tomcat's `server.xml` accordingly, and every later command
 reads the port from config. Run `check`/`status` to see port conflicts.
 
+### Recommended tool-call timeouts
+
+Every command returns as soon as it prints its verdict, so an oversized
+timeout costs no wall-clock by itself — but a very long timeout is one of the
+signals that gets a command reclassified as a background task (see the
+no-pipe note in step 4), so don't inflate it "just in case":
+
+| Command | Tool-call timeout |
+|---|---|
+| `check` / `status` / `log` / `versions` / `api` / `open` | default (120 s) |
+| `setup` — first run (downloads ~400 MB) | 600 s |
+| `setup` — re-run (ports, DB, settings tweaks) | default |
+| `start` / `restart` — routine edit→restart cycle (lightstart) | 300 s |
+| `start-server` — first start on this DB, or major-version upgrade (raise the inner `-Timeout` to 300 as well) | 600 s |
+| `verify` — first ever run (installs Playwright + Chromium, ~120 MB) | 300 s |
+| `verify` — later runs | default |
+
+Rule of thumb: outer timeout ≈ the script's inner `-Timeout` (default 180 s)
+plus ~2 minutes of Maven/Tomcat overhead. Don't copy the 600 s ceiling from a
+first-start invocation into routine restarts — recalibrate per call.
+
 **`setup` downloads are version-driven, not `-Force`-driven.** Re-running
 `setup` (with or without `-Force`) only fetches an artifact that is **missing**
 or whose **platform version changed**:
@@ -455,18 +476,23 @@ every 10–20 s — don't `-Timeout 600` and walk away. If a real long sync
 is genuinely in progress, the log keeps printing real work and you can
 extend the wait deliberately.
 
-**Run `start`/`restart` in the foreground — don't pipe it through `tail` or
-other filters.** `start-server` already polls the log itself and returns the
-moment it prints a verdict (started / failed / inconclusive) — usually 10–40 s
-on a lightstart restart — so the command's own stdout is your signal; it does
-**not** block for the full `-Timeout`. Wrapping the invocation in a pipe
-(`… | tail`) or attaching a very long timeout can make the agent's shell tool
-classify the command as long-running and **run it in the background**. You then
-sit waiting for a task-completion notification and polling `status` in a loop —
-pure dead time the command never needed. Let it run in the foreground and read
-the verdict it prints. If you really do want to background a long first-time
-sync, do it deliberately (the shell tool's `run_in_background`), not as an
-accidental side effect of a pipe.
+**Run `start`/`restart` in the foreground — never pipe it through a filter.**
+`start-server` already polls the log itself and returns the moment it prints a
+verdict (started / failed / inconclusive) — usually 10–40 s on a lightstart
+restart — so the command's own stdout is your signal; it does **not** block for
+the full `-Timeout`. Wrapping the invocation in a pipe or attaching a very long
+timeout can make the agent's shell tool classify the command as long-running
+and **run it in the background**. You then sit waiting for a task-completion
+notification and polling `status` in a loop — pure dead time the command never
+needed. **Any pipe counts** — `| tail`, `| head`, `| grep`, `| Select-String`,
+`| ForEach-Object` — the filter you pick doesn't matter, the pipe itself does;
+an observed failure mode is exactly `restart | Select-String '==='` going to
+the background on a one-minute lightstart restart. There is nothing to filter
+anyway: the output is already a compact verdict (the full java command line is
+written to `.lsfusion-dev/launch-cmd.txt`, not echoed). Let it run in the
+foreground and read the verdict it prints. If you really do want to background
+a long first-time sync, do it deliberately (the shell tool's
+`run_in_background`), not as an accidental side effect of a pipe.
 
 **Refresh PostgreSQL statistics after a first start or a big schema change —
 call `analyzeDBAction()`.** lsFusion emits large, join-heavy SQL. On a
@@ -582,6 +608,14 @@ checking the unit-test output.
    note in step 4 (use the `api` command / `-ScriptFile`, not a raw `curl`
    POST body).
 
+   **Reading a value back: use `EXPORT FROM`, not `MESSAGE`.** The `api`
+   command prints the HTTP response body, and only `EXPORT FROM <expr>`
+   puts the value there. A plain `MESSAGE` returns an empty 200 (it proves
+   compilation, nothing more), and `MESSAGE ... NOWAIT` lands in the
+   **server log** (`Server message: ...`) — if you use it anyway, expect a
+   second round-trip through `lsfdev.ps1 log` to fish the value out.
+   `EXPORT FROM x = (GROUP SUM 1 IF ...);` gives you the answer in one call.
+
 3. **UI, last.** When log + API agree the build is healthy, run
    `verify`. It drives **Playwright** (headless Chromium) to:
    - screenshot the landing page → `.lsfusion-dev/verify-login.png`,
@@ -609,6 +643,14 @@ checking the unit-test output.
    opens in the same server lifetime are fast. A lone timeout here is
    almost always cold-start latency — re-run with a longer wait before
    concluding the UI is broken.
+
+   **Put the budget in selector timeouts, never in fixed sleeps.** A
+   selector wait (`wait_for(..., timeout=60000)`) returns the instant the
+   element renders — an oversized budget costs nothing on a fast run. A
+   fixed sleep (`wait_for_timeout(15000)` "to be safe") burns its full
+   duration on *every* run: three such sleeps in a screenshot script is
+   ~20 s of guaranteed dead time per invocation. Reserve fixed waits for
+   sub-3-second UI settles (animation, focus) where no selector exists.
 
 **Do not query PostgreSQL directly to inspect data.** lsFusion owns the
 schema — table names are mangled (`<class>_<namespace>`, `_x_yz` columns),
