@@ -27,6 +27,7 @@ param(
     [string]$ScriptFile = "",
     [int]$RmiPort = 7652,
     [int]$HttpPort = 7651,
+    [int]$WebSocketPort = 8887,
     [int]$WebPort = 8080,
     [int]$ShutdownPort = 8005,
     [int]$Lines = 80,
@@ -150,14 +151,17 @@ function Load-Config {
     if (Test-Path $ConfigPath) {
         $c = (Get-Content $ConfigPath -Raw | ConvertFrom-Json)
         # settings.properties is the source of truth for the lsFusion-side ports
-        # (rmi.port / http.port), exactly like db.*. Reading them back here means
-        # they survive a wiped .lsfusion-dev/ or a hand-edit of settings.properties
-        # — config.json is only a cache/fallback. (webPort / shutdownPort stay in
-        # config.json: those are Tomcat's, not lsFusion settings.)
+        # (rmi.port / http.port / webSocket.port), exactly like db.*. Reading them
+        # back here means they survive a wiped .lsfusion-dev/ or a hand-edit of
+        # settings.properties — config.json is only a cache/fallback. (webPort /
+        # shutdownPort stay in config.json: those are Tomcat's, not lsFusion settings.)
         $sRmi  = Read-SettingsPort "rmi.port"
         $sHttp = Read-SettingsPort "http.port"
+        $sWs   = Read-SettingsPort "webSocket.port"
         if ($sRmi)  { $c.rmiPort  = $sRmi }  elseif (-not $c.rmiPort)  { $c.rmiPort  = 7652 }
         if ($sHttp) { $c.httpPort = $sHttp } elseif (-not $c.httpPort) { $c.httpPort = 7651 }
+        if ($sWs)   { $c | Add-Member -NotePropertyName webSocketPort -NotePropertyValue $sWs -Force }
+        elseif (-not $c.webSocketPort) { $c | Add-Member -NotePropertyName webSocketPort -NotePropertyValue 8887 -Force }
         return $c
     }
     return $null
@@ -627,6 +631,7 @@ function Cmd-Setup {
         topModule     = (Pick "topModule" "TopModule" "")
         rmiPort       = (Pick "rmiPort" "RmiPort" 7652)
         httpPort      = (Pick "httpPort" "HttpPort" 7651)
+        webSocketPort = (Pick "webSocketPort" "WebSocketPort" 8887)
         webPort       = (Pick "webPort" "WebPort" 8080)
         shutdownPort  = (Pick "shutdownPort" "ShutdownPort" 8005)
     }
@@ -638,8 +643,12 @@ function Cmd-Setup {
     # this install will bind, not just the web port; our own running instances
     # are excluded so a re-setup over a live server isn't a false positive.
     $preflight = @(
-        @{ Name = "RMI (app server)";   Port = $cfg.rmiPort;      Flag = "-RmiPort" },
-        @{ Name = "Action API";         Port = $cfg.httpPort;     Flag = "-HttpPort" }
+        @{ Name = "RMI (app server)";   Port = $cfg.rmiPort;       Flag = "-RmiPort" },
+        @{ Name = "Action API";         Port = $cfg.httpPort;      Flag = "-HttpPort" },
+        # The platform unconditionally binds a WebSocket server too (webSocket.port,
+        # default 8887). A second instance on the same box hits BindException there
+        # unless this port is shifted as well - it is the easy one to forget.
+        @{ Name = "WebSocket (app server)"; Port = $cfg.webSocketPort; Flag = "-WebSocketPort" }
     )
     if (-not $NoWeb) {
         $preflight += @{ Name = "Tomcat HTTP (web)"; Port = $cfg.webPort;      Flag = "-WebPort" }
@@ -763,10 +772,24 @@ function Cmd-Setup {
         Apply-SettingsOverride $confSettings "db.user"     $cfg.dbUser     ($ScriptBound.ContainsKey("DbUser"))     | Out-Null
         Apply-SettingsOverride $confSettings "db.server"   $cfg.dbServer   ($ScriptBound.ContainsKey("DbServer"))   | Out-Null
         Apply-SettingsOverride $confSettings "db.name"     $cfg.dbName     ($ScriptBound.ContainsKey("DbName"))     | Out-Null
+        # A repo-committed db.name defeats the "unique DB per project" default:
+        # every clone of the repo points at the same database, and two instances
+        # on one box would fight over the schema. Don't silently adopt it - keep
+        # it (the project's choice wins, like every committed setting) but warn,
+        # and make config.json reflect the name the server will actually use.
+        if (-not $ScriptBound.ContainsKey("DbName")) {
+            $committedDbName = Get-SettingsValue $confSettings "db.name"
+            if ($committedDbName -and ($committedDbName -ne $cfg.dbName)) {
+                $cfg.dbName = $committedDbName
+                Save-Config $cfg
+                Warn "Project commits db.name '$committedDbName' - every clone of this repo shares that database. Pass 'setup -DbName <unique> -Force' if this instance needs its own DB."
+            }
+        }
         # Ports: only ever written when the user explicitly passed one (default
         # ports stay implicit, same as the non-Maven path); never fill a default.
-        if ($ScriptBound.ContainsKey("RmiPort"))  { Apply-SettingsOverride $confSettings "rmi.port"  $cfg.rmiPort  $true | Out-Null }
-        if ($ScriptBound.ContainsKey("HttpPort")) { Apply-SettingsOverride $confSettings "http.port" $cfg.httpPort $true | Out-Null }
+        if ($ScriptBound.ContainsKey("RmiPort"))       { Apply-SettingsOverride $confSettings "rmi.port"       $cfg.rmiPort       $true | Out-Null }
+        if ($ScriptBound.ContainsKey("HttpPort"))      { Apply-SettingsOverride $confSettings "http.port"      $cfg.httpPort      $true | Out-Null }
+        if ($ScriptBound.ContainsKey("WebSocketPort")) { Apply-SettingsOverride $confSettings "webSocket.port" $cfg.webSocketPort $true | Out-Null }
         # A stale root settings.properties from an older skill run is dead weight
         # in Maven mode (never read) and only confuses - drop it, but only if we
         # generated it (carries our marker); never touch a hand-written root file.
@@ -780,6 +803,17 @@ function Cmd-Setup {
     $settings = Join-Path $ProjectDir "settings.properties"
     if ((Test-Path $settings) -and -not $Force) {
         Ok "settings.properties already exists (left untouched; use -Force to regenerate)."
+        # Same shared-DB guard as the Maven path: a committed/pre-existing db.name
+        # means every copy of this project points at one database. Keep it, but
+        # say so, and keep config.json truthful about the name actually in use.
+        if (-not $ScriptBound.ContainsKey("DbName")) {
+            $existingDbName = Get-SettingsValue $settings "db.name"
+            if ($existingDbName -and ($existingDbName -ne $cfg.dbName)) {
+                $cfg.dbName = $existingDbName
+                Save-Config $cfg
+                Warn "settings.properties carries db.name '$existingDbName' - other copies of this project may share that database. Pass 'setup -DbName <unique> -Force' if this instance needs its own DB."
+            }
+        }
     } elseif ($isExistingProject) {
         # Minimal overrides only: the project's own lsfusion.properties drives
         # topModule, namespaces, etc. We only inject install-specific
@@ -796,6 +830,7 @@ function Cmd-Setup {
         # Ports live here too (same scheme as db.*): only emitted when non-default.
         if ($ScriptBound.ContainsKey("RmiPort")  -or $cfg.rmiPort  -ne 7652) { $lines += "rmi.port = $($cfg.rmiPort)" }
         if ($ScriptBound.ContainsKey("HttpPort") -or $cfg.httpPort -ne 7651) { $lines += "http.port = $($cfg.httpPort)" }
+        if ($ScriptBound.ContainsKey("WebSocketPort") -or $cfg.webSocketPort -ne 8887) { $lines += "webSocket.port = $($cfg.webSocketPort)" }
         if ($ScriptBound.ContainsKey("TopModule") -and $cfg.topModule) { $lines += "logics.topModule = $($cfg.topModule)" }
         Set-Content -Path $settings -Value ($lines -join "`r`n") -Encoding UTF8
         Ok "settings.properties written (minimal - existing project)."
@@ -803,11 +838,13 @@ function Cmd-Setup {
         $topLine = ""
         if ($cfg.topModule) { $topLine = "logics.topModule = $($cfg.topModule)`r`n" }
         # Non-default ports go in settings.properties (server reads them natively,
-        # independent of how it is launched) — see the rmi.port / http.port note
-        # in SKILL.md. Default ports (7652 / 7651) are left implicit.
+        # independent of how it is launched) — see the rmi.port / http.port /
+        # webSocket.port note in SKILL.md. Default ports (7652 / 7651 / 8887)
+        # are left implicit.
         $portLines = ""
         if ($cfg.rmiPort  -ne 7652) { $portLines += "rmi.port = $($cfg.rmiPort)`r`n" }
         if ($cfg.httpPort -ne 7651) { $portLines += "http.port = $($cfg.httpPort)`r`n" }
+        if ($cfg.webSocketPort -ne 8887) { $portLines += "webSocket.port = $($cfg.webSocketPort)`r`n" }
         $content = @"
 # lsFusion application server settings - generated by lsfdev.ps1
 # Edit freely; the server reads this file on startup.
@@ -861,7 +898,7 @@ function Cmd-StartServer {
         if (-not (Test-Path $jar)) { throw "Server jar missing. Run setup again." }
     }
 
-    Stop-Tracked $ServerPid @($cfg.rmiPort, $cfg.httpPort) "Previous application server"
+    Stop-Tracked $ServerPid @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort) "Previous application server"
     Ensure-Database $cfg
 
     # settings.properties can live at the project root (scaffolded / non-Maven
@@ -871,7 +908,11 @@ function Cmd-StartServer {
         -not (Test-Path (Join-Path $ProjectDir "conf\settings.properties"))) {
         Warn "settings.properties not found (looked in project root and conf/) - re-run setup."
     }
-    $lsf = @(Get-ChildItem $ProjectDir -Recurse -Filter *.lsf -ErrorAction SilentlyContinue)
+    # Count only source modules: target/ holds Maven-staged copies of the same
+    # files after a compile, and .lsfusion-dev/ may hold scratch scripts - both
+    # would double the number and make the line useless as a sanity signal.
+    $lsf = @(Get-ChildItem $ProjectDir -Recurse -Filter *.lsf -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\(target|\.lsfusion-dev|\.git)\\' })
     if ($lsf.Count -eq 0) { Warn "No .lsf files found under $ProjectDir - the server will start with system modules only." }
     else { Info "Found $($lsf.Count) .lsf file(s) to load." }
 
@@ -993,11 +1034,12 @@ function Cmd-StartServer {
         $reason = if ($firstStart) { "first launch" } else { "-FullStart requested" }
         Info "Dev mode ON, light start OFF ($reason - full schema sync)."
     }
-    # Ports come from settings.properties (rmi.port / http.port), the same place
-    # and scheme as db.* — the server reads them natively, so they hold no matter
-    # how it is launched, and survive a wiped .lsfusion-dev/. We deliberately do
-    # NOT pass -Drmi.port / -Dhttp.port here: a -D arg would silently outrank
-    # settings.properties and re-introduce the "ports live in two places" split.
+    # Ports come from settings.properties (rmi.port / http.port / webSocket.port),
+    # the same place and scheme as db.* — the server reads them natively, so they
+    # hold no matter how it is launched, and survive a wiped .lsfusion-dev/. We
+    # deliberately do NOT pass -Drmi.port / -Dhttp.port / -DwebSocket.port here:
+    # a -D arg would silently outrank settings.properties and re-introduce the
+    # "ports live in two places" split.
     $jvmArgs = @() + (Add-Opens $java.Major) + $devArgs + @(
         "-Xmx2g", "-Dfile.encoding=UTF-8", "-cp", $cp,
         "lsfusion.server.logics.BusinessLogicsBootstrap"
@@ -1031,7 +1073,7 @@ function Cmd-StartServer {
     $tailErr = Tail-Text (Read-FileText $ServerErr) 30
     if ($verdict -eq "started") {
         New-Item -ItemType File -Force -Path $initMarker | Out-Null
-        Ok "Application server started (RMI $($cfg.rmiPort), Action API $($cfg.httpPort))."
+        Ok "Application server started (RMI $($cfg.rmiPort), Action API $($cfg.httpPort), WebSocket $($cfg.webSocketPort))."
     } elseif ($verdict -eq "failed") {
         Bad "Application server process exited during startup. Last log lines:"
         $tailOut | ForEach-Object { Write-Host "    $_" }
@@ -1157,14 +1199,14 @@ function Cmd-Status {
     Head "Status"
     $cfg = Load-Config
     if (-not $cfg) { Info "Not set up."; return }
-    $rmi = $cfg.rmiPort; $http = $cfg.httpPort; $web = $cfg.webPort
+    $rmi = $cfg.rmiPort; $http = $cfg.httpPort; $ws = $cfg.webSocketPort; $web = $cfg.webPort
 
     if (Test-PortOpen 5432) { Ok "PostgreSQL    : listening on 5432" }
     else { Bad "PostgreSQL    : not listening on 5432" }
 
     $sPid = 0
     if (Test-Path $ServerPid) { [int]::TryParse((Get-Content $ServerPid -Raw).Trim(), [ref]$sPid) | Out-Null }
-    if ((Process-Alive $sPid) -and (Test-PortOpen $rmi)) { Ok "App server    : running (PID $sPid, RMI $rmi, API $http)" }
+    if ((Process-Alive $sPid) -and (Test-PortOpen $rmi)) { Ok "App server    : running (PID $sPid, RMI $rmi, API $http, WebSocket $ws$(if (-not (Test-PortOpen $ws)) { ' [NOT BOUND - port clash? see runtime.md]' }))" }
     elseif (Test-PortOpen $rmi) { Warn "App server    : something is on RMI port $rmi (PID file stale)" }
     else { Info "App server    : stopped" }
 
@@ -1283,13 +1325,15 @@ function Cmd-Api {
 
     # Authentication. The local dev server is ALWAYS launched in devmode (see
     # Cmd-StartServer), and devmode lets a request with NO Authorization header
-    # through as the anonymous user. Sending Basic auth for 'admin' with an
-    # EMPTY password makes the server run a real credential check and reject it
-    # with HTTP 401 — so we attach the header ONLY when a non-empty password is
+    # through as the anonymous user. With an Authorization header present the
+    # server runs a real credential check instead: on current builds
+    # (7.0-SNAPSHOT, 2026-06) Basic auth for 'admin' with an EMPTY password
+    # passes that check too, but 6.x-era builds rejected it with HTTP 401 - so
+    # the no-header form is the only one that works across all platform
+    # versions, and we attach the header ONLY when a non-empty password is
     # actually configured (admin password rotated, or a real account set up).
-    # With the default empty password we omit the header entirely and ride
-    # devmode's anonymous access. An explicitly-passed -AdminUser/-AdminPassword
-    # on the 'api' call overrides whatever setup stored in config.json.
+    # An explicitly-passed -AdminUser/-AdminPassword on the 'api' call
+    # overrides whatever setup stored in config.json.
     $apiUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
     $apiPass = if ($ScriptBound.ContainsKey("AdminPassword")) { $AdminPassword } else { $cfg.adminPassword }
     $headers = @{}
@@ -1298,12 +1342,14 @@ function Cmd-Api {
         $headers["Authorization"] = "Basic $auth"
         Info "Authenticating as '$apiUser' (password configured)."
     } else {
-        Info "Calling anonymously (devmode) - no admin password set; sending 'admin' with an empty password would 401."
+        Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent (works on every platform version; 6.x-era builds 401'd an empty-password Basic)."
     }
     # The script travels as a percent-encoded query parameter (NOT a POST form
     # body): EscapeDataString emits the UTF-8 bytes as %XX, which the server
-    # decodes as UTF-8 reliably. A raw form body is decoded with the server's
-    # default charset and corrupts every non-ASCII character to '?'.
+    # decodes as UTF-8 reliably on every platform version. (Current
+    # 7.0-SNAPSHOT decodes a POST form body as UTF-8 too, but 6.x-era builds
+    # used the platform default charset there and corrupted non-ASCII to '?' -
+    # the query parameter is the channel that behaves the same everywhere.)
     $enc = [uri]::EscapeDataString($scriptText)
     $uri = "http://localhost:$($cfg.httpPort)/eval/action?script=$enc"
     Info "POST $uri"
@@ -1427,6 +1473,8 @@ Common options:
   -RmiPort <port>       App-server RMI port (default 7652). Set per project to
                         run several servers/configs at once.
   -HttpPort <port>      App-server HTTP / Action API port (default 7651).
+  -WebSocketPort <port> App-server WebSocket port (default 8887). Shift it too
+                        when running several servers - it is always bound.
   -WebPort <port>       Tomcat HTTP port (default 8080).
   -ShutdownPort <port>  Tomcat shutdown port (default 8005).
   -Timeout <seconds>    Startup wait (default 180).
@@ -1456,20 +1504,20 @@ try {
         "restart" {
             Head "Restart"
             $cfg = Load-Config
-            $ports = @(7652, 7651, 8080)
-            if ($cfg) { $ports = @($cfg.rmiPort, $cfg.httpPort, $cfg.webPort) }
-            Stop-Tracked $ServerPid @($ports[0], $ports[1]) "Application server"
-            Stop-Tracked $TomcatPid @($ports[2]) "Tomcat"
+            $srvPorts = @(7652, 7651, 8887); $webPorts = @(8080)
+            if ($cfg) { $srvPorts = @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort); $webPorts = @($cfg.webPort) }
+            Stop-Tracked $ServerPid $srvPorts "Application server"
+            Stop-Tracked $TomcatPid $webPorts "Tomcat"
             Cmd-StartServer
             if (-not $NoWeb) { Cmd-StartWeb }
         }
         "stop" {
             Head "Stop"
             $cfg = Load-Config
-            $ports = @(7652, 7651, 8080)
-            if ($cfg) { $ports = @($cfg.rmiPort, $cfg.httpPort, $cfg.webPort) }
-            Stop-Tracked $ServerPid @($ports[0], $ports[1]) "Application server"
-            Stop-Tracked $TomcatPid @($ports[2]) "Tomcat"
+            $srvPorts = @(7652, 7651, 8887); $webPorts = @(8080)
+            if ($cfg) { $srvPorts = @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort); $webPorts = @($cfg.webPort) }
+            Stop-Tracked $ServerPid $srvPorts "Application server"
+            Stop-Tracked $TomcatPid $webPorts "Tomcat"
         }
         "status"       { Cmd-Status }
         "log"          { Cmd-Log }

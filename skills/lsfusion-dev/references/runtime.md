@@ -84,7 +84,8 @@ java <--add-opens flags> -Dlsfusion.server.devmode=true \
 ```
 
 Success is the log line `Server has successfully started`. Listens on RMI
-`7652` and HTTP Action API `7651`.
+`7652`, HTTP Action API `7651`, and WebSocket `8887` (all shiftable via
+`rmi.port` / `http.port` / `webSocket.port`).
 
 **Development JVM options.** `-Dlsfusion.server.devmode=true` is always set for
 local development. Beyond turning on dev-friendly behaviour, **devmode also
@@ -94,10 +95,13 @@ the navigator with no login form, both in the user's browser and in headless
 password) apply and the login form is rendered as usual.
 
 Devmode auth has one trap that drives how the `api` command talks to the
-Action API: devmode grants access **only to a request that carries no
-`Authorization` header at all** (it treats it as the anonymous user). A request
-that *does* send Basic auth for `admin` with an **empty** password makes the
-server run a real credential check and reject it with **HTTP 401**. So the
+Action API: devmode auto-auth applies **only to a request that carries no
+`Authorization` header at all** (it treats it as the anonymous user). A
+request that *does* send a header makes the server run a real credential
+check on what was sent — a wrong password gets **HTTP 401** even in devmode.
+How an **empty-password** Basic for `admin` fares is version-dependent:
+current builds (7.0-SNAPSHOT, verified 2026-06) accept it, 6.x-era builds
+rejected it with 401. The no-header form works on every version, so the
 `api` command sends **no** `Authorization` header unless a non-empty admin
 password is configured (`-AdminPassword` at setup, or stored in
 `config.json`); with the default blank password it calls anonymously. This is
@@ -145,7 +149,9 @@ everything runs locally with default ports.
 | `logics.topModule` | top module to load; blank = load all found | (blank) |
 
 Other useful keys (add by hand if needed): `rmi.port` (default `7652`),
-`http.port` (default `7651`), `logics.includePaths` / `logics.excludePaths`,
+`http.port` (default `7651`), `webSocket.port` (default `8887` — bound
+unconditionally; shift it per instance when running several servers),
+`logics.includePaths` / `logics.excludePaths`,
 `user.language` / `user.country` (locale).
 
 To change ports, edit both `settings.properties` and
@@ -170,10 +176,11 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | `module ... not found` | A `REQUIRE`d module name is wrong or missing. Check module names. |
 | `InaccessibleObjectException` / `module does not "opens"` | JDK module access. The skill already adds common `--add-opens`; add the exact failing one to the `Add-Opens` function in `lsfdev.ps1`, or use JDK 11. |
 | `Address already in use` / port `7652`/`8080` busy | Another process holds the port. `lsfdev.ps1 stop`, or change the port in config + settings. |
+| `BindException` from `WebSocketServer` in stderr, server otherwise starts | Another instance holds `webSocket.port` (default `8887`). Non-fatal but WebSocket features silently break — set a per-instance `webSocket.port` (`setup -WebSocketPort <free> -Force`) and restart. |
 | Web UI loads but shows a connection error | The application server is not running or not on `7652`. Check `lsfdev.ps1 status` and the server log. |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
-| `api` returns **HTTP 401 Unauthorized** | A credentialed request hit the devmode server. Devmode only accepts requests with **no** `Authorization` header (anonymous); `admin` with an empty password is rejected. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
+| `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong (or, on 6.x-era builds, empty) credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
 
 ## Changing the lsFusion version
 
