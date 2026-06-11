@@ -52,10 +52,15 @@ Jar it as-is:
 jar cf app.jar -C target/classes .
 ```
 
-Or on Windows from PowerShell:
+Or on Windows from PowerShell (`JAVA_HOME` is often unset even when Java is
+installed, or set but pointing at a JRE without `jar.exe` — probe it, then
+fall back to `jar.exe` on `PATH`, then to the one next to `java.exe`):
 
 ```powershell
-& "$env:JAVA_HOME\bin\jar.exe" --create --file=app.jar -C target\classes .
+$jar = if ($env:JAVA_HOME -and (Test-Path "$env:JAVA_HOME\bin\jar.exe")) { "$env:JAVA_HOME\bin\jar.exe" }
+       elseif (Get-Command jar.exe -ErrorAction SilentlyContinue) { (Get-Command jar.exe).Source }
+       else { Join-Path (Split-Path (Get-Command java).Source) "jar.exe" }
+& $jar --create --file=app.jar -C target\classes .
 ```
 
 The `-C` switch changes directory before reading entries, so the jar's internal paths are `accounting/...`, not `target/classes/accounting/...`. That's required — the platform looks for resources at jar root.

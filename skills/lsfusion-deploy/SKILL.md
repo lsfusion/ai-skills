@@ -38,7 +38,7 @@ If the user wants to stay in auto mode, expect to surface each ssh/systemctl/scp
 After a clean install the server has **three** moving parts:
 
 - **PostgreSQL** — listens on `127.0.0.1:5432`. The auto-installer creates it with user `postgres` / password `11111` / database `lsfusion`.
-- **The application-server unit** (systemd) — the JVM running the platform plus your config. Binds RMI on `:7652` and the HTTP Action API on `:7651`. The platform install lives in `/usr/share/<pkg>-server/`, the **drop-folder** for your app is `/var/lib/lsfusion/`.
+- **The application-server unit** (systemd) — the JVM running the platform plus your config. Binds RMI on `:7652`, the HTTP Action API on `:7651`, and a WebSocket server on `:8887`. The platform install lives in `/usr/share/<pkg>-server/`, the **drop-folder** for your app is `/var/lib/lsfusion/`.
 - **The web-client unit** (systemd) — Tomcat 9 with the lsFusion web-client war. Browser UI on `:8080`.
 
 The application server's CLASSPATH is `/var/lib/lsfusion:/var/lib/lsfusion/*:server.jar` (defined in the unit's `lsfusion.conf`). Anything you drop into `/var/lib/lsfusion/` becomes visible to the platform — jars via the wildcard, loose files via the directory entry.
@@ -201,7 +201,7 @@ Verify (substitute `PKG` for the upstream package generation — see [Naming con
 ```bash
 PKG=lsfusion6
 ssh root@<host> "systemctl is-active ${PKG}-server ${PKG}-client postgresql"
-ssh root@<host> "ss -tlnp | awk '/:(5432|7651|7652|8080)\\>/'"
+ssh root@<host> "ss -tlnp | awk '/:(5432|7651|7652|8080|8887)\\>/'"
 curl -sI http://<host>:8080/ | head -1                              # expect 200
 curl -s http://<host>:8080/ | grep -o '<title>[^<]*</title>'        # default: <title>lsfusion</title>
 ```
@@ -453,9 +453,13 @@ A Maven lsFusion project (`pom.xml` at root, `src/main/lsfusion/<ns>/*.lsf`, `sr
 That mixed layout IS what the platform expects on classpath. Build, then jar:
 
 ```powershell
-# from project root, on Windows
+# from project root, on Windows. JAVA_HOME is often unset even when Java is
+# installed (or set but pointing at a JRE without jar.exe) - probe, then fall
+# back to jar.exe on PATH, then to the one next to java.exe.
 mvn -q -DskipTests compile               # makes target/classes fresh
-$jar = "$env:JAVA_HOME\bin\jar.exe"      # or any local JDK
+$jar = if ($env:JAVA_HOME -and (Test-Path "$env:JAVA_HOME\bin\jar.exe")) { "$env:JAVA_HOME\bin\jar.exe" }
+       elseif (Get-Command jar.exe -ErrorAction SilentlyContinue) { (Get-Command jar.exe).Source }
+       else { Join-Path (Split-Path (Get-Command java).Source) "jar.exe" }
 & $jar --create --file=app.jar -C target\classes .
 ```
 
@@ -467,7 +471,7 @@ jar cf app.jar -C target/classes .
 
 Output `app.jar` is what you scp. Typical size: 5–20 MB.
 
-**Do not run `mvn package` for deploy.** It produces a fat jar including transitive deps — including the platform `server.jar`. Bundling a platform jar into the app, when the server already has its own platform jar in classpath, leads to confusing version-mix failures. Ship only the application content.
+**Build the deploy jar from `target/classes`, not from a Maven profile.** On the standard solution layout a plain `mvn package` happens to produce an equivalent thin jar (verified on a stock solution project: same content as jarring `target/classes` by hand — the platform parent POM adds no shade/assembly step), so if one already exists it is fine to ship. The real hazard is the **`assemble` profile** (`mvn package -Passemble`) that solution POMs carry for building standalone images: it pulls `lsfusion.platform:server` / `api` in as dependencies, and bundling a platform jar into the app — when the server already has its own platform jar on the classpath — leads to confusing version-mix failures. `jar cf app.jar -C target/classes .` sidesteps profile and plugin surprises entirely; ship only the application content.
 
 ### From-scratch project (no Maven)
 
@@ -709,7 +713,7 @@ CRLF in `authorized_keys`. PowerShell pipes mangle line endings on the way out. 
 
 - **`/etc/lsfusion6-server/settings.properties` overrides the jar's `lsfusion.properties`, not the other way around.** Per the resolution chain (see [the section above](#where-install-specific-parameters-live-and-why-etclsfusion6-serversettingsproperties-is-confsettingsproperties)), install-side `conf/settings.properties` is layer 3 and the project's `lsfusion.properties` is layer 2 — later layers win. So if the jar sets `db.denyDropModules = false` and you keep `db.denyDropModules = true` in `/etc/lsfusion6-server/settings.properties`, the install-side value wins and drops are blocked. Decide deliberately which layer owns each key; duplicating is fine when intentional, surprising when accidental.
 
-- **Ports `:7651` and `:7652` listen on `*` by default** — exposed to the internet on a public host. Only `:8080` should be public-facing. Before exposing the host, firewall the others (`ufw allow 8080; ufw deny 7651,7652`) or rebind to `127.0.0.1` in the app-server's `lsfusion.conf` under `/etc/<pkg>-server/`.
+- **Ports `:7651`, `:7652` and `:8887` listen on `*` by default** — exposed to the internet on a public host. `:8887` is the platform's WebSocket server (`webSocket.port`), bound unconditionally at startup alongside RMI and the Action API; it is the one audits forget. Only `:8080` should be public-facing. Before exposing the host, firewall the others (`ufw allow 8080; ufw deny 7651; ufw deny 7652; ufw deny 8887`) or rebind to `127.0.0.1` in the app-server's `lsfusion.conf` under `/etc/<pkg>-server/`. (`debugger.port` 1299 exists too but binds only when debugging is attached.)
 
 - **Default DB password is `11111` after auto-install.** Change it (`ALTER USER postgres WITH PASSWORD '...'`) and update `db.password` in `settings.properties` before exposing the host.
 

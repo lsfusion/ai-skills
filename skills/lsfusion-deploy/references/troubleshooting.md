@@ -297,7 +297,7 @@ ssh root@<host> 'bash -s' <<'EOF'
 PKG=lsfusion6
 echo "=== version ===" ; grep 'Current version' /var/log/${PKG}-server/stdout.log | tail -3
 echo "=== service ===" ; systemctl status ${PKG}-server --no-pager -l | head -25
-echo "=== ports ===" ; ss -tlnp | awk '/:(5432|7651|7652|8080)\>/'
+echo "=== ports ===" ; ss -tlnp | awk '/:(5432|7651|7652|8080|8887)\>/'
 echo "=== drop folder ===" ; ls -la /var/lib/lsfusion/
 echo "=== install settings ===" ; cat /etc/${PKG}-server/settings.properties
 echo "=== last stderr ===" ; tail -n 50 /var/log/${PKG}-server/stderr.log

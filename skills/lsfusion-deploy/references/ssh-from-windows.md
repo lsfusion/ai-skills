@@ -105,7 +105,7 @@ It really is the argv boundary, not the shell or the server: MSYS-internal tools
   Invoke-WebRequest -Uri "$URL`?script=$enc" -Method Post -Headers $hdr -UseBasicParsing
   ```
 
-Send the script in the **query string** (Tomcat decodes it as UTF-8), not the POST **body** (the servlet form-decodes the body as ISO-8859-1 → corruption). Large scripts can exceed the connector's `maxHttpHeaderSize` (8 KB default) → raise it on the SSL connector if you hit `Request header is too large`.
+Send the script in the **query string** (Tomcat decodes it as UTF-8 on every platform version), in preference to the POST **body** — current builds (7.0-SNAPSHOT, verified 2026-06) decode the body as UTF-8 too, but 6.x-era builds were observed form-decoding it with a legacy charset and corrupting non-ASCII; the query string never had that problem. Large scripts can exceed the connector's `maxHttpHeaderSize` (8 KB default) → raise it on the SSL connector if you hit `Request header is too large`.
 
 ## First-time key install via SSH_ASKPASS
 
@@ -260,36 +260,40 @@ If a workflow seems to need plink (e.g. easier password handling), step back —
 Drop these in the session and they're available for the rest of the deploy:
 
 ```powershell
+# NOTE: the host parameter is deliberately NOT named $Host - that is a
+# read-only automatic variable in PowerShell, and `param([string]$Host)`
+# fails at call time with "Cannot overwrite variable Host because it is
+# read-only or constant".
 function Invoke-RemoteBash {
     param(
         [Parameter(Mandatory)][string]$User,
-        [Parameter(Mandatory)][string]$Host,
+        [Parameter(Mandatory)][string]$HostName,
         [Parameter(Mandatory)][string]$Script
     )
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-    ssh "$User@$Host" "echo $b64 | base64 -d | bash"
+    ssh "$User@$HostName" "echo $b64 | base64 -d | bash"
 }
 
 function Copy-ToRemote {
     param(
         [Parameter(Mandatory)][string]$LocalPath,
         [Parameter(Mandatory)][string]$User,
-        [Parameter(Mandatory)][string]$Host,
+        [Parameter(Mandatory)][string]$HostName,
         [Parameter(Mandatory)][string]$RemotePath
     )
-    scp $LocalPath "${User}@${Host}:${RemotePath}"
+    scp $LocalPath "${User}@${HostName}:${RemotePath}"
 }
 ```
 
 Usage:
 
 ```powershell
-Invoke-RemoteBash -User root -Host <host> -Script @'
+Invoke-RemoteBash -User root -HostName <host> -Script @'
 systemctl is-active lsfusion6-server lsfusion6-client postgresql
-ss -tlnp | awk '/:(5432|7651|7652|8080)\>/'
+ss -tlnp | awk '/:(5432|7651|7652|8080|8887)\>/'
 '@
 
-Copy-ToRemote -LocalPath C:\Work\app.jar -User root -Host <host> -RemotePath /var/lib/lsfusion/app.jar
+Copy-ToRemote -LocalPath C:\Work\app.jar -User root -HostName <host> -RemotePath /var/lib/lsfusion/app.jar
 ```
 
 These are convenience wrappers — nothing stops you from writing the raw `ssh` / `scp` calls inline. The wrappers exist to make the BOM-workaround invisible after one definition.
