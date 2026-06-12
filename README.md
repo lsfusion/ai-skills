@@ -64,6 +64,14 @@ claude plugin marketplace remove lsfusion
 Skills and the `lsfusion-ai` MCP server become available in **new** Claude Code
 sessions (the MCP server may prompt for authentication on first use).
 
+> **After `claude plugin update` / `marketplace update`:** a session that is
+> already open keeps the **old** SKILL.md it loaded at startup — instructions
+> refresh only in a new session. The updated *scripts* (e.g.
+> `scripts/lsfdev.ps1`) are available immediately, though: they are resolved
+> from the plugin cache by path at call time, and the cache path changes with
+> the version (`...\lsfusion-ai-skills\<version>\skills\...`) — so re-resolve
+> the script path instead of reusing one cached earlier in the conversation.
+
 ## Use the skills without the plugin
 
 The `skills/` folder follows the open Agent Skills format, so it works anywhere:
