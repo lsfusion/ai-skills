@@ -180,7 +180,7 @@ with and stay consistent within the project.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Headless-Chrome screenshot + DOM dump of the web UI into `.lsfusion-dev/`. |
+| `verify` | Headless-Chrome screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it. |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding — see workflow.md). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
@@ -652,10 +652,37 @@ checking the unit-test output.
    a value there is `RETURN <expr>;` — the action's return value becomes the
    body: `RETURN (GROUP SUM 1 IF ...);` answers a count in one call. For
    tabular/structured data use `EXPORT FROM ...` (the export becomes the
-   body). A plain `MESSAGE` returns an empty 200 (it proves compilation,
-   nothing more), and `MESSAGE ... NOWAIT` lands in the **server log**
-   (`Server message: ...`) — if you use it anyway, expect a second
-   round-trip through `lsfdev.ps1 log` to fish the value out.
+   body). A plain `MESSAGE` over HTTP is **swallowed entirely** — empty 200,
+   nothing in the response, nothing in the log; `MESSAGE ... NOWAIT` at
+   least lands in the **server log** (`Server message: ...`), and the `api`
+   command tails those lines and prints them after the call.
+
+   **A constraint-canceled `APPLY` is silent — HTTP 200 either way.** If a
+   seed/mutation script violates a constraint (`NONULL`, `CONSTRAINT`,
+   uniqueness), `APPLY` cancels, **no row lands, and the response is still
+   an empty 200** — indistinguishable from success at the transport level.
+   Never trust the status code for mutations: end every mutation script
+   with a self-check so the answer arrives in one call:
+
+   ```lsf
+   NEWSESSION {
+       // ... NEW / assignments ...
+       APPLY;
+       IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();
+   }
+   RETURN 'OK: ' + STRING(GROUP SUM 1 IF ...);   // count proves the data landed
+   ```
+
+   `applyMessage()` carries the human-readable constraint text, so the
+   failed case diagnoses itself instead of costing a separate count query.
+   The `api` command adds two safety nets of its own: it prints a hint
+   whenever the body comes back empty, and it tails the server log for
+   `Server message:` lines after every call — which surfaces both
+   `MESSAGE ... NOWAIT` output **and** the constraint text a canceled
+   `APPLY` logs, so even an un-instrumented seed script usually shows its
+   failure reason right in the call output. The `RETURN`-based recipe is
+   still the contract to write: it works through any HTTP client, not just
+   `lsfdev.ps1 api`.
 
 3. **UI, last.** When log + API agree the build is healthy, run
    `verify`. It drives **Playwright** (headless Chromium) to:
@@ -668,10 +695,22 @@ checking the unit-test output.
    In devmode lsFusion auto-authenticates, so there is **no login form**
    and the landing screenshot already shows the navigator + forms. The
    first `verify` ever installs Playwright + Chromium (~120 MB); one-time.
-   For multi-step / remote / form-specific verification (clicking through
-   to a card to confirm a new field renders), use the lsfusion-eval
-   skill's Part 3 — it ships a Python Playwright template that goes
-   beyond `verify`'s one-screenshot scope.
+
+   **To verify a specific form, pass `-Click`** — it clicks navigator
+   entries by their visible text (chain with `>` for tab-then-entry) and
+   screenshots the opened form to `verify-click.png`, with the generous
+   first-open waits below already baked in:
+
+   ```
+   lsfdev.ps1 verify -Click "Master data > Items"
+   ```
+
+   Captions are locale-dependent — if the click misses, read the navigator
+   text off `verify-app.png` first and retry with what is actually
+   rendered. This covers the common "did my form/field render?" check; for
+   anything more involved (multi-step flows, opening a card via Edit,
+   remote hosts), use the lsfusion-eval skill's Part 3 — it ships a Python
+   Playwright template that goes beyond `verify`'s scope.
 
    **First form open after a `restart` is slow — use generous Playwright
    timeouts.** Opening a non-trivial form the first time after a restart

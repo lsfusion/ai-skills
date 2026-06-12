@@ -55,17 +55,22 @@ def main() -> int:
     ap.add_argument("--password", default="")
     ap.add_argument("--timeout", type=int, default=30000,
                     help="navigation timeout in ms")
+    ap.add_argument("--click", default="",
+                    help="after landing, click element(s) by visible text and "
+                         "screenshot the result; chain with '>' for tab-then-"
+                         "entry navigation, e.g. \"Master data > Items\"")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     login_png    = out_dir / "verify-login.png"
     app_png      = out_dir / "verify-app.png"
+    click_png    = out_dir / "verify-click.png"
     dom_path     = out_dir / "verify-dom.html"
     console_path = out_dir / "verify-console.txt"
 
     # Wipe previous artefacts so callers can rely on file presence.
-    for p in (login_png, app_png, dom_path, console_path):
+    for p in (login_png, app_png, click_png, dom_path, console_path):
         if p.exists():
             p.unlink()
 
@@ -76,9 +81,15 @@ def main() -> int:
         "login_attempted": False,
         "console_errors": 0,
         "error": None,
+        "click": {
+            "requested": bool(args.click.strip()),
+            "clicked": [],
+            "error": None,
+        },
         "artifacts": {
             "login_screenshot": str(login_png),
             "app_screenshot":   str(app_png),
+            "click_screenshot": str(click_png),
             "dom":              str(dom_path),
             "console":          str(console_path),
         },
@@ -145,6 +156,43 @@ def main() -> int:
                         result["error"] = f"login flow failed: {e}"
 
                 page.screenshot(path=str(app_png))
+
+                # Optional click-through: navigate to a specific form by the
+                # visible text of navigator entries ('>' chains tab -> entry),
+                # with generous waits - the FIRST open of a form after a
+                # restart takes 10-40 s while the server lazily builds it.
+                if result["click"]["requested"]:
+                    segments = [s.strip() for s in args.click.split(">") if s.strip()]
+                    seg = ""
+                    try:
+                        for seg in segments:
+                            target = page.get_by_text(seg, exact=True).first
+                            try:
+                                target.click(timeout=15000)
+                            except (PWTimeout, PWError):
+                                # Captions are locale-dependent and may carry
+                                # counters/whitespace - retry as substring.
+                                page.get_by_text(seg, exact=False).first.click(timeout=15000)
+                            result["click"]["clicked"].append(seg)
+                            page.wait_for_timeout(700)
+                        # The 'Loading' overlay may be localized - treat the
+                        # wait as best-effort, then settle on networkidle.
+                        try:
+                            page.wait_for_selector("text=Loading", state="detached", timeout=60000)
+                        except PWTimeout:
+                            pass
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=30000)
+                        except PWTimeout:
+                            pass
+                        page.wait_for_timeout(2500)
+                        # Dismiss a lingering navigator tooltip before the shot.
+                        page.mouse.click(700, 450)
+                        page.wait_for_timeout(300)
+                    except (PWTimeout, PWError) as e:
+                        result["click"]["error"] = f"click on {seg!r} failed: {e}"
+                    page.screenshot(path=str(click_png))
+
                 dom_path.write_text(page.content(), encoding="utf-8")
 
             finally:

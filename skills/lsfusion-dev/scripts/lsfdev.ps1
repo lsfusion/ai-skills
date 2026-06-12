@@ -23,6 +23,7 @@ param(
     [string]$AdminPassword = "",
     [string]$TopModule = "",
     [string]$Url = "",
+    [string]$Click = "",
     [string]$Script = "",
     [string]$ScriptFile = "",
     [int]$RmiPort = 7652,
@@ -908,13 +909,32 @@ function Cmd-StartServer {
         -not (Test-Path (Join-Path $ProjectDir "conf\settings.properties"))) {
         Warn "settings.properties not found (looked in project root and conf/) - re-run setup."
     }
-    # Count only source modules: target/ holds Maven-staged copies of the same
-    # files after a compile, and .lsfusion-dev/ may hold scratch scripts - both
-    # would double the number and make the line useless as a sanity signal.
-    $lsf = @(Get-ChildItem $ProjectDir -Recurse -Filter *.lsf -ErrorAction SilentlyContinue |
+    # Count only modules that will actually be on the classpath, mirroring the
+    # staging/classpath logic below: the Maven source roots when they exist,
+    # else loose top-level .lsf (flat-project fallback). A recursive scan over
+    # the whole project would also count Maven-staged copies in target/,
+    # scratch/seed scripts in .lsfusion-dev/, and stray files in unrelated
+    # subfolders - none of which load, making the number a misleading signal.
+    $srcRoots = @(@("src\main\lsfusion", "src\main\resources") |
+        ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ })
+    if ($srcRoots.Count) {
+        $lsf = @($srcRoots | ForEach-Object { Get-ChildItem $_ -Recurse -Filter *.lsf -ErrorAction SilentlyContinue })
+        $lsfWhere = "under src/main"
+    } else {
+        $lsf = @(Get-ChildItem $ProjectDir -File -Filter *.lsf -ErrorAction SilentlyContinue)
+        $lsfWhere = "at the project root"
+    }
+    if ($lsf.Count -eq 0) { Warn "No .lsf files found $lsfWhere - the server will start with system modules only." }
+    else { Info "Found $($lsf.Count) .lsf file(s) to load ($lsfWhere)." }
+    # Stray modules outside the loaded roots deserve a heads-up - a .lsf parked
+    # in docs/, scripts/ or next to the sources will silently NOT load.
+    $allLsf = @(Get-ChildItem $ProjectDir -Recurse -Filter *.lsf -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch '\\(target|\.lsfusion-dev|\.git)\\' })
-    if ($lsf.Count -eq 0) { Warn "No .lsf files found under $ProjectDir - the server will start with system modules only." }
-    else { Info "Found $($lsf.Count) .lsf file(s) to load." }
+    $strayCount = $allLsf.Count - $lsf.Count
+    if ($strayCount -gt 0) {
+        $verb = if ($strayCount -eq 1) { "is" } else { "are" }
+        Info "($strayCount more .lsf elsewhere in the project $verb NOT on the classpath and will not load.)"
+    }
 
     if ($useMaven) {
         # 'mvn compile' refreshes target/classes (Maven incremental, fast after
@@ -1265,11 +1285,13 @@ function Cmd-Verify {
     Info "Target : $target"
     Info "Login  : user '$($cfg.adminUser)', $(if ($cfg.adminPassword) { 'password from config' } else { 'empty password' })"
 
+    if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
+
     # Use --name=value form so an empty password is preserved through
     # PowerShell's native-argument handling (without =, empty strings get
     # dropped and argparse sees the next flag as the value).
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
-        "--user=$($cfg.adminUser)" "--password=$($cfg.adminPassword)" --timeout 30000) -join "`n"
+        "--user=$($cfg.adminUser)" "--password=$($cfg.adminPassword)" "--click=$Click" --timeout 30000) -join "`n"
     $pyExit = $LASTEXITCODE
 
     $r = $null
@@ -1291,7 +1313,19 @@ function Cmd-Verify {
         $tag = if ($r.logged_in) { "authenticated UI" } else { "post-submit state" }
         Ok "App screenshot ($tag) : $($r.artifacts.app_screenshot) ($kb KB)"
     }
-    Info "Open both PNGs with the Read tool to see what was rendered."
+    if ($r.click -and $r.click.requested) {
+        if (Test-Path $r.artifacts.click_screenshot) {
+            $kb = [math]::Round((Get-Item $r.artifacts.click_screenshot).Length / 1KB, 1)
+            Ok "Click screenshot      : $($r.artifacts.click_screenshot) ($kb KB)"
+        }
+        if ($r.click.error) {
+            Warn "Click-through failed after [$($r.click.clicked -join ' > ')]: $($r.click.error)"
+            Warn "Captions are locale-dependent - check verify-app.png for the actual navigator text."
+        } elseif ($r.click.clicked.Count) {
+            Ok "Clicked through: $($r.click.clicked -join ' > ')"
+        }
+    }
+    Info "Open the PNGs with the Read tool to see what was rendered."
 
     if ($r.login_attempted) {
         if ($r.logged_in) { Ok "Login flow succeeded - the authenticated screenshot shows the app." }
@@ -1353,6 +1387,15 @@ function Cmd-Api {
     $enc = [uri]::EscapeDataString($scriptText)
     $uri = "http://localhost:$($cfg.httpPort)/eval/action?script=$enc"
     Info "POST $uri"
+
+    # Snapshot the server log length so MESSAGE output can be surfaced after
+    # the call. Over HTTP a plain MESSAGE is swallowed entirely (empty 200, no
+    # log line), but MESSAGE ... NOWAIT IS written to the server log as
+    # "Server message: ..." - reading the log delta makes that visible here
+    # instead of forcing a second round-trip through 'lsfdev.ps1 log'.
+    $logLenBefore = 0
+    if (Test-Path $ServerOut) { $logLenBefore = (Get-Item $ServerOut).Length }
+
     try {
         $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
             -UseBasicParsing -TimeoutSec 30
@@ -1361,7 +1404,11 @@ function Cmd-Api {
         # (e.g. EXPORT FROM with Cyrillic values) prints correctly.
         $bytes = $resp.RawContentStream.ToArray()
         if ($bytes.Length) { Write-Host ([System.Text.Encoding]::UTF8.GetString($bytes)) }
-        else { Write-Host $resp.Content }
+        else {
+            Info "(empty response body - normal for actions without RETURN/EXPORT, but carries no proof either:"
+            Info " a plain MESSAGE is not returned over HTTP, and a constraint-canceled APPLY still answers 200."
+            Info " For mutations, end the script with: APPLY; IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();)"
+        }
     } catch {
         Bad "API call failed: $($_.Exception.Message)"
         if ($_.Exception.Response) {
@@ -1369,6 +1416,30 @@ function Cmd-Api {
             Write-Host $sr.ReadToEnd()
         }
     }
+
+    # Surface MESSAGE ... NOWAIT output ("Server message: ..." log lines)
+    # produced by this call. Plain MESSAGE never reaches the log - nothing to
+    # show for it (see the hint above).
+    try {
+        Start-Sleep -Milliseconds 300
+        if (Test-Path $ServerOut) {
+            $fs = [IO.File]::Open($ServerOut, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                if ($fs.Length -gt $logLenBefore) {
+                    $fs.Seek($logLenBefore, [IO.SeekOrigin]::Begin) | Out-Null
+                    $srLog = New-Object IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+                    $delta = $srLog.ReadToEnd()
+                    $msgs = @($delta -split "`r?`n" | Where-Object { $_ -match 'Server message:' })
+                    if ($msgs.Count) {
+                        # Covers MESSAGE ... NOWAIT *and* the constraint text a
+                        # canceled APPLY logs - both arrive as "Server message:".
+                        Info "Server messages (from the log):"
+                        $msgs | ForEach-Object { Write-Host ("    " + ($_ -replace '^.*Server message:\s*', '')) }
+                    }
+                }
+            } finally { $fs.Close() }
+        }
+    } catch { }
 }
 
 function Cmd-Open {
@@ -1479,6 +1550,10 @@ Common options:
   -ShutdownPort <port>  Tomcat shutdown port (default 8005).
   -Timeout <seconds>    Startup wait (default 180).
   -Url <url>            Target URL for 'verify'.
+  -Click <text>         'verify' only: click navigator entry(ies) by visible
+                        text before the final screenshot; chain with '>'
+                        (e.g. -Click "Master data > Items"). Output goes to
+                        verify-click.png; first form open gets generous waits.
   -Script <code>        Inline lsFusion action code for 'api' (ASCII-safe only).
   -ScriptFile <path>    UTF-8 file with lsFusion action code for 'api'. Preferred
                         for non-ASCII scripts (read from disk, never via argv).
