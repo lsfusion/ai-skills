@@ -59,6 +59,11 @@ def main() -> int:
                     help="after landing, click element(s) by visible text and "
                          "screenshot the result; chain with '>' for tab-then-"
                          "entry navigation, e.g. \"Master data > Items\"")
+    ap.add_argument("--viewport-width", type=int, default=1920)
+    ap.add_argument("--viewport-height", type=int, default=1080)
+    ap.add_argument("--locale", default="",
+                    help="browser context locale, e.g. ru-RU (affects browser-"
+                         "side language negotiation)")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -100,7 +105,17 @@ def main() -> int:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             try:
-                context = browser.new_context(viewport={"width": 1366, "height": 900})
+                # 1920x1080 default: narrower viewports (e.g. 1366x900) make
+                # dense forms (calendars, wide grids) collapse into "+N more"
+                # placeholders and the screenshot looks broken when the app is
+                # fine. Override with --viewport-width/--viewport-height.
+                ctx_kwargs = {
+                    "viewport": {"width": args.viewport_width,
+                                 "height": args.viewport_height},
+                }
+                if args.locale.strip():
+                    ctx_kwargs["locale"] = args.locale.strip()
+                context = browser.new_context(**ctx_kwargs)
                 page = context.new_page()
                 page.on("console", lambda m: console_lines.append(f"[{m.type}] {m.text}"))
 

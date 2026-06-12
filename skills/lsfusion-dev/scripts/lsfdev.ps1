@@ -24,6 +24,11 @@ param(
     [string]$TopModule = "",
     [string]$Url = "",
     [string]$Click = "",
+    [int]$ViewportWidth = 1920,
+    [int]$ViewportHeight = 1080,
+    [string]$Locale = "",
+    [string]$JvmArgs = "",
+    [string]$TomcatOpts = "",
     [string]$Script = "",
     [string]$ScriptFile = "",
     [int]$RmiPort = 7652,
@@ -498,9 +503,24 @@ function Stop-Tracked([string]$pidFile, [int[]]$ports, [string]$label) {
     }
     foreach ($p in $ports) {
         foreach ($procId in (Get-PortPids $p)) {
-            if (Process-Alive $procId) {
+            if (-not (Process-Alive $procId)) { continue }
+            # Kill by port ONLY when the process provably belongs to THIS
+            # project. Two parallel sessions on one box can drift onto the
+            # same ports, and an unconditional port-kill shoots the other
+            # session's server mid-schema-sync (empty stderr, log cut off
+            # mid-line). Ownership signals on the command line: the
+            # -Dlsfdev.project=<dir> marker every server JVM gets at launch,
+            # or this project's .lsfusion-dev path (Tomcat carries it in
+            # -Dcatalina.home). Anything else is reported, not killed.
+            $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue).CommandLine
+            $isOurs = $cmdline -and (
+                $cmdline.IndexOf("-Dlsfdev.project=$ProjectDir", [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                $cmdline.IndexOf($StateDir, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+            if ($isOurs) {
                 Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
                 $killed = $true
+            } else {
+                Warn "Port $p is held by PID $procId, which does not look like this project's process - NOT killing it. Stop it from its own project, or move this project to other ports (setup -RmiPort/-HttpPort/...)."
             }
         }
     }
@@ -630,11 +650,54 @@ function Cmd-Setup {
         adminUser     = (Pick "adminUser" "AdminUser" "admin")
         adminPassword = (Pick "adminPassword" "AdminPassword" "")
         topModule     = (Pick "topModule" "TopModule" "")
+        jvmArgs       = (Pick "jvmArgs" "JvmArgs" "")
+        tomcatOpts    = (Pick "tomcatOpts" "TomcatOpts" "")
         rmiPort       = (Pick "rmiPort" "RmiPort" 7652)
         httpPort      = (Pick "httpPort" "HttpPort" 7651)
         webSocketPort = (Pick "webSocketPort" "WebSocketPort" 8887)
         webPort       = (Pick "webPort" "WebPort" 8080)
         shutdownPort  = (Pick "shutdownPort" "ShutdownPort" 8005)
+    }
+    # When every port is still at its default, none was passed explicitly, and
+    # a default is already taken by a foreign process (typical: a second agent
+    # session on the same box), derive a deterministic per-project port set
+    # from the same path hash that names the database. Hash-derived ports land
+    # parallel sessions on disjoint values instead of having every agent walk
+    # the same "default+10" ladder and collide again.
+    $portFlagsPassed = @("RmiPort", "HttpPort", "WebSocketPort", "WebPort", "ShutdownPort") |
+        Where-Object { $ScriptBound.ContainsKey($_) }
+    $portsAtDefault = ($cfg.rmiPort -eq 7652 -and $cfg.httpPort -eq 7651 -and $cfg.webSocketPort -eq 8887 -and
+                       $cfg.webPort -eq 8080 -and $cfg.shutdownPort -eq 8005)
+    if (-not $portFlagsPassed -and $portsAtDefault) {
+        $ownPids = Get-OwnPids
+        $defaultPorts = if ($NoWeb) { @(7652, 7651, 8887) } else { @(7652, 7651, 8887, 8080, 8005) }
+        $busyDefaults = @($defaultPorts | Where-Object { Test-PortBusyForeign $_ $ownPids })
+        if ($busyDefaults.Count) {
+            $md5 = [System.Security.Cryptography.MD5]::Create()
+            $hashBytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($ProjectDir.ToLower()))
+            $md5.Dispose()
+            $seed = [Math]::Abs([BitConverter]::ToInt32($hashBytes, 0))
+            $derived = $false
+            for ($i = 0; $i -lt 100 -and -not $derived; $i++) {
+                # base in 20000..39990, step 10 - far from the well-known defaults
+                $base = 20000 + (((($seed % 2000) + $i) * 10) % 20000)
+                # NB: parentheses are load-bearing - PS's comma binds tighter
+                # than '+', so @($base + 2, ...) would parse as int + array.
+                $cand = @(($base + 2), ($base + 1), ($base + 7), $base, ($base + 5))   # rmi, http, ws, web, shutdown
+                if (-not @($cand | Where-Object { Test-PortBusyForeign $_ $ownPids })) {
+                    $cfg.rmiPort = $base + 2; $cfg.httpPort = $base + 1; $cfg.webSocketPort = $base + 7
+                    $cfg.webPort = $base; $cfg.shutdownPort = $base + 5
+                    $derived = $true
+                }
+            }
+            if ($derived) {
+                Info "Default port(s) $($busyDefaults -join ', ') are taken by another process - derived this project's ports from its path hash:"
+                Info "  RMI $($cfg.rmiPort), Action API $($cfg.httpPort), WebSocket $($cfg.webSocketPort), web $($cfg.webPort), Tomcat shutdown $($cfg.shutdownPort)."
+                Info "  (Deterministic for this path; pass -RmiPort/-HttpPort/... to choose your own.)"
+            } else {
+                Warn "Default port(s) busy and no free derived set found - pass explicit ports via setup flags."
+            }
+        }
     }
     Save-Config $cfg
     Ok "Config written (lsFusion $($cfg.version), Tomcat $($cfg.tomcatVersion))."
@@ -786,11 +849,12 @@ function Cmd-Setup {
                 Warn "Project commits db.name '$committedDbName' - every clone of this repo shares that database. Pass 'setup -DbName <unique> -Force' if this instance needs its own DB."
             }
         }
-        # Ports: only ever written when the user explicitly passed one (default
-        # ports stay implicit, same as the non-Maven path); never fill a default.
-        if ($ScriptBound.ContainsKey("RmiPort"))       { Apply-SettingsOverride $confSettings "rmi.port"       $cfg.rmiPort       $true | Out-Null }
-        if ($ScriptBound.ContainsKey("HttpPort"))      { Apply-SettingsOverride $confSettings "http.port"      $cfg.httpPort      $true | Out-Null }
-        if ($ScriptBound.ContainsKey("WebSocketPort")) { Apply-SettingsOverride $confSettings "webSocket.port" $cfg.webSocketPort $true | Out-Null }
+        # Ports: written when explicitly passed OR when non-default (the
+        # hash-derived set from the busy-defaults fallback must persist here
+        # too - the server reads ports from this file). Defaults stay implicit.
+        if ($ScriptBound.ContainsKey("RmiPort")       -or $cfg.rmiPort       -ne 7652) { Apply-SettingsOverride $confSettings "rmi.port"       $cfg.rmiPort       $true | Out-Null }
+        if ($ScriptBound.ContainsKey("HttpPort")      -or $cfg.httpPort      -ne 7651) { Apply-SettingsOverride $confSettings "http.port"      $cfg.httpPort      $true | Out-Null }
+        if ($ScriptBound.ContainsKey("WebSocketPort") -or $cfg.webSocketPort -ne 8887) { Apply-SettingsOverride $confSettings "webSocket.port" $cfg.webSocketPort $true | Out-Null }
         # A stale root settings.properties from an older skill run is dead weight
         # in Maven mode (never read) and only confuses - drop it, but only if we
         # generated it (carries our marker); never touch a hand-written root file.
@@ -1060,8 +1124,20 @@ function Cmd-StartServer {
     # deliberately do NOT pass -Drmi.port / -Dhttp.port / -DwebSocket.port here:
     # a -D arg would silently outrank settings.properties and re-introduce the
     # "ports live in two places" split.
+    # Extra user JVM args (setup -JvmArgs "..."), e.g. -Duser.language=ru or a
+    # bigger -Xmx. Appended AFTER the defaults so a user -Xmx wins (for
+    # duplicated JVM flags the last occurrence takes effect).
+    $extraJvm = @()
+    if ($cfg.PSObject.Properties.Name -contains 'jvmArgs' -and $cfg.jvmArgs) {
+        $extraJvm = @("$($cfg.jvmArgs)" -split '\s+' | Where-Object { $_ })
+        Info "Extra JVM args: $($extraJvm -join ' ')"
+    }
     $jvmArgs = @() + (Add-Opens $java.Major) + $devArgs + @(
-        "-Xmx2g", "-Dfile.encoding=UTF-8", "-cp", $cp,
+        "-Xmx2g", "-Dfile.encoding=UTF-8") + $extraJvm + @(
+        # Ownership marker for stop/restart: lets Stop-Tracked tell this
+        # project's JVM apart from another session's server on the same ports.
+        "-Dlsfdev.project=$ProjectDir",
+        "-cp", $cp,
         "lsfusion.server.logics.BusinessLogicsBootstrap"
     )
     # Do NOT echo the full java command line: the classpath alone can be ~30 KB,
@@ -1152,12 +1228,20 @@ function Cmd-StartWeb {
 
     $tempDir = Join-Path $tomcatHome "temp"
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-    $jvmArgs = @() + (Add-Opens $java.Major) + @(
+    # Extra user Tomcat JVM args (setup -TomcatOpts "..."), the CATALINA_OPTS
+    # analog - e.g. -Duser.language=ru for the web client.
+    $extraTomcat = @()
+    if ($cfg.PSObject.Properties.Name -contains 'tomcatOpts' -and $cfg.tomcatOpts) {
+        $extraTomcat = @("$($cfg.tomcatOpts)" -split '\s+' | Where-Object { $_ })
+        Info "Extra Tomcat JVM args: $($extraTomcat -join ' ')"
+    }
+    $jvmArgs = @() + (Add-Opens $java.Major) + $extraTomcat + @(
         "-Dcatalina.home=$tomcatHome",
         "-Dcatalina.base=$tomcatHome",
         "-Djava.io.tmpdir=$tempDir",
         "-Djava.util.logging.config.file=$tomcatHome\conf\logging.properties",
         "-Djava.util.logging.manager=org.apache.juli.ClassLoaderLogManager",
+        "-Dlsfdev.project=$ProjectDir",
         "-classpath", "$tomcatHome\bin\bootstrap.jar;$tomcatHome\bin\tomcat-juli.jar",
         "org.apache.catalina.startup.Bootstrap", "start"
     )
@@ -1286,12 +1370,15 @@ function Cmd-Verify {
     Info "Login  : user '$($cfg.adminUser)', $(if ($cfg.adminPassword) { 'password from config' } else { 'empty password' })"
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
+    Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
     # Use --name=value form so an empty password is preserved through
     # PowerShell's native-argument handling (without =, empty strings get
     # dropped and argparse sees the next flag as the value).
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
-        "--user=$($cfg.adminUser)" "--password=$($cfg.adminPassword)" "--click=$Click" --timeout 30000) -join "`n"
+        "--user=$($cfg.adminUser)" "--password=$($cfg.adminPassword)" "--click=$Click" `
+        --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
+        --timeout 30000) -join "`n"
     $pyExit = $LASTEXITCODE
 
     $r = $null
@@ -1360,12 +1447,12 @@ function Cmd-Api {
     # Authentication. The local dev server is ALWAYS launched in devmode (see
     # Cmd-StartServer), and devmode lets a request with NO Authorization header
     # through as the anonymous user. With an Authorization header present the
-    # server runs a real credential check instead: on current builds
-    # (7.0-SNAPSHOT, 2026-06) Basic auth for 'admin' with an EMPTY password
-    # passes that check too, but 6.x-era builds rejected it with HTTP 401 - so
-    # the no-header form is the only one that works across all platform
-    # versions, and we attach the header ONLY when a non-empty password is
-    # actually configured (admin password rotated, or a real account set up).
+    # server runs a real credential check instead: current builds (verified on
+    # 6.2 and 7.0-SNAPSHOT, 2026-06) accept Basic auth for 'admin' with an
+    # EMPTY password too, but at least one snapshot-era build was observed
+    # rejecting it with HTTP 401 - the no-header form has no such history, so
+    # we attach the header ONLY when a non-empty password is actually
+    # configured (admin password rotated, or a real account set up).
     # An explicitly-passed -AdminUser/-AdminPassword on the 'api' call
     # overrides whatever setup stored in config.json.
     $apiUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
@@ -1376,7 +1463,7 @@ function Cmd-Api {
         $headers["Authorization"] = "Basic $auth"
         Info "Authenticating as '$apiUser' (password configured)."
     } else {
-        Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent (works on every platform version; 6.x-era builds 401'd an empty-password Basic)."
+        Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent (the form that works on every platform build)."
     }
     # The script travels as a percent-encoded query parameter (NOT a POST form
     # body): EscapeDataString emits the UTF-8 bytes as %XX, which the server
@@ -1405,16 +1492,40 @@ function Cmd-Api {
         $bytes = $resp.RawContentStream.ToArray()
         if ($bytes.Length) { Write-Host ([System.Text.Encoding]::UTF8.GetString($bytes)) }
         else {
+            # The self-check recipe differs by platform version: RETURN is 7.0+
+            # only (a parse error on 6.x), where EXPORT FROM carries the value.
+            $recipe = if ("$($cfg.version)" -match '^6') {
+                "APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');"
+            } else {
+                "APPLY; IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');"
+            }
             Info "(empty response body - normal for actions without RETURN/EXPORT, but carries no proof either:"
             Info " a plain MESSAGE is not returned over HTTP, and a constraint-canceled APPLY still answers 200."
-            Info " For mutations, end the script with: APPLY; IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();)"
+            Info " For mutations, end the script with: $recipe)"
         }
     } catch {
-        Bad "API call failed: $($_.Exception.Message)"
-        if ($_.Exception.Response) {
-            $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream(), [System.Text.Encoding]::UTF8)
-            Write-Host $sr.ReadToEnd()
+        $errResp = $_.Exception.Response
+        $statusTag = ""
+        if ($errResp) { try { $statusTag = " (HTTP $([int]$errResp.StatusCode))" } catch { } }
+        Bad "API call failed$($statusTag): $($_.Exception.Message)"
+        # Print the error response body - for a 500 it carries the actual
+        # parse/type error from the server, which is the whole diagnosis.
+        # PS 5.1: the cmdlet usually stashes the body in ErrorDetails; the
+        # raw stream is a fallback (rewind it - the cmdlet may have read it).
+        $errBody = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
+        elseif ($errResp) {
+            try {
+                $stream = $errResp.GetResponseStream()
+                if ($stream -and $stream.CanSeek) { $stream.Position = 0 }
+                if ($stream) {
+                    $sr = New-Object IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                    $errBody = $sr.ReadToEnd()
+                }
+            } catch { }
         }
+        if ($errBody) { Write-Host $errBody }
+        else { Info "(the server sent no error body)" }
     }
 
     # Surface MESSAGE ... NOWAIT output ("Server message: ..." log lines)
@@ -1549,11 +1660,20 @@ Common options:
   -WebPort <port>       Tomcat HTTP port (default 8080).
   -ShutdownPort <port>  Tomcat shutdown port (default 8005).
   -Timeout <seconds>    Startup wait (default 180).
+  -JvmArgs "<args>"     Extra app-server JVM args, persisted at setup
+                        (e.g. -JvmArgs "-Duser.language=ru -Xmx4g"; appended
+                        after defaults, so a user -Xmx wins).
+  -TomcatOpts "<args>"  Extra Tomcat JVM args (CATALINA_OPTS analog),
+                        persisted at setup.
   -Url <url>            Target URL for 'verify'.
   -Click <text>         'verify' only: click navigator entry(ies) by visible
                         text before the final screenshot; chain with '>'
                         (e.g. -Click "Master data > Items"). Output goes to
                         verify-click.png; first form open gets generous waits.
+  -ViewportWidth/-ViewportHeight
+                        'verify' browser viewport (default 1920x1080; narrow
+                        viewports make dense forms look broken).
+  -Locale <tag>         'verify' browser locale, e.g. ru-RU.
   -Script <code>        Inline lsFusion action code for 'api' (ASCII-safe only).
   -ScriptFile <path>    UTF-8 file with lsFusion action code for 'api'. Preferred
                         for non-ASCII scripts (read from disk, never via argv).

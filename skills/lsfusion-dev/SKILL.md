@@ -187,9 +187,12 @@ with and stay consistent within the project.
 Key options: `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
 (`stable` — default; `dev`/`snapshot`; a major-version alias; or an exact
 tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
-`-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-FullStart`, `-Url`,
-`-Script`, `-ScriptFile`, `-Timeout`. Run the script with no command to
-print full usage.
+`-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
+(extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
+`-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-Url`, `-Click`,
+`-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
+`-ScriptFile`, `-Timeout`. Run the script with no command to print full
+usage.
 
 If port `8080` is taken (e.g. another Tomcat), pass `setup -WebPort <free port>`
 — the skill rewrites Tomcat's `server.xml` accordingly, and every later command
@@ -263,6 +266,14 @@ a second instance left on the default still starts fine — but stderr gets a
 that trace shows up after bringing up a second server, shift `webSocket.port`
 and restart. (`debugger.port`, default 1299, also exists but is bound only
 when debugging — it doesn't collide in normal runs.)
+
+You usually don't have to pick the numbers yourself: when `setup` runs with
+no port flags and finds a default port already taken by a foreign process,
+it **derives a deterministic per-project port set from the project-path
+hash** (the same hash that names the database), probes that the whole set is
+free, and persists it. Parallel agent sessions on one box thus land on
+disjoint ports instead of all reaching for "default+10" and colliding —
+explicit `-RmiPort`/... flags always override.
 
 `-RmiPort` / `-HttpPort` / `-WebSocketPort` follow the **exact same scheme as
 the database settings**: `setup` writes `rmi.port` / `http.port` /
@@ -497,6 +508,22 @@ web client opens directly on the navigator and the login form never
 appears** — both for the user's browser tab and for the headless `verify`
 run. (The default credentials matter only outside devmode.)
 
+**UI language.** On a host with a non-English locale the system UI
+(navigator, captions, validation messages) comes up in the **host
+language** — the server JVM inherits the OS locale. The resolution chain,
+strongest first:
+
+1. **Server JVM locale** — this is what actually governs the system
+   captions. Force it with `setup -JvmArgs "-Duser.language=ru
+   -Duser.country=RU"` (then `restart`).
+2. **Web-client JVM** — same flags via `setup -TomcatOpts "..."` for
+   client-side strings.
+3. **Per-user `Authentication.language`** — user-level localization;
+   setting `language(u) <- 'ru'` alone does **not** re-localize the system
+   captions, so don't stop there.
+4. **Browser locale** — browser-side negotiation only (`verify -Locale
+   ru-RU` for matching screenshots).
+
 **Lightstart: leave ON.** Devmode enables `-Dlsfusion.server.lightstart=true`;
 that's the default for every `restart`. Same code loads either way — lightstart
 only skips reloading user-side DB-stored UI prefs (table-view layout,
@@ -554,21 +581,18 @@ edit→restart cycles; it only matters after the first full schema load or a
 sync that touched many tables.
 
 > **UTF-8 / non-ASCII pitfall — read before sending Cyrillic (or any
-> non-ASCII) through the Action API.** The `api` command sends the script as a
-> **percent-encoded query parameter**, which the server decodes as UTF-8
-> reliably **on every platform version**. A raw `curl --data-urlencode
-> "script=…"` POST **form body** against `/eval/action` is version-dependent:
-> current builds (7.0-SNAPSHOT, verified 2026-06) decode it as UTF-8 too, but
-> 6.x-era builds used the platform default charset and silently turned every
-> non-ASCII character into `?` (rows full of `?????` while the `.lsf`
-> captions — read from disk as UTF-8 — still look fine, making it look like an
-> app bug rather than a transport bug). The query parameter behaves the same
-> everywhere — prefer the `api` command over gambling on the server's build
-> date. The pitfall that is **always** live, on every version, is the **argv
-> boundary on Windows**: an **inline** `-Script` value crosses the bash →
-> PowerShell argv boundary (Windows ANSI code page) and non-ASCII is mangled
-> to `?` *before anything is sent*. So put any non-ASCII script in a UTF-8
-> file and pass `-ScriptFile`:
+> non-ASCII) through the Action API.** The transport is NOT the problem:
+> with the server JVM on UTF-8 (lsfdev always passes
+> `-Dfile.encoding=UTF-8`), POST bodies and query parameters both carry
+> non-ASCII intact — verified byte-for-byte on 6.2 and 7.0-SNAPSHOT
+> (2026-06). The real corruption happens **on the Windows client side**, in
+> two places: **outbound**, an **inline** `-Script` value crosses the
+> bash → PowerShell argv boundary (Windows ANSI code page) and non-ASCII is
+> mangled to `?` *before anything is sent*; and **inbound**, piping a UTF-8
+> response through console tools re-decodes it in the ANSI code page and
+> *fabricates* mojibake that is not in the data (check bytes from a saved
+> file, not console output, before blaming the server). So put any
+> non-ASCII script in a UTF-8 file and pass `-ScriptFile`:
 >
 > ```
 > lsfdev.ps1 api -ScriptFile "C:/Work/proj/.lsfusion-dev/seed.lsf"
@@ -647,40 +671,49 @@ checking the unit-test output.
    note in step 4 (use the `api` command / `-ScriptFile`, not a raw `curl`
    POST body).
 
-   **Reading a value back: use `RETURN` (or `EXPORT FROM`), not `MESSAGE`.**
-   The `api` command prints the HTTP response body. The simplest way to put
-   a value there is `RETURN <expr>;` — the action's return value becomes the
-   body: `RETURN (GROUP SUM 1 IF ...);` answers a count in one call. For
-   tabular/structured data use `EXPORT FROM ...` (the export becomes the
-   body). A plain `MESSAGE` over HTTP is **swallowed entirely** — empty 200,
-   nothing in the response, nothing in the log; `MESSAGE ... NOWAIT` at
-   least lands in the **server log** (`Server message: ...`), and the `api`
-   command tails those lines and prints them after the call.
+   **Reading a value back: use `EXPORT FROM` (any version) or `RETURN`
+   (7.0+ only), never `MESSAGE`.** The `api` command prints the HTTP
+   response body. `EXPORT FROM res = <expr>;` puts a scalar (or rows, with
+   `EXPORT JSON FROM ...`) into the body on **every** platform version.
+   On **7.0+** there is the shorter `RETURN <expr>;` — but mind the
+   default: `setup` installs `stable` (currently **6.2**), where `RETURN`
+   is a **parse error** (`extraneous input ... expecting ';'`). A plain
+   `MESSAGE` over HTTP is **swallowed entirely** — empty 200, nothing in
+   the response, nothing in the log; `MESSAGE ... NOWAIT` at least lands
+   in the **server log** (`Server message: ...`), and the `api` command
+   tails those lines and prints them after the call.
 
    **A constraint-canceled `APPLY` is silent — HTTP 200 either way.** If a
    seed/mutation script violates a constraint (`NONULL`, `CONSTRAINT`,
    uniqueness), `APPLY` cancels, **no row lands, and the response is still
    an empty 200** — indistinguishable from success at the transport level.
    Never trust the status code for mutations: end every mutation script
-   with a self-check so the answer arrives in one call:
+   with a self-check so the answer arrives in one call. No `NEWSESSION`
+   wrapper — an eval call already runs in its own session, and `EXPORT`
+   inside `NEWSESSION` is silently discarded with the session:
 
    ```lsf
-   NEWSESSION {
-       // ... NEW / assignments ...
-       APPLY;
-       IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();
-   }
-   RETURN 'OK: ' + STRING(GROUP SUM 1 IF ...);   // count proves the data landed
+   // any version (6.x and 7.0+):
+   // ... NEW / assignments ...
+   APPLY;
+   EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');
+
+   // 7.0+ alternative:
+   // ... NEW / assignments ...
+   APPLY;
+   IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');
+   RETURN 'OK: ' + STRING((OVERRIDE (GROUP SUM 1 IF ...), 0));
    ```
 
-   `applyMessage()` carries the human-readable constraint text, so the
-   failed case diagnoses itself instead of costing a separate count query.
-   The `api` command adds two safety nets of its own: it prints a hint
-   whenever the body comes back empty, and it tails the server log for
+   `applyMessage()` carries the human-readable constraint text — wrapped in
+   `OVERRIDE` because it can be `NULL`, and `'CANCELED: ' + NULL` would
+   collapse the whole answer to an empty body. The `api` command adds two
+   safety nets of its own: it prints a version-appropriate hint whenever
+   the body comes back empty, and it tails the server log for
    `Server message:` lines after every call — which surfaces both
    `MESSAGE ... NOWAIT` output **and** the constraint text a canceled
    `APPLY` logs, so even an un-instrumented seed script usually shows its
-   failure reason right in the call output. The `RETURN`-based recipe is
+   failure reason right in the call output. The self-check recipe is
    still the contract to write: it works through any HTTP client, not just
    `lsfdev.ps1 api`.
 
@@ -711,6 +744,13 @@ checking the unit-test output.
    anything more involved (multi-step flows, opening a card via Edit,
    remote hosts), use the lsfusion-eval skill's Part 3 — it ships a Python
    Playwright template that goes beyond `verify`'s scope.
+
+   The viewport defaults to **1920×1080** — judge layout at a realistic
+   size before calling it broken: on a narrow viewport dense forms
+   (calendars, wide grids) legitimately collapse into `+N more`
+   placeholders and the screenshot *looks* buggy while the app is fine.
+   Override with `-ViewportWidth/-ViewportHeight`, and pass `-Locale`
+   (e.g. `ru-RU`) when the browser-side language matters for the shot.
 
    **First form open after a `restart` is slow — use generous Playwright
    timeouts.** Opening a non-trivial form the first time after a restart

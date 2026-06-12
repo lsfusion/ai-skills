@@ -99,11 +99,11 @@ Action API: devmode auto-auth applies **only to a request that carries no
 `Authorization` header at all** (it treats it as the anonymous user). A
 request that *does* send a header makes the server run a real credential
 check on what was sent — a wrong password gets **HTTP 401** even in devmode.
-How an **empty-password** Basic for `admin` fares is version-dependent:
-current builds (7.0-SNAPSHOT, verified 2026-06) accept it, 6.x-era builds
-rejected it with 401. The no-header form works on every version, so the
-`api` command sends **no** `Authorization` header unless a non-empty admin
-password is configured (`-AdminPassword` at setup, or stored in
+An **empty-password** Basic for `admin` is accepted by current builds
+(verified on 6.2 and 7.0-SNAPSHOT, 2026-06), though a snapshot-era build was
+once observed rejecting it with 401. The no-header form has no such history,
+so the `api` command sends **no** `Authorization` header unless a non-empty
+admin password is configured (`-AdminPassword` at setup, or stored in
 `config.json`); with the default blank password it calls anonymously. This is
 the same rule the **lsfusion-eval** skill documents: devmode → no `-u`;
 password set / rotated → `-u admin:<password>`.
@@ -154,6 +154,12 @@ unconditionally; shift it per instance when running several servers),
 `logics.includePaths` / `logics.excludePaths`,
 `user.language` / `user.country` (locale).
 
+Extra **JVM flags** are not settings.properties keys — pass them once via
+`setup -JvmArgs "-Duser.language=ru -Xmx4g"` (app server) and/or
+`-TomcatOpts "..."` (web client); they persist in `.lsfusion-dev/config.json`
+and are appended after the built-in defaults on every start, so a user
+`-Xmx` overrides the default `-Xmx2g`.
+
 To change ports, edit both `settings.properties` and
 `.lsfusion-dev/config.json` so the skill and the server agree.
 
@@ -180,7 +186,7 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | Web UI loads but shows a connection error | The application server is not running or not on `7652`. Check `lsfdev.ps1 status` and the server log. |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
-| `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong (or, on 6.x-era builds, empty) credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
+| `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong (or, on some snapshot-era builds, empty) credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
 
 ## Changing the lsFusion version
 
