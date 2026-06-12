@@ -73,8 +73,8 @@ you make from reading local code is wrong.
 | One-shot fix on production data (with user approval) | **This skill** — same path; **never** silently |
 | Clean up all rows of a class | **This skill** — POST a delete-and-apply script to `/eval/action` |
 | Evaluate an lsFusion expression / call an action on a running server | **This skill** — HTTP Action API |
-| Confirm a class / property / form exists in the running schema | **This skill** — `MESSAGE '...' + STRING(GROUP SUM 1 IF Class c IS Class);` over `/eval/action` |
-| Count / sample data | **This skill** — `EXPORT FROM count(...)` or `MESSAGE ...` |
+| Confirm a class / property / form exists in the running schema | **This skill** — `RETURN OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0;` over `/eval/action`: 200 + count = exists, 500 "not found" = it doesn't |
+| Count / sample data | **This skill** — `RETURN <expr>;` for a scalar, `EXPORT FROM ...` for rows |
 | See the `.lsf` source actually loaded on a remote host | **This skill** — `/files/list`, `/files/read`, `/files/search` on the web port |
 | Inspect physical DB tables / columns / indexes | Direct `psql` — but this is a last resort; **first ask the user**, per the rule in the **lsfusion-dev** skill. lsFusion mangles names; raw SQL almost always misleads. |
 | Edit `.lsf` source | The lsfusion-dev skill + IDE MCP tools |
@@ -115,8 +115,9 @@ from where you're running curl:
 | `/eval/action?script=<code>` | Run an **action-body** snippet directly (no surrounding `run() { ... }` wrapper needed) | `script=` |
 
 Most introspection ("does this class exist", "count rows", "send a value
-back") fits `/eval/action` — you write one line of action code, the server
-runs it, you read the status.
+back") fits `/eval/action` — you write one line of action code ending in
+`RETURN <expr>;`, the server runs it, you read the value in the response
+body (the status code alone only proves the script compiled).
 
 **Per-action access control.** A project action is only callable via the API
 if its declaration carries an access annotation:
@@ -182,16 +183,16 @@ that exists on every version: on Windows, non-ASCII in a native curl's
 inline.
 
 ```bash
-# Local dev (devmode), inline script
+# Local dev (devmode), inline script — response body is "hello"
 curl -sS -X POST \
   -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
-  --data-urlencode "script=MESSAGE 'hello';" \
+  --data-urlencode "script=RETURN 'hello';" \
   http://localhost:7651/eval/action
 
 # Production (devmode off), inline script, on HTTPS via web port
 curl -sS -u 'admin:' -X POST \
   -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
-  --data-urlencode "script=MESSAGE 'hello';" \
+  --data-urlencode "script=RETURN 'hello';" \
   https://<host>/eval/action
 
 # Long script from a file (avoid quoting hell).
@@ -228,20 +229,24 @@ is part of the workflow.
 
 | Status | Meaning |
 |---|---|
-| `HTTP 200`, empty body | Script compiled, name-resolved against the running schema, and ran. For `MESSAGE` calls this is the success state — `MESSAGE` writes to a UI popup, which over HTTP has nowhere to go, so a clean 200 is the only signal. |
+| `HTTP 200`, empty body | Script compiled, name-resolved against the running schema, and ran — **nothing more**. A `MESSAGE` produces exactly this (its text is swallowed — see the gotchas), and so does a mutation whose `APPLY` was silently **canceled by a constraint**. An empty 200 is never data-level proof; write scripts that `RETURN` something. |
 | `HTTP 200`, body present | Script ended in `RETURN <expr>;` or declared an `EXPORT FROM ...` — the value/export is the body. See "Getting values back" below. |
 | `HTTP 401` | Auth issue — see the trap table above. Usually means you sent the wrong `-u` form, NOT that the password is wrong. |
 | `HTTP 500`, body with `[error]:` and a stack trace | Script reached the type-checker and failed there. Common causes: type mismatch (mixing INTEGER with STRING in `+`, forgetting `STRING(...)` around a number), unknown name (the class / property doesn't exist in the running schema — proof the deployed config differs from yours), `OVERRIDE` argument-type mismatch. Read the first error line; subsequent ones are cascading. |
 | `HTTP 404` | Endpoint not in this build (no `Eval` module REQUIREd, or wrong path). |
 
-A clean 200 against `/eval/action` with `MESSAGE 'x' + STRING(... MyClass ...)`
-is the canonical "is this name in the running schema?" check — if the parser
-got past name resolution and the type-checker, the name exists.
+The canonical "is this name in the running schema?" check is
+`RETURN OVERRIDE (GROUP SUM 1 IF MyClass o IS MyClass), 0;` against
+`/eval/action` — a 500 "not found" answers *no*, a 200 with the count in the
+body answers *yes* (and tells you how many). Don't use `MESSAGE` for this:
+it yields the same empty 200 as half a dozen failure modes.
 
 ### Getting values back
 
-`MESSAGE` is great for proving compilation but useless for getting data back.
-Two ways to actually read a value:
+`MESSAGE` is useless over the Action API: its text is swallowed entirely —
+not in the response body, and (for a plain `MESSAGE`) not even in the server
+log; only `MESSAGE ... NOWAIT` leaves a `Server message:` line in the log.
+Don't put `MESSAGE` in API scripts at all. Two ways to actually read a value:
 
 **1. `RETURN <expr>;` — the action's return value becomes the response
 body.** Simplest path for a scalar (a count, a name, a flag). Works on both
@@ -283,20 +288,26 @@ EXPORT JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
   http://localhost:7651/eval/action
 ```
 
-For one-off introspection (just confirming a class exists), prefer `MESSAGE`
-+ status code — much simpler and the status code is sufficient evidence.
+For one-off introspection (just confirming a class exists), `RETURN` is also
+the shortest form — the same one-liner as a compile-probe, but the count
+comes back in the body instead of an ambiguous empty 200.
 
 ### Common recipes
 
+All verified against a live 7.0-SNAPSHOT; each answers in the response body.
+
 ```lsf
-// Does class X exist?
-MESSAGE 'X count = ' + STRING(GROUP SUM 1 IF X x IS X);
+// Does class X exist, and how many objects? 200 + count = yes; 500 "not found" = no.
+RETURN OVERRIDE (GROUP SUM 1 IF X x IS X), 0;
 
-// Does property p(Class) exist and what does it count?
-MESSAGE 'p set on ' + STRING(GROUP SUM 1 IF p(Class c)) + ' / ' + STRING(GROUP SUM 1 IF c IS Class);
+// Does property p(Class) exist, and on how many objects is it set?
+RETURN STRING((OVERRIDE (GROUP SUM 1 IF p(Class c)), 0)) + ' / ' +
+       STRING((OVERRIDE (GROUP SUM 1 IF c IS Class), 0));
 
-// First 5 names from class X (sample)
-FOR Item i IS Item ORDER name(i) LIMIT 5 DO MESSAGE name(i);
+// First 5 names from class X (sample). ORDER by the PROPERTY, not the alias:
+// ORDER nm compiles but fails at runtime with a misleading
+// "Set operations is invalid" 500.
+EXPORT JSON FROM nm = name(X x) ORDER name(x) TOP 5;
 
 // Module loaded? Reference an element only that module defines — a class
 // works best: 200 = loaded, 500 "not found" = not in the running config.
@@ -308,7 +319,10 @@ RETURN OVERRIDE (GROUP SUM 1 IF Task t IS Task), 0;   // probes the Task module
 config REQUIREs `Eval`.)
 
 Always wrap counts in `STRING(...)` when concatenating with text — `+` between
-INTEGER and STRING is a type error and produces a confusing 500.
+INTEGER and STRING is a type error and produces a confusing 500. And when a
+comma-bearing `OVERRIDE` sits inside an argument list, give it its own
+parentheses (`STRING((OVERRIDE ..., 0))`), or the comma is parsed as an
+argument separator.
 
 ### Chaining and verifying
 
@@ -331,11 +345,21 @@ curl -sS -X POST \
 
 **`HTTP 200` is not proof the mutation landed.** The server returns 200
 when the script *compiled and ran* — but a failed `APPLY` (constraint
-violation, missing required field, etc.) returns the same 200. To prove
-the data actually changed, follow the mutation with a count check (a
-separate eval call that reads the count back via `RETURN` — or fold it in:
-`NEWSESSION { ... APPLY; } RETURN <count expr>;` in one script) or with a
-Playwright screenshot of the list form (Part 3).
+violation, missing required field, etc.) cancels silently and returns the
+same 200 with an empty body. Make every mutation script self-checking:
+
+```lsf
+NEWSESSION {
+    // ... NEW / assignments ...
+    APPLY;
+    IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();
+}
+RETURN 'OK: ' + STRING(GROUP SUM 1 IF ...);   // count proves the data landed
+```
+
+`applyMessage()` returns the human-readable constraint text, so a failure
+diagnoses itself in the same round-trip. Alternatively verify with a
+separate count call or a Playwright screenshot of the list form (Part 3).
 Don't trust the transport-level 200 as data-level confirmation.
 
 **Leave no trace in the codebase.** A one-shot seed / cleanup / fix
@@ -598,9 +622,13 @@ and replace the body with whatever your task needs. Output goes to
   recommends. If the deployed project doesn't have it, `/eval/action`
   returns 404 — you'll have to deploy a temporary build with `Eval` added,
   or use `/exec?action=<an action the project itself declares with @@api>`.
-- **`MESSAGE` returns no body over HTTP** — that's not a bug; `MESSAGE` is
-  a UI popup which the HTTP path can't deliver. For data back, use
-  `RETURN <expr>;` or `EXPORT FROM`.
+- **`MESSAGE` is pointless in API scripts.** Over HTTP its text is swallowed
+  entirely: not in the response body, and (plain `MESSAGE`) not even in the
+  server log — only `MESSAGE ... NOWAIT` leaves a `Server message:` log line.
+  The constraint text of a canceled `APPLY` behaves the same way: server log
+  only, never the response. So over the API, data comes back **only** via
+  `RETURN <expr>;` / `EXPORT FROM`, and a mutation outcome **only** via an
+  explicit check: `APPLY; IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();`.
 - **The eval API is a runtime tool.** Don't use it as a substitute for
   proper migration scripts or for changing production data without
   approval — that's exactly the kind of action the user trust pattern
