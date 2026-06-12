@@ -73,8 +73,8 @@ you make from reading local code is wrong.
 | One-shot fix on production data (with user approval) | **This skill** — same path; **never** silently |
 | Clean up all rows of a class | **This skill** — POST a delete-and-apply script to `/eval/action` |
 | Evaluate an lsFusion expression / call an action on a running server | **This skill** — HTTP Action API |
-| Confirm a class / property / form exists in the running schema | **This skill** — `RETURN OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0;` over `/eval/action`: 200 + count = exists, 500 "not found" = it doesn't |
-| Count / sample data | **This skill** — `RETURN <expr>;` for a scalar, `EXPORT FROM ...` for rows |
+| Confirm a class / property / form exists in the running schema | **This skill** — `RETURN OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0;` over `/eval/action` (7.0+; on 6.x: `EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0);`): 200 + count = exists, 500 "not found" = it doesn't |
+| Count / sample data | **This skill** — `RETURN <expr>;` (7.0+) or `EXPORT FROM ...` (any version) |
 | See the `.lsf` source actually loaded on a remote host | **This skill** — `/files/list`, `/files/read`, `/files/search` on the web port |
 | Inspect physical DB tables / columns / indexes | Direct `psql` — but this is a last resort; **first ask the user**, per the rule in the **lsfusion-dev** skill. lsFusion mangles names; raw SQL almost always misleads. |
 | Edit `.lsf` source | The lsfusion-dev skill + IDE MCP tools |
@@ -115,9 +115,16 @@ from where you're running curl:
 | `/eval/action?script=<code>` | Run an **action-body** snippet directly (no surrounding `run() { ... }` wrapper needed) | `script=` |
 
 Most introspection ("does this class exist", "count rows", "send a value
-back") fits `/eval/action` — you write one line of action code ending in
-`RETURN <expr>;`, the server runs it, you read the value in the response
-body (the status code alone only proves the script compiled).
+back") fits `/eval/action` — you write one line of action code that sends
+the answer back in the response body, the server runs it, you read the
+value (the status code alone only proves the script compiled). **The
+value-returning statement depends on the platform major version**: `RETURN
+<expr>;` exists on **7.0+ only** — on 6.x (including the current `stable` =
+6.2 that the lsfusion-dev skill installs by default) it is a **parse
+error** (`extraneous input ... expecting ';'`); the 6.x equivalent is
+`EXPORT FROM res = <expr>;`, which works on every version. Check the
+target's version first (`Current version:` in the server log) and pick the
+matching form below.
 
 **Per-action access control.** A project action is only callable via the API
 if its declaration carries an access annotation:
@@ -153,34 +160,41 @@ to get wrong:
 Devmode-auto-auth fires **only** when the server sees no header; with a
 header present the server runs a real credential check on what you sent.
 `-u admin:<wrong-guess>` therefore returns `HTTP 401` even in devmode —
-don't try `-u admin:fusion` or `-u admin:admin` "just in case". How an
-**empty-password** Basic (`-u admin:`) fares in devmode is version-dependent:
-current builds (7.0-SNAPSHOT, verified 2026-06) accept it (the empty password
-matches the default admin account and returns 200), while 6.x-era builds
-rejected it with 401. The no-header form is the only one that behaves the
-same on every version — make it your default for devmode, and fall back to a
-real password only if the user supplies one.
+don't try `-u admin:fusion` or `-u admin:admin` "just in case". An
+**empty-password** Basic (`-u admin:`) is accepted by current builds (200
+verified on both 6.2 and 7.0-SNAPSHOT, 2026-06; the empty password matches
+the default admin account), though at least one snapshot-era build has been
+observed rejecting it with 401. The no-header form has no such history —
+make it your default for devmode, and fall back to a real password only if
+the user supplies one.
 
 ### Sending an lsFusion script via curl
 
 Use **POST** with `Content-Type: application/x-www-form-urlencoded; charset=UTF-8`
 and pass the script through `--data-urlencode script=...`. Keep the charset
-suffix — it costs nothing and is correct hygiene — but don't rely on it as a
-non-ASCII guarantee: on current builds (7.0-SNAPSHOT, verified 2026-06) the
-server decodes the form body as UTF-8 with or without it, while 6.x-era
-builds were observed mangling non-ASCII POST bodies to `?` (whether the
-charset attribute helped there was never isolated). For a script that
-carries non-ASCII text, the transport that behaves the same on **every**
-version is the **query string**: `curl -G --data-urlencode "script@file"`
-(or building the `?script=` URL from PowerShell). Note the two concerns are
-orthogonal — `-G` moves the payload out of the POST body (old-build server
-decode), while reading from a **file** keeps it out of argv (Windows
-client-side mangling); `script@file` *without* `-G` is still a POST body, so
-against an old or unknown build combine both. The argv corruption is the one
-that exists on every version: on Windows, non-ASCII in a native curl's
-**inline argument** is mangled at the argv boundary before anything is sent
-(see the gotchas below) — pass non-ASCII scripts from a **file**, never
-inline.
+suffix as cheap hygiene — but know where non-ASCII *actually* gets
+corrupted, because it is **not the HTTP transport**: with the server JVM on
+a UTF-8 default encoding (lsfusion-dev always passes
+`-Dfile.encoding=UTF-8`; the lsfusion-deploy skill's locale preflight
+ensures it on servers), Cyrillic survives POST bodies and query strings
+alike — verified **byte-for-byte on both 6.2 and 7.0-SNAPSHOT** (2026-06),
+on the app-server port and the web port. The corruptions that do happen are
+**client-side, on Windows**:
+
+- **Outbound — argv.** Non-ASCII in a native curl's **inline** argument is
+  re-encoded to the ANSI code page before curl even runs, and the server
+  faithfully stores `?`. Pass non-ASCII scripts from a **file**
+  (`--data-urlencode "script@C:/path/file.lsf"`) or send from PowerShell —
+  never inline.
+- **Inbound — console pipes.** Piping a UTF-8 response through console
+  tools re-decodes it in the ANSI code page and *fabricates* mojibake that
+  is not in the data. Verify **bytes**, not console text: `curl -o
+  resp.json`, then read the file as UTF-8. (Exactly this artifact has
+  produced false "the server mangles Cyrillic" reports before.)
+
+If a server *was* installed with a non-UTF-8 locale (legacy hosts), fix the
+JVM encoding per the lsfusion-deploy skill's locale section instead of
+fighting transports.
 
 ```bash
 # Local dev (devmode), inline script — response body is "hello"
@@ -235,11 +249,13 @@ is part of the workflow.
 | `HTTP 500`, body with `[error]:` and a stack trace | Script reached the type-checker and failed there. Common causes: type mismatch (mixing INTEGER with STRING in `+`, forgetting `STRING(...)` around a number), unknown name (the class / property doesn't exist in the running schema — proof the deployed config differs from yours), `OVERRIDE` argument-type mismatch. Read the first error line; subsequent ones are cascading. |
 | `HTTP 404` | Endpoint not in this build (no `Eval` module REQUIREd, or wrong path). |
 
-The canonical "is this name in the running schema?" check is
-`RETURN OVERRIDE (GROUP SUM 1 IF MyClass o IS MyClass), 0;` against
-`/eval/action` — a 500 "not found" answers *no*, a 200 with the count in the
-body answers *yes* (and tells you how many). Don't use `MESSAGE` for this:
-it yields the same empty 200 as half a dozen failure modes.
+The canonical "is this name in the running schema?" check against
+`/eval/action` is
+`EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF MyClass o IS MyClass), 0);`
+(or the `RETURN` one-liner on 7.0+) — a 500 "not found" answers *no*, a 200
+with the count in the body answers *yes* (and tells you how many). Don't use
+`MESSAGE` for this: it yields the same empty 200 as half a dozen failure
+modes.
 
 ### Getting values back
 
@@ -248,10 +264,11 @@ not in the response body, and (for a plain `MESSAGE`) not even in the server
 log; only `MESSAGE ... NOWAIT` leaves a `Server message:` line in the log.
 Don't put `MESSAGE` in API scripts at all. Two ways to actually read a value:
 
-**1. `RETURN <expr>;` — the action's return value becomes the response
-body.** Simplest path for a scalar (a count, a name, a flag). Works on both
-endpoints: as the last statement of an `/eval/action` body, or inside `run()`
-for `/eval`.
+**1. `RETURN <expr>;` (platform 7.0+ only) — the action's return value
+becomes the response body.** Simplest path for a scalar (a count, a name, a
+flag). Works on both endpoints: as the last statement of an `/eval/action`
+body, or inside `run()` for `/eval`. **On 6.x this is a parse error** — use
+`EXPORT FROM` (method 2), which carries scalars just as well.
 
 ```bash
 # count via /eval/action — response body is the number, e.g. "6"
@@ -273,10 +290,10 @@ curl -sS -X POST \
 > 2026-06) it is silently ignored — HTTP 200 with an **empty body**, which
 > reads like "no value". `RETURN` replaces it outright.
 
-**2. `EXPORT FROM` to stdout via the response body.** For tabular /
-structured data the action's `EXPORT` target becomes the HTTP response
-body — content type is derived from the file extension or specified
-explicitly.
+**2. `EXPORT FROM` to stdout via the response body — works on every
+version.** For tabular / structured data (and, on 6.x, for scalars too) the
+action's `EXPORT` target becomes the HTTP response body — content type is
+derived from the format keyword.
 
 ```bash
 # (localhost devmode → NO -u; on production add -u 'admin:')
@@ -286,7 +303,17 @@ curl -sS -X POST \
 EXPORT JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
 " \
   http://localhost:7651/eval/action
+
+# scalar via EXPORT — the 6.x substitute for RETURN (works on 7.0+ too):
+#   EXPORT FROM res = 'hello';            → {"res":"hello"}
+#   EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Item i IS Item), 0);
 ```
+
+**Don't wrap `EXPORT` in `NEWSESSION { ... }`.** The export lands in a
+session-local property; a surrounding `NEWSESSION` discards it on exit and
+the response comes back **empty with HTTP 200** (verified on 6.2). One-shot
+eval scripts don't need `NEWSESSION` at all — every `/eval`/`/eval/action`
+call already runs in its own fresh session.
 
 For one-off introspection (just confirming a class exists), `RETURN` is also
 the shortest form — the same one-liner as a compile-probe, but the count
@@ -294,15 +321,18 @@ comes back in the body instead of an ambiguous empty 200.
 
 ### Common recipes
 
-All verified against a live 7.0-SNAPSHOT; each answers in the response body.
+Each answers in the response body. The `EXPORT` forms run on **every**
+platform version (verified live on 6.2 and 7.0-SNAPSHOT, 2026-06); on 7.0+
+any of them can be shortened to `RETURN <the same expr>;`.
 
 ```lsf
 // Does class X exist, and how many objects? 200 + count = yes; 500 "not found" = no.
-RETURN OVERRIDE (GROUP SUM 1 IF X x IS X), 0;
+EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF X x IS X), 0);
+// 7.0+ shorthand: RETURN OVERRIDE (GROUP SUM 1 IF X x IS X), 0;
 
 // Does property p(Class) exist, and on how many objects is it set?
-RETURN STRING((OVERRIDE (GROUP SUM 1 IF p(Class c)), 0)) + ' / ' +
-       STRING((OVERRIDE (GROUP SUM 1 IF c IS Class), 0));
+EXPORT FROM res = STRING((OVERRIDE (GROUP SUM 1 IF p(Class c)), 0)) + ' / ' +
+                  STRING((OVERRIDE (GROUP SUM 1 IF c IS Class), 0));
 
 // First 5 names from class X (sample). ORDER by the PROPERTY, not the alias:
 // ORDER nm compiles but fails at runtime with a misleading
@@ -311,7 +341,7 @@ EXPORT JSON FROM nm = name(X x) ORDER name(x) TOP 5;
 
 // Module loaded? Reference an element only that module defines — a class
 // works best: 200 = loaded, 500 "not found" = not in the running config.
-RETURN OVERRIDE (GROUP SUM 1 IF Task t IS Task), 0;   // probes the Task module
+EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Task t IS Task), 0);   // probes the Task module
 ```
 
 (For the `Eval` module specifically no probe is needed — a working
@@ -346,19 +376,27 @@ curl -sS -X POST \
 **`HTTP 200` is not proof the mutation landed.** The server returns 200
 when the script *compiled and ran* — but a failed `APPLY` (constraint
 violation, missing required field, etc.) cancels silently and returns the
-same 200 with an empty body. Make every mutation script self-checking:
+same 200 with an empty body. Make every mutation script self-checking; no
+`NEWSESSION` wrapper is needed (an eval call already runs in its own
+session) — and with `EXPORT` it would even *break* the readback (see the
+note in "Getting values back"):
 
 ```lsf
-NEWSESSION {
-    // ... NEW / assignments ...
-    APPLY;
-    IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();
-}
-RETURN 'OK: ' + STRING(GROUP SUM 1 IF ...);   // count proves the data landed
+// any version (6.x and 7.0+):
+// ... NEW / assignments ...
+APPLY;
+EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');
+
+// 7.0+ alternative with RETURN:
+// ... NEW / assignments ...
+APPLY;
+IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');
+RETURN 'OK: ' + STRING((OVERRIDE (GROUP SUM 1 IF ...), 0));   // count proves it landed
 ```
 
-`applyMessage()` returns the human-readable constraint text, so a failure
-diagnoses itself in the same round-trip. Alternatively verify with a
+`applyMessage()` carries the human-readable constraint text — but it can be
+`NULL`, and `'CANCELED: ' + NULL` is `NULL` (an empty response that looks
+like success), so always wrap it in `OVERRIDE`. Alternatively verify with a
 separate count call or a Playwright screenshot of the list form (Part 3).
 Don't trust the transport-level 200 as data-level confirmation.
 
@@ -590,23 +628,22 @@ and replace the body with whatever your task needs. Output goes to
 
 - **`-u admin:` ≠ no `-u`.** Repeat after me. The single mistake worth more
   than all the others combined.
-- **Charset suffix: keep it, but don't bet on it.** Always send
-  `Content-Type: application/x-www-form-urlencoded; charset=UTF-8`. Current
-  builds (7.0-SNAPSHOT, verified 2026-06) decode the form body as UTF-8 with
-  or without the suffix; 6.x-era builds were observed turning non-ASCII POST
-  bodies into `?` server-side — the script then failed name resolution
-  against a Cyrillic-named class with a misleading "not found" error. For
-  non-ASCII payloads against an old or unknown build, don't gamble on the
-  POST body at all — move the script to the query string with
-  `curl -G --data-urlencode "script@file"` (the `-G` handles the old-build
-  body decode, the file handles Windows argv mangling; `script@file` alone
-  is still a POST body), or send from PowerShell (see Part 1).
-- **On Windows, inline non-ASCII dies at the argv boundary — on every
-  version.** Git Bash re-encodes a native `curl.exe`'s arguments to the ANSI
-  code page, so Cyrillic/CJK in an inline `script=...` argument is already
-  `?` before curl even runs (server-side everything is then "correct" —
-  garbage in, garbage stored). Pass non-ASCII scripts from a file
-  (`--data-urlencode "script@C:/path/file.lsf"`) or send from PowerShell.
+- **Non-ASCII corruption is client-side, not transport-side.** With the
+  server JVM on UTF-8 (the dev and deploy skills both ensure it), POST
+  bodies and query strings carry Cyrillic intact on 6.2 and 7.0 alike —
+  verified byte-for-byte. Keep the `charset=UTF-8` suffix as hygiene, but
+  when characters break, look at the Windows client first (next bullet) or
+  at a legacy server installed under a non-UTF-8 locale (lsfusion-deploy
+  locale section).
+- **On Windows, inline non-ASCII dies at the argv boundary — and console
+  pipes fake mojibake on the way back.** Git Bash re-encodes a native
+  `curl.exe`'s arguments to the ANSI code page, so Cyrillic/CJK in an inline
+  `script=...` argument is already `?` before curl even runs. And piping a
+  UTF-8 response through console tools re-decodes it in the ANSI code page,
+  fabricating mojibake that is not in the data. Send non-ASCII scripts from
+  a file (`--data-urlencode "script@C:/path/file.lsf"`), and verify results
+  from a saved file read as UTF-8 (`curl -o resp.json`), not from console
+  text.
 - **Use `--data-urlencode`, not `--data`.** With `--data` the shell does
   no encoding and `&`, `+`, `=`, `%` inside your script become protocol
   syntax — the server then parses garbage.
@@ -627,8 +664,9 @@ and replace the body with whatever your task needs. Output goes to
   server log — only `MESSAGE ... NOWAIT` leaves a `Server message:` log line.
   The constraint text of a canceled `APPLY` behaves the same way: server log
   only, never the response. So over the API, data comes back **only** via
-  `RETURN <expr>;` / `EXPORT FROM`, and a mutation outcome **only** via an
-  explicit check: `APPLY; IF canceled() THEN RETURN 'CANCELED: ' + applyMessage();`.
+  `EXPORT FROM` (any version) / `RETURN <expr>;` (7.0+), and a mutation
+  outcome **only** via an explicit check:
+  `APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');`.
 - **The eval API is a runtime tool.** Don't use it as a substitute for
   proper migration scripts or for changing production data without
   approval — that's exactly the kind of action the user trust pattern
