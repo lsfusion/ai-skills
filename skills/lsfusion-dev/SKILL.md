@@ -313,6 +313,11 @@ config. After the switch, the Action API moves with `http.port` (e.g.
 **Each instance needs its own `-DbName`** — two servers pointed at the same
 database will fight over the schema. Use distinct names (the default name is
 derived from the project path, so distinct project dirs already differ).
+`setup` **always persists `db.name`** into `settings.properties` and never
+drops it on a re-run: a later `setup -Force` (e.g. just to change a JVM flag)
+preserves the database the instance was using — it does not silently fall
+back to the shared default DB. To repoint at a different database you must
+say so explicitly with `-DbName`.
 **Watch out for a repo-committed `db.name`**: when a cloned project ships
 `conf/settings.properties` with a `db.name` line, that committed value wins
 over the per-project default — every clone of the repo then points at the
@@ -688,9 +693,13 @@ checking the unit-test output.
    uniqueness), `APPLY` cancels, **no row lands, and the response is still
    an empty 200** — indistinguishable from success at the transport level.
    Never trust the status code for mutations: end every mutation script
-   with a self-check so the answer arrives in one call. No `NEWSESSION`
-   wrapper — an eval call already runs in its own session, and `EXPORT`
-   inside `NEWSESSION` is silently discarded with the session:
+   with a self-check so the answer arrives in one call. Keep the
+   value-returning statement at the **top level** — an eval call already
+   runs in its own session, so no `NEWSESSION` wrapper is needed, and
+   wrapping matters for the `EXPORT` form specifically: `EXPORT`'s result
+   is a session-local property, silently discarded when the `NEWSESSION`
+   exits (`RETURN`, being stack control flow, survives `NEWSESSION` — but
+   don't add the wrapper just to rely on that):
 
    ```lsf
    // any version (6.x and 7.0+):
