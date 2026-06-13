@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "lsFusion AI assistant skills and MCP integration",
-    "version": "0.1.5"
+    "version": "0.1.6"
   },
   "plugins": [
     {
