@@ -310,10 +310,14 @@ EXPORT JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
 ```
 
 **Don't wrap `EXPORT` in `NEWSESSION { ... }`.** The export lands in a
-session-local property; a surrounding `NEWSESSION` discards it on exit and
-the response comes back **empty with HTTP 200** (verified on 6.2). One-shot
-eval scripts don't need `NEWSESSION` at all — every `/eval`/`/eval/action`
-call already runs in its own fresh session.
+session-local property (`exportFile()`), which the HTTP layer reads *after*
+the action finishes; a surrounding `NEWSESSION` throws that property away on
+exit, so the response comes back **empty with HTTP 200** (verified on 6.2
+and 7.0). This is specific to `EXPORT` — `RETURN` is control flow that
+propagates up the stack, so `NEWSESSION { ... RETURN x; }` *does* return `x`
+(verified on 7.0). Either way, one-shot eval scripts don't need `NEWSESSION`
+at all — every `/eval`/`/eval/action` call already runs in its own fresh
+session — so just keep the `EXPORT`/`RETURN` at the top level.
 
 For one-off introspection (just confirming a class exists), `RETURN` is also
 the shortest form — the same one-liner as a compile-probe, but the count
