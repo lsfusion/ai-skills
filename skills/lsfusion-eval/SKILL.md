@@ -246,7 +246,7 @@ is part of the workflow.
 | `HTTP 200`, empty body | Script compiled, name-resolved against the running schema, and ran — **nothing more**. A `MESSAGE` produces exactly this (its text is swallowed — see the gotchas), and so does a mutation whose `APPLY` was silently **canceled by a constraint**. An empty 200 is never data-level proof; write scripts that `RETURN` something. |
 | `HTTP 200`, body present | Script ended in `RETURN <expr>;` or declared an `EXPORT FROM ...` — the value/export is the body. See "Getting values back" below. |
 | `HTTP 401` | Auth issue — see the trap table above. Usually means you sent the wrong `-u` form, NOT that the password is wrong. |
-| `HTTP 500`, body with `[error]:` and a stack trace | Script reached the type-checker and failed there. Common causes: type mismatch (mixing INTEGER with STRING in `+`, forgetting `STRING(...)` around a number), unknown name (the class / property doesn't exist in the running schema — proof the deployed config differs from yours), `OVERRIDE` argument-type mismatch. Read the first error line; subsequent ones are cascading. |
+| `HTTP 500`, body with `[error]:` | The script failed one of the compile phases (see "Syntax-checking" below for the exact order). Three error shapes, in the order the server checks them: a **parse error** (`no viable alternative`, `extraneous input`, `missing X`, `mismatched input`) = bad syntax; **`... is not found`** = an unknown class/property/action (the deployed config differs from yours, or a missing REQUIRE); **`X cannot be used in EVAL module`** = a forbidden construct whose syntax+names are actually fine (see below). Genuine type mismatches (`... types don't match`, `should have integral class`) surface only when the value is realized — note INTEGER+STRING is **not** one (it coerces). Only the first error is reported. |
 | `HTTP 404` | Endpoint not in this build (no `Eval` module REQUIREd, or wrong path). |
 
 The canonical "is this name in the running schema?" check against
@@ -256,6 +256,61 @@ The canonical "is this name in the running schema?" check against
 with the count in the body answers *yes* (and tells you how many). Don't use
 `MESSAGE` for this: it yields the same empty 200 as half a dozen failure
 modes.
+
+### Syntax-checking `.lsf` without a restart
+
+A `.lsf` edit normally needs a server restart (30–60 s) to find out whether
+it even parses. eval is a **sub-second first-pass linter** for the whole
+`.lsf` surface — not just expressions — because the eval string is compiled
+as a throwaway module that depends on every loaded module. The server runs
+the compile phases **in a fixed order**, and the error you get back tells you
+exactly which phase failed (verified live on 7.0-SNAPSHOT):
+
+| Phase (in order) | Catches | Error shape in the body |
+|---|---|---|
+| 1. Parse (grammar) | malformed syntax in **anything**, including forbidden constructs | `no viable alternative` / `extraneous input` / `missing X` / `mismatched input` / `required (...)+ loop` |
+| 2. Name resolution | unknown class / property / action, missing `REQUIRE` — incl. names used inside `FORM` and event conditions | `property or action '<name>' is not found` |
+| 3. EVAL restriction | a construct eval can't load (see below) — reached **only** once syntax + names are clean | `<X> statement / option cannot be used in EVAL module` |
+| 4. Type realization | genuine type mismatches — but only when the value is actually used (lazy on unused declarations; INTEGER+STRING coerces, not an error) | `... types don't match` / `should have integral class` |
+
+Because phase 1 runs first and phase 2 second, you can throw **any**
+declaration at eval and read the result by three outcomes:
+
+- **parse error** → a real syntax bug in your code. Fix it.
+- **`... is not found`** → a referenced element doesn't exist (typo, or a
+  `REQUIRE` you haven't added).
+- **`... cannot be used in EVAL module`** → treat as **PASS**: the
+  construct's syntax and names are clean; eval just won't load it. It will
+  load on the next real restart.
+
+So `CLASS`, persistent `DATA` (`NONULL` / `MATERIALIZED` / `INDEXED`),
+`WHEN`, `CONSTRAINT`, aggregations etc. are all syntax+name checkable — a
+typo in them yields a parse error, a clean one yields "cannot be used".
+Plain calc properties, session `DATA`, and whole `FORM` declarations are
+loadable, so they get checked all the way through (a `FORM` even
+name-resolves the properties in its `PROPERTIES` block).
+
+```bash
+# wrap the edit as eval statements (statements mode needs a run action).
+# 200 => parses + names resolve; 500 => read the phase from the error shape.
+curl -sS -X POST -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+  --data-urlencode "script=
+profit (Order o) = revenue(o) - cost(o);   // your new property
+run() { }
+" http://localhost:7651/eval
+# devmode: no -u.  lsfdev.ps1 api works too (it prints the 500 body).
+```
+
+Limits — eval is a linter, **not** the loader: it does not validate the
+load-time semantics specific to forbidden constructs (constraint logic,
+whether `MATERIALIZED` is legal on that property shape, aggregation
+well-formedness beyond grammar), only one error is reported per call (fix
+and re-run), and one statement's error masks later ones. For a whole new
+module in one pass, temporarily strip the load-only options
+(`NONULL`/`MATERIALIZED`/`INDEXED`) so the `DATA`/calc/form surface checks
+cleanly, and probe each `CLASS`/`WHEN`/`CONSTRAINT` separately. Actually
+loading the schema still requires the restart — this just catches the typos
+first, cheaply.
 
 ### Getting values back
 
@@ -352,11 +407,13 @@ EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Task t IS Task), 0);   // probes the
 `/eval/action` call *is* the proof: the endpoint exists only when the running
 config REQUIREs `Eval`.)
 
-Always wrap counts in `STRING(...)` when concatenating with text — `+` between
-INTEGER and STRING is a type error and produces a confusing 500. And when a
-comma-bearing `OVERRIDE` sits inside an argument list, give it its own
-parentheses (`STRING((OVERRIDE ..., 0))`), or the comma is parsed as an
-argument separator.
+Wrapping counts in `STRING(...)` when concatenating with text is good style,
+but it is not required to avoid an error: `+` between INTEGER and STRING
+**coerces** (verified — `'count=' + 5` → `count=5`, `5 + ' items'` → `5 items`,
+in either order), it does not throw. When a comma-bearing `OVERRIDE` sits
+inside an argument list, give it its own parentheses
+(`STRING((OVERRIDE ..., 0))`), or the comma is parsed as an argument
+separator.
 
 ### Chaining and verifying
 
