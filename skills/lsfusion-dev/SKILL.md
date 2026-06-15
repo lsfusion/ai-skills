@@ -182,7 +182,7 @@ with and stay consistent within the project.
 | `log` | Print the tail of the server log and flag errors. |
 | `verify` | Headless-Chrome screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it. |
 | `open` | Open the web UI in the user's default browser. |
-| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding — see workflow.md). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
+| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see workflow.md and the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
 Key options: `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
 (`stable` — default; `dev`/`snapshot`; a major-version alias; or an exact
@@ -614,6 +614,20 @@ actions, events, constraints, migration steps. Everything else —
 seeding test data, running a one-off fix, ad-hoc count / lookup,
 calling an existing action with specific arguments — is **data**, not
 schema, and belongs on the running server.
+
+**Before a schema restart, syntax-check the edit via eval — it's a
+sub-second linter for the whole `.lsf` surface.** A restart is the only
+way to *load* new schema, but it's a slow way to discover a typo. The
+running server compiles an eval script in a fixed order (parse → name
+resolution → EVAL-restriction), so feeding it your new declaration tells
+you in ~0.1 s whether the **syntax and names** are clean before you pay
+the 30–60 s restart: a parse error means bad syntax, `... is not found`
+means a missing element / `REQUIRE`, and `... cannot be used in EVAL
+module` means syntax+names are fine (it just can't be loaded by eval).
+This works even for `CLASS` / `DATA … NONULL` / `WHEN` / `CONSTRAINT`.
+See the lsfusion-eval skill's "Syntax-checking `.lsf` without a restart"
+for the phase table and the technique; `lsfdev.ps1 api -Script "…"`
+drives it.
 
 **Web resources (JS / CSS / images) need NO restart in devmode — just
 hard-reload the browser.** Files under `src/main/resources/**` that the
