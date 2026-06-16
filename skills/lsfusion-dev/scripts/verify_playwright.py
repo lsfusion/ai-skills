@@ -201,8 +201,13 @@ def main() -> int:
                         except PWTimeout:
                             pass
                         page.wait_for_timeout(2500)
-                        # Dismiss a lingering navigator tooltip before the shot.
-                        page.mouse.click(700, 450)
+                        # Dismiss a lingering navigator hover-tooltip by moving the
+                        # cursor OFF the entry (onto the logo corner) - never click
+                        # into the content area to do this. A blind click there can
+                        # trigger app side effects - e.g. a scheduler board where
+                        # "click an empty slot = create a record" - silently mutating
+                        # data during what is supposed to be a read-only check.
+                        page.mouse.move(8, 8)
                         page.wait_for_timeout(300)
                     except (PWTimeout, PWError) as e:
                         result["click"]["error"] = f"click on {seg!r} failed: {e}"
