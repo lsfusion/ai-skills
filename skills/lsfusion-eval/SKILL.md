@@ -126,17 +126,34 @@ error** (`extraneous input ... expecting ';'`); the 6.x equivalent is
 target's version first (`Current version:` in the server log) and pick the
 matching form below.
 
-**Per-action access control.** A project action is only callable via the API
-if its declaration carries an access annotation:
+**Access control — `enableAPI` is the master gate; `@@api`/`@@noauth` are
+per-action overrides.** The `enableAPI` working parameter (default **`0`**
+since platform v7; **`2`** under devmode) decides who may reach the Action
+API at all:
 
-- `@@api` — callable when authenticated (even when `enableAPI=0`)
-- `@@noauth` — callable without authentication and bypassing `enableAPI`
+- `2` — anonymous allowed (dev / sandbox only; never production)
+- `1` — **any authenticated user may call any action**
+- `0` (the v7 default) — allowed only for: `@@noauth` actions, authenticated
+  requests to `@@api` actions, and authenticated users who have access to the
+  `System.interpreter` navigator form
 
-The platform's built-in `Eval` module ships its own `/eval` / `/eval/action`
-handlers with the right annotations — that's why the project's top module
-defaults in this repo (`REQUIRE Icon, Eval, ProcessMonitor, Backup, ...`)
-include `Eval`. If `/eval/action` returns 404 / "action not found", the
-running project probably doesn't `REQUIRE Eval`.
+A **named project action** opts into the API with an annotation on its
+declaration:
+
+- `@@api` — callable when authenticated, even at `enableAPI=0`
+- `@@noauth` — callable without authentication, bypassing `enableAPI` entirely
+
+**`/eval` and `/eval/action` are built-in endpoints, not `@@api` actions** —
+`@@api` marks a *named* action and does not apply to these endpoints, so it
+never opens them. Because they execute **arbitrary** lsFusion code, at
+`enableAPI=0` they require the caller to have access to the
+`System.interpreter` form (the same gate as running code in the UI), and at
+`enableAPI=1` **every authenticated user** can run arbitrary code through
+them — which is exactly why production should keep `enableAPI=0` and expose
+specific `@@api` actions instead (see "Production security" below). The
+endpoints also need the platform's EVAL support loaded; the skill family's
+default top-module `REQUIRE` list includes `Eval`, and a `/eval/action` 404
+usually means the running project doesn't `REQUIRE Eval`.
 
 ### Authentication (this is where everyone trips)
 
@@ -152,7 +169,7 @@ to get wrong:
 | Server state | What to send | Why |
 |---|---|---|
 | **Devmode ON** (local dev install, `-Dlsfusion.server.devmode=true`) | `curl` **without `-u`** — no `Authorization` header at all | Server auto-authenticates as `admin` only when it sees **no** header. Works on every platform version. |
-| **Devmode OFF** (production, deployed via lsfusion-deploy) | `curl -u admin:` (empty password) | API requires auth; `admin:` sends Basic with empty password, server validates and accepts |
+| **Devmode OFF** (production, deployed via lsfusion-deploy) | `curl -u admin:` (empty password) | API requires auth; `admin:` sends Basic with empty password, server validates and accepts. `admin` reaches `/eval/action` even at the v7 default `enableAPI=0` because it has `System.interpreter` access — a **non-admin** user would be refused there (see access control above). |
 | **Admin password rotated** | `curl -u admin:<real password>` | Self-explanatory |
 
 **The trap:** "no header" ≠ "header with empty password". `curl` without
@@ -167,6 +184,23 @@ the default admin account), though at least one snapshot-era build has been
 observed rejecting it with 401. The no-header form has no such history —
 make it your default for devmode, and fall back to a real password only if
 the user supplies one.
+
+### Production security: never raise `enableAPI` to reach `/eval/action`
+
+`/eval/action` runs **arbitrary** lsFusion code. The platform's hardening
+default is `enableAPI=0` (since v7), under which the endpoint is reachable
+only by `System.interpreter`-privileged users (e.g. `admin`) — that is the
+state you want in production. If a non-admin's `/eval/action` call is being
+refused, the fix is **not** to set `enableAPI=1`: that flips on arbitrary
+code execution over HTTP for *every authenticated user*, bypassing the
+`System.interpreter` form gate that limits the interpreter in the UI. Instead
+wrap the specific operation in a named action annotated `@@api` (callable at
+`enableAPI=0`) and have it validate `currentUser()` itself. Use `enableAPI=2`
+(anonymous) only on a throwaway dev/sandbox box, never production. If a role
+genuinely needs broad API access, grant it per-role via
+`Administration → System → Settings → Parameters`, not globally. (This
+mirrors the platform docs — *Working parameters* `enableAPI`,
+*Access from an external system*, and *MCP server setup*.)
 
 ### Sending an lsFusion script via curl
 
