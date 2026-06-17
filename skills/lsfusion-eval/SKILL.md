@@ -374,11 +374,6 @@ curl -sS -X POST \
   http://localhost:7651/eval
 ```
 
-> Older revisions of this skill documented a `&return=<property>` query
-> parameter for this. Don't use it: on current builds (7.0-SNAPSHOT, verified
-> 2026-06) it is silently ignored — HTTP 200 with an **empty body**, which
-> reads like "no value". `RETURN` replaces it outright.
-
 **2. `EXPORT FROM` to stdout via the response body — works on every
 version.** For tabular / structured data (and, on 6.x, for scalars too) the
 action's `EXPORT` target becomes the HTTP response body — content type is
@@ -494,6 +489,23 @@ RETURN 'OK: ' + STRING((OVERRIDE (GROUP SUM 1 IF ...), 0));   // count proves it
 like success), so always wrap it in `OVERRIDE`. Alternatively verify with a
 separate count call or a Playwright screenshot of the list form (Part 3).
 Don't trust the transport-level 200 as data-level confirmation.
+
+**Asserting a computed value on the object you just created.** You can't read
+the `NEW` alias after `APPLY` — it's scoped to its block (ACTION §2), and a
+plain `LOCAL` is reset by `APPLY` (CHANGE §5); a class-wide aggregate mixes in
+other rows on a real DB. Two ways to read the **specific** object (verified on 7.0):
+
+```lsf
+// 1. Re-find by a unique business key after APPLY (simplest, when it has one):
+APPLY;
+RETURN (GROUP MAX calcProp(Cls o) IF keyProp(o) = <key>);
+
+// 2. Carry the object through APPLY in a nested LOCAL:
+LOCAL created = Cls ();
+NEW o = Cls { ... ; created() <- o; }   // capture while o is in scope
+APPLY NESTED (created);                  // preserve the LOCAL across APPLY
+RETURN calcProp(created());
+```
 
 **Leave no trace in the codebase.** A one-shot seed / cleanup / fix
 should not change the project tree. The `.lsf` script you posted lives
