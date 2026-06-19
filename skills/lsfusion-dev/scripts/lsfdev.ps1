@@ -24,6 +24,7 @@ param(
     [string]$TopModule = "",
     [string]$Url = "",
     [string]$Click = "",
+    [string]$DoubleClick = "",
     [int]$ViewportWidth = 1920,
     [int]$ViewportHeight = 1080,
     [string]$Locale = "",
@@ -1376,13 +1377,14 @@ function Cmd-Verify {
     Info "Login  : user '$($cfg.adminUser)', $(if ($cfg.adminPassword) { 'password from config' } else { 'empty password' })"
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
+    if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
     # Use --name=value form so an empty password is preserved through
     # PowerShell's native-argument handling (without =, empty strings get
     # dropped and argparse sees the next flag as the value).
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
-        "--user=$($cfg.adminUser)" "--password=$($cfg.adminPassword)" "--click=$Click" `
+        "--user=$($cfg.adminUser)" "--password=$($cfg.adminPassword)" "--click=$Click" "--double-click=$DoubleClick" `
         --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
         --timeout 30000) -join "`n"
     $pyExit = $LASTEXITCODE
@@ -1416,6 +1418,18 @@ function Cmd-Verify {
             Warn "Captions are locale-dependent - check verify-app.png for the actual navigator text."
         } elseif ($r.click.clicked.Count) {
             Ok "Clicked through: $($r.click.clicked -join ' > ')"
+        }
+    }
+    if ($r.double_click -and $r.double_click.requested) {
+        if (Test-Path $r.artifacts.dblclick_screenshot) {
+            $kb = [math]::Round((Get-Item $r.artifacts.dblclick_screenshot).Length / 1KB, 1)
+            Ok "Double-click screenshot : $($r.artifacts.dblclick_screenshot) ($kb KB)"
+        }
+        if ($r.double_click.error) {
+            Warn "Double-click failed: $($r.double_click.error)"
+            Warn "Row text is locale/data-dependent - check verify-click.png for the actual grid text."
+        } elseif ($r.double_click.target) {
+            Ok "Double-clicked row '$($r.double_click.target)' - edit card in verify-dblclick.png"
         }
     }
     Info "Open the PNGs with the Read tool to see what was rendered."
@@ -1680,6 +1694,10 @@ Common options:
                         text before the final screenshot; chain with '>'
                         (e.g. -Click "Master data > Items"). Output goes to
                         verify-click.png; first form open gets generous waits.
+  -DoubleClick <text>   'verify' only: after -Click navigation, double-click a
+                        grid row by visible cell text to open its edit card,
+                        then screenshot it (e.g. -DoubleClick "Coffee beans").
+                        Output goes to verify-dblclick.png.
   -ViewportWidth/-ViewportHeight
                         'verify' browser viewport (default 1920x1080; narrow
                         viewports make dense forms look broken).

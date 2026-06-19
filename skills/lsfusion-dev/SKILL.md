@@ -180,7 +180,7 @@ with and stay consistent within the project.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Headless-Chrome screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it. |
+| `verify` | Headless-Chrome screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see workflow.md and the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
@@ -190,7 +190,7 @@ tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
 `-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-Url`, `-Click`,
-`-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
+`-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
 `-ScriptFile`, `-Timeout`. Run the script with no command to print full
 usage.
 
@@ -761,10 +761,19 @@ checking the unit-test output.
    lsfdev.ps1 verify -Click "Master data > Items"
    ```
 
-   Captions are locale-dependent — if the click misses, read the navigator
-   text off `verify-app.png` first and retry with what is actually
-   rendered. This covers the common "did my form/field render?" check; for
-   anything more involved (multi-step flows, opening a card via Edit,
+   **To screenshot an edit card, add `-DoubleClick "<row text>"`** — after the
+   navigator click-through it double-clicks the grid row containing that
+   visible text, opening that row's edit form, and screenshots it to
+   `verify-dblclick.png` (the same generous first-open waits apply):
+
+   ```
+   lsfdev.ps1 verify -Click "Master data > Items" -DoubleClick "Coffee beans"
+   ```
+
+   Captions and row text are locale/data-dependent — if a click misses, read
+   the actual text off `verify-app.png` / `verify-click.png` first and retry
+   with what is rendered. This covers the common "did my form/card render?"
+   check; for anything more involved (multi-step flows, filling fields,
    remote hosts), use the lsfusion-eval skill's Part 3 — it ships a Python
    Playwright template that goes beyond `verify`'s scope.
 

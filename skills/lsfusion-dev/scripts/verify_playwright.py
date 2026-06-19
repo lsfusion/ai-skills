@@ -59,6 +59,10 @@ def main() -> int:
                     help="after landing, click element(s) by visible text and "
                          "screenshot the result; chain with '>' for tab-then-"
                          "entry navigation, e.g. \"Master data > Items\"")
+    ap.add_argument("--double-click", default="",
+                    help="after the click-through, double-click a grid row by "
+                         "visible text to open its edit card, then screenshot "
+                         "it; e.g. \"Coffee beans\"")
     ap.add_argument("--viewport-width", type=int, default=1920)
     ap.add_argument("--viewport-height", type=int, default=1080)
     ap.add_argument("--locale", default="",
@@ -71,11 +75,12 @@ def main() -> int:
     login_png    = out_dir / "verify-login.png"
     app_png      = out_dir / "verify-app.png"
     click_png    = out_dir / "verify-click.png"
+    dblclick_png = out_dir / "verify-dblclick.png"
     dom_path     = out_dir / "verify-dom.html"
     console_path = out_dir / "verify-console.txt"
 
     # Wipe previous artefacts so callers can rely on file presence.
-    for p in (login_png, app_png, click_png, dom_path, console_path):
+    for p in (login_png, app_png, click_png, dblclick_png, dom_path, console_path):
         if p.exists():
             p.unlink()
 
@@ -91,12 +96,18 @@ def main() -> int:
             "clicked": [],
             "error": None,
         },
+        "double_click": {
+            "requested": bool(args.double_click.strip()),
+            "target": "",
+            "error": None,
+        },
         "artifacts": {
-            "login_screenshot": str(login_png),
-            "app_screenshot":   str(app_png),
-            "click_screenshot": str(click_png),
-            "dom":              str(dom_path),
-            "console":          str(console_path),
+            "login_screenshot":    str(login_png),
+            "app_screenshot":      str(app_png),
+            "click_screenshot":    str(click_png),
+            "dblclick_screenshot": str(dblclick_png),
+            "dom":                 str(dom_path),
+            "console":             str(console_path),
         },
     }
     console_lines: list[str] = []
@@ -212,6 +223,40 @@ def main() -> int:
                     except (PWTimeout, PWError) as e:
                         result["click"]["error"] = f"click on {seg!r} failed: {e}"
                     page.screenshot(path=str(click_png))
+
+                # Optional double-click: open a grid row's edit card by the
+                # visible text of any cell in that row, then screenshot it. Runs
+                # after the click-through, so -Click opens the list form and
+                # -DoubleClick opens a specific card from it. The first card
+                # open is lazy - reuse the same generous waits as the click-
+                # through. Mouse is moved off afterwards (never click the content
+                # area) to dismiss any hover tooltip without side effects.
+                if result["double_click"]["requested"]:
+                    dbl = args.double_click.strip()
+                    try:
+                        target = page.get_by_text(dbl, exact=True).first
+                        try:
+                            target.dblclick(timeout=15000)
+                        except (PWTimeout, PWError):
+                            # Cell text is locale/data-dependent and may carry
+                            # surrounding whitespace - retry as a substring.
+                            page.get_by_text(dbl, exact=False).first.dblclick(timeout=15000)
+                        result["double_click"]["target"] = dbl
+                        page.wait_for_timeout(700)
+                        try:
+                            page.wait_for_selector("text=Loading", state="detached", timeout=60000)
+                        except PWTimeout:
+                            pass
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=30000)
+                        except PWTimeout:
+                            pass
+                        page.wait_for_timeout(2500)
+                        page.mouse.move(8, 8)
+                        page.wait_for_timeout(300)
+                    except (PWTimeout, PWError) as e:
+                        result["double_click"]["error"] = f"double-click on {dbl!r} failed: {e}"
+                    page.screenshot(path=str(dblclick_png))
 
                 dom_path.write_text(page.content(), encoding="utf-8")
 
