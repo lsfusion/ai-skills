@@ -185,7 +185,7 @@ with and stay consistent within the project.
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see workflow.md and the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
 Key options: `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
-(`stable` — default; `dev`/`snapshot`; a major-version alias; or an exact
+(`7` — default; `stable`; `dev`/`snapshot`; a major-version alias; or an exact
 tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
@@ -361,32 +361,33 @@ downloading. The client war is **moved straight into Tomcat as `ROOT.war`** and
 the download is not retained, so only the server jar and Tomcat stay on disk.
 `setup` also writes `settings.properties` and a starter `.gitignore` entry.
 
-**Which lsFusion version.** **Default to `-Version stable`** — the latest
-non-SNAPSHOT release on the download server. This is what you should pick
-when the user gives no version cue: stable releases have predictable
-behaviour, won't shift under you between sessions, and match what most
-production servers run.
+**Which lsFusion version.** **Default to `-Version 7`** — the latest 7.x
+build on the download server. The `7` alias tracks the highest 7.x available
+(currently `7.0-SNAPSHOT`) and rolls forward to the 7.0 stable release once
+it ships. Pick it when the user gives no version cue: 7.x carries the newest
+platform behaviour the skill is tuned for (for instance, headless `verify`
+relies on 7.0's automatic tooltip suppression instead of a workaround).
 
-When starting a new project, **mention once** to the user that
-`-Version dev` (alias `snapshot`) is available if they want the latest
-features — but do not switch to it on your own. SNAPSHOT builds can change
-daily, sometimes break, and may not be available through the apt installer
-used by deploy workflows, so picking one without an explicit reason invites
-avoidable trouble.
+Because the latest 7.x is a SNAPSHOT today, **mention once** to the user that
+SNAPSHOT builds can change daily, sometimes break, and may not be available
+through the apt installer used by deploy workflows — and that `-Version
+stable` (the latest non-SNAPSHOT release, currently 6.2) is there when they
+want a fixed, production-matching build. Don't switch tracks on your own.
 
 Switch off the default **only** when the user clearly asks for it — e.g.
-"dev branch", "snapshot", "latest", a specific tag (like `7.0-SNAPSHOT`), a
-major-version alias, or when the project itself pins a version (its
-`pom.xml` parent declares a specific version, or its README requires it).
-In that case pass `-Version <alias-or-tag>`. If the cue is ambiguous, **ask**
-rather than guessing — major versions differ a lot.
+"stable", a specific tag (like `6.2`), a major-version alias, or when the
+project itself pins a version (its `pom.xml` parent declares a specific
+version, or its README requires it). In that case pass `-Version
+<alias-or-tag>`. If the cue is ambiguous, **ask** rather than guessing —
+major versions differ a lot.
 
 Which exact version each alias resolves to is **not stable** — it depends on
 what the download server currently publishes. Always run `lsfdev.ps1 versions`
-to see how `stable`, `dev`, major-number aliases, and concrete tags resolve
-right now, before locking in a non-default choice. To switch later, re-run
-setup with the new alias and `-Force`; the skill removes the stale server
-jar and clears the init marker so the next start does a full schema sync.
+to see how `7`, `stable`, `dev`, major-number aliases, and concrete tags
+resolve right now, before locking in a non-default choice. To switch later,
+re-run setup with the new alias and `-Force`; the skill removes the stale
+server jar and clears the init marker so the next start does a full schema
+sync.
 
 ### 3. Write the `.lsf` code
 
@@ -694,9 +695,11 @@ checking the unit-test output.
    (7.0+ only), never `MESSAGE`.** The `api` command prints the HTTP
    response body. `EXPORT FROM res = <expr>;` puts a scalar (or rows, with
    `EXPORT JSON FROM ...`) into the body on **every** platform version.
-   On **7.0+** there is the shorter `RETURN <expr>;` — but mind the
-   default: `setup` installs `stable` (currently **6.2**), where `RETURN`
-   is a **parse error** (`extraneous input ... expecting ';'`). A plain
+   On **7.0+** there is the shorter `RETURN <expr>;` — and since the skill
+   now defaults to `-Version 7`, it works out of the box. But on `-Version
+   stable` (currently **6.2**) `RETURN` is a **parse error** (`extraneous
+   input ... expecting ';'`), so reach for `EXPORT FROM` when a script must
+   also run on older platforms. A plain
    `MESSAGE` over HTTP is **swallowed entirely** — empty 200, nothing in
    the response, nothing in the log; `MESSAGE ... NOWAIT` at least lands
    in the **server log** (`Server message: ...`), and the `api` command

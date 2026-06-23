@@ -212,14 +212,6 @@ def main() -> int:
                         except PWTimeout:
                             pass
                         page.wait_for_timeout(2500)
-                        # Dismiss a lingering navigator hover-tooltip by moving the
-                        # cursor OFF the entry (onto the logo corner) - never click
-                        # into the content area to do this. A blind click there can
-                        # trigger app side effects - e.g. a scheduler board where
-                        # "click an empty slot = create a record" - silently mutating
-                        # data during what is supposed to be a read-only check.
-                        page.mouse.move(8, 8)
-                        page.wait_for_timeout(300)
                     except (PWTimeout, PWError) as e:
                         result["click"]["error"] = f"click on {seg!r} failed: {e}"
                     page.screenshot(path=str(click_png))
@@ -229,8 +221,7 @@ def main() -> int:
                 # after the click-through, so -Click opens the list form and
                 # -DoubleClick opens a specific card from it. The first card
                 # open is lazy - reuse the same generous waits as the click-
-                # through. Mouse is moved off afterwards (never click the content
-                # area) to dismiss any hover tooltip without side effects.
+                # through.
                 if result["double_click"]["requested"]:
                     dbl = args.double_click.strip()
                     try:
@@ -252,8 +243,6 @@ def main() -> int:
                         except PWTimeout:
                             pass
                         page.wait_for_timeout(2500)
-                        page.mouse.move(8, 8)
-                        page.wait_for_timeout(300)
                     except (PWTimeout, PWError) as e:
                         result["double_click"]["error"] = f"double-click on {dbl!r} failed: {e}"
                     page.screenshot(path=str(dblclick_png))

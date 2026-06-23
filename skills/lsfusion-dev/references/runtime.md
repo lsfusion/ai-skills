@@ -211,7 +211,7 @@ or the war re-downloaded.
 
 Once a version is in `config.json`, later `setup` runs reuse it verbatim — the
 resolved version is sticky, so the platform never gets upgraded silently. Pass
-an alias again (e.g. `setup -Version stable -Force`) when you want to move to
+an alias again (e.g. `setup -Version 7 -Force`) when you want to move to
 the current latest.
 
 ## Updating after editing `.lsf` files

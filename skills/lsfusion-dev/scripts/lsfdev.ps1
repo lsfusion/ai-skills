@@ -13,7 +13,7 @@ param(
     [Parameter(Position = 0)]
     [string]$Command = "help",
     [string]$ProjectDir = "",
-    [string]$Version = "stable",
+    [string]$Version = "7",
     [string]$TomcatVersion = "",
     [string]$DbServer = "localhost",
     [string]$DbName = "lsfusion",
@@ -405,8 +405,8 @@ function Get-AvailableVersions {
 
 function Resolve-Version([string]$requested) {
     # Concrete tags (e.g. "6.2", "7.0-SNAPSHOT") pass through; the words below
-    # are aliases for "the latest X in track Y". Defaults to the latest stable.
-    if (-not $requested) { $requested = "stable" }
+    # are aliases for "the latest X in track Y". Defaults to the latest 7.x.
+    if (-not $requested) { $requested = "7" }
     $lc = $requested.ToLowerInvariant()
     if ($lc -notin @("stable", "latest", "dev", "snapshot", "6", "7")) {
         return $requested
@@ -615,10 +615,10 @@ function Cmd-Setup {
         return $fallback
     }
     $tomcatVer = Resolve-TomcatVersion
-    $requestedVersion = (Pick "version" "Version" "stable")
+    $requestedVersion = (Pick "version" "Version" "7")
     # Maven projects pin the platform version in pom.xml, and Maven resolves the
     # server jar from it. The web-client war (which the skill downloads, not
-    # Maven) MUST match, or a -Version default of 'stable' would ship a
+    # Maven) MUST match, or a -Version default of '7' would ship a
     # mismatched client against the pom's server. So unless the user explicitly
     # passed -Version, follow the pom.
     $pomVersion = $null
@@ -1672,7 +1672,7 @@ lsfdev.ps1 - lsFusion development CLI
 Common options:
   -DbPassword <pwd>     PostgreSQL password (needed for setup).
   -DbUser / -DbServer / -DbName
-  -Version <ver>        lsFusion version: 'stable' (default), 'dev', '6', '7',
+  -Version <ver>        lsFusion version: '7' (default), 'stable', 'dev', '6',
                         or exact (e.g. 6.2, 7.0-SNAPSHOT). See 'versions'.
   -TomcatVersion <ver>  Pin a Tomcat 9 version.
   -TopModule <name>     Top lsFusion module to load.
