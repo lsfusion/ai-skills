@@ -579,6 +579,11 @@ function Cmd-Check {
     }
 
     Write-Host ""
+    $git = Find-Git
+    if ($git) { Ok "git found - $git (used by 'clone' to fetch existing projects)." }
+    else { Info "git not on PATH - only needed for the 'clone' command. Install Git to clone an existing lsFusion repo." }
+
+    Write-Host ""
     $mvn = Find-Maven
     if ($mvn) { Ok "Maven found - $mvn (used for projects with pom.xml; skips server jar download)." }
     else { Info "Maven not on PATH - only needed for Maven-based existing projects (pom.xml). The skill falls back to the downloaded server jar without it." }
@@ -1654,7 +1659,7 @@ function Cmd-Help {
 lsfdev.ps1 - lsFusion development CLI
 
   clone          Clone an existing lsFusion project from a Git repository.
-  check          Detect Java, PostgreSQL and Python.
+  check          Detect Java, PostgreSQL, Python, git and Maven.
   setup          Download server jar, client war, Tomcat; write settings.properties.
   start-server   Start the application server and report a startup verdict.
   start-web      Start Tomcat with the web client.

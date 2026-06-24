@@ -170,7 +170,7 @@ with and stay consistent within the project.
 
 | Command | What it does |
 |---|---|
-| `check` | Detect Java, PostgreSQL, Chrome; report versions and what is missing. |
+| `check` | Detect Java, PostgreSQL, Python, git, and Maven; report versions and what is missing. |
 | `versions` | List the lsFusion versions on the download server and the alias mappings. |
 | `setup` | Fetch the server jar, client war, and Tomcat into `.lsfusion-dev/` (only what's missing / version-changed — see note); write config + `settings.properties`. Safe to re-run anytime. |
 | `start-server` | Start the application server, tail the log, and report a verdict (started / failed / inconclusive). |
@@ -331,7 +331,7 @@ Work through these steps. Stop and tell the user if a step needs their input
 
 ### 1. Check the environment
 
-Run `check`. It reports Java, PostgreSQL, and Python.
+Run `check`. It reports Java, PostgreSQL, Python, git, and Maven.
 
 - **Java 11+** is required (1.8 works but 11 is the safest target). If Java is
   missing, ask the user to install a JDK — do not try to install it silently.
@@ -341,6 +341,18 @@ Run `check`. It reports Java, PostgreSQL, and Python.
   Playwright itself (plus its bundled Chromium, ~120 MB) is auto-installed on
   the first `verify` run. If Python is absent, `verify` is unavailable but the
   rest of the skill still works.
+- **git** is needed for the `clone` command — the first step when working with
+  an existing project hosted in a Git repository (see [Working with an existing
+  project](#working-with-an-existing-project)). Not required if you scaffold a
+  new project or run sources already on disk. If git is missing and the user
+  wants to clone a repo, ask them to install it.
+- **Maven** is needed only for **Maven-based projects** (a `pom.xml` at the
+  project root). When Maven is on `PATH` the skill builds with it and pulls
+  `lsfusion-server` straight from `pom.xml` (no jar download, exact dependency
+  graph). Without Maven the skill still runs such projects by staging the build
+  itself against the downloaded server jar — so Maven is **recommended but not
+  strictly required**, even for a `pom.xml` project. For a non-Maven project it
+  is not needed at all.
 
 ### 2. Set up
 
@@ -645,6 +657,17 @@ new form properties/actions the JS calls, the `onWebClientInit` registration
 itself) — that's schema. Pure JS/CSS iteration is a sub-second reload loop,
 not a 30 s restart loop.
 
+**Report templates (`.jrxml`) — NO restart in devmode; iterate via
+`target/classes`.** Like JS/CSS web resources, JasperReports templates are
+read from the classpath at print time, so in devmode they are re-read live —
+no server restart needed. The catch: `start-server` stages
+`src/main/resources/**` into `target/classes/` only at startup, so editing
+`src/main/resources/<name>.jrxml` alone does not take effect until the next
+restart. To iterate without restarting, edit the staged copy
+`target/classes/<name>.jrxml` directly and re-print; once the layout is
+right, mirror it back to `src/main/resources/<name>.jrxml` (the source of
+truth) so a later restart doesn't overwrite your work.
+
 The lsfusion-eval skill talks to the live server's HTTP endpoints
 (`/exec`, `/eval`, `/eval/action`) and accepts arbitrary
 `NEWSESSION { NEW … APPLY; }` scripts. The same script that you'd put
@@ -806,6 +829,22 @@ checking the unit-test output.
    duration on *every* run: three such sleeps in a screenshot script is
    ~20 s of guaranteed dead time per invocation. Reserve fixed waits for
    sub-3-second UI settles (animation, focus) where no selector exists.
+
+**Verify print forms headless via PDF — don't assume.** There's no
+browser/IDE preview here, so render server-side and read the result:
+
+```
+lsfdev.ps1 api -Script "LOCAL f = FILE (); PRINT myForm OBJECTS o = <expr> PDF TO f; WRITE f() TO 'C:/proj/.lsfusion-dev/out';"
+```
+
+`PRINT … PDF TO <fileProp>` renders on the server with no client interaction;
+`WRITE f() TO '<path>'` dumps it to disk (extension auto-appended →
+`out.pdf`). Open the PDF with your file-reading tool and actually eyeball it —
+a wrong field name/type or band height only shows in the rendered output.
+Template fields are the form property references verbatim (`date(o)`,
+`quantity(d)`), with the object key `<group>.object`; numerics map to
+`java.math.BigDecimal`, dates to `java.util.Date`. (Use `$V{REPORT_COUNT}`
+for line numbers to avoid a field-type guess.)
 
 **Do not query PostgreSQL directly to inspect data.** lsFusion owns the
 schema — table names are mangled (`<class>_<namespace>`, `_x_yz` columns),
