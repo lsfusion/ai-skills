@@ -138,7 +138,11 @@ everything runs locally with default ports.
 
 ## settings.properties keys
 
-`settings.properties` lives in the project folder. Keys the skill writes:
+The file the server reads at runtime is `conf/settings.properties` (relative to
+the JVM working directory; in a non-Maven project the project-root
+`settings.properties` is a mirror that `setup`/`start` keep in sync). It is the
+source of truth — `start`/`restart`/`stop`/`api` read `db.*` and the ports back
+from it, with `.lsfusion-dev/config.json` only a cache. Keys the skill writes:
 
 | Key | Meaning | Default |
 |---|---|---|

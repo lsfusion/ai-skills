@@ -290,9 +290,11 @@ for a specific instance, use that instance's `http.port`
 (e.g. `http://localhost:7661/eval/action`).
 
 > Default ports (7652 / 7651 / 8887) are left implicit — `settings.properties`
-> only carries them when non-default, exactly like `db.user`/`db.server`. And
-> like `db.*`, changing them in an **existing** `settings.properties` needs
-> `setup -Force` (or a manual edit); a plain re-`setup` leaves the file alone.
+> only carries them when non-default, exactly like `db.user`/`db.server`. An
+> **explicitly passed** flag (`-DbName`, `-RmiPort`, …) is written straight into
+> the authoritative `conf/settings.properties` even without `-Force`; a plain
+> re-`setup` with no flags preserves whatever the file already holds; `-Force`
+> regenerates the whole file. You can also just hand-edit the file.
 
 **Changing `rmi.port` / `http.port` on a *running* instance — `stop` FIRST.**
 `stop` (and `restart`'s stop phase) finds the live server by the ports in the
@@ -313,15 +315,28 @@ config. After the switch, the Action API moves with `http.port` (e.g.
 **Each instance needs its own `-DbName`** — two servers pointed at the same
 database will fight over the schema. Use distinct names (the default name is
 derived from the project path, so distinct project dirs already differ).
-`setup` **always persists `db.name`** into `settings.properties` and never
-drops it on a re-run: a later `setup -Force` (e.g. just to change a JVM flag)
-preserves the database the instance was using — it does not silently fall
-back to the shared default DB. To repoint at a different database you must
-say so explicitly with `-DbName`.
+
+The file the server actually reads at runtime is **`conf/settings.properties`**
+(in *both* Maven and non-Maven projects; in a non-Maven project the project-root
+`settings.properties` is a human-readable mirror that `setup` and `start` keep
+in sync). It is the **source of truth**: `start` / `restart` / `stop` / `api`
+read `db.name` (and the other `db.*`, and the ports) back from it — exactly like
+the port handling above — and `config.json` is only a cache. So a hand-edit of
+`db.name` in `conf/settings.properties` is honored on the next `start` and is
+**never reverted from `config.json`** by `restart`/`start`.
+
+`setup` **always persists `db.name`** and never drops it on a re-run: a later
+`setup -Force` (e.g. just to change a JVM flag) reads the current `db.name`
+straight from `settings.properties` and writes it back verbatim — it does not
+fall back to the per-project auto-name or the shared default DB, even if
+`.lsfusion-dev/` was wiped. `setup -DbName <x>` writes the new name into
+`settings.properties` **and** `config.json` together (no `-Force` needed); to
+repoint at a different database you must say so explicitly with `-DbName`.
+
 **Watch out for a repo-committed `db.name`**: when a cloned project ships
 `conf/settings.properties` with a `db.name` line, that committed value wins
 over the per-project default — every clone of the repo then points at the
-same database. `setup` warns when it sees this; pass
+same database. `setup` warns when it first sees this; pass
 `setup -DbName <unique> -Force` to give the instance its own DB.
 
 ## Standard workflow

@@ -123,6 +123,20 @@ function Get-SettingsValue([string]$file, [string]$key) {
     return $null
 }
 
+# Read a string-valued key from the project's settings.properties, checking
+# conf/settings.properties first (the file the server actually reads at runtime —
+# Spring `file:conf/settings.properties` in lsfusion.xml) then the project-root
+# mirror. Returns $null if absent or blank. String sibling of Read-SettingsPort:
+# it is what makes settings.properties the source of truth and config.json a mere
+# cache for db.* (a hand-edit there wins, and survives a wiped .lsfusion-dev/).
+function Read-SettingsString($key) {
+    foreach ($sf in @((Join-Path $ProjectDir "conf\settings.properties"), (Join-Path $ProjectDir "settings.properties"))) {
+        $v = Get-SettingsValue $sf $key
+        if ($null -ne $v -and "$v".Trim() -ne "") { return $v }
+    }
+    return $null
+}
+
 # Update an existing key in a .properties file, or append it if absent.
 # Preserves every other line (and creates the file if missing).
 function Set-SettingsProperty([string]$file, [string]$key, [string]$value) {
@@ -169,6 +183,15 @@ function Load-Config {
         if ($sHttp) { $c.httpPort = $sHttp } elseif (-not $c.httpPort) { $c.httpPort = 7651 }
         if ($sWs)   { $c | Add-Member -NotePropertyName webSocketPort -NotePropertyValue $sWs -Force }
         elseif (-not $c.webSocketPort) { $c | Add-Member -NotePropertyName webSocketPort -NotePropertyValue 8887 -Force }
+        # db.* get the SAME treatment: settings.properties (conf/ first, then the
+        # root mirror) is the source of truth; config.json is only the cache. This
+        # is why a hand-edit of db.name in conf/settings.properties is honored by
+        # start/restart/stop/api/status and is never reverted from config.json
+        # (the bug this read-back closes), and why it survives a wiped .lsfusion-dev/.
+        foreach ($pair in @(@('db.name','dbName'), @('db.server','dbServer'), @('db.user','dbUser'), @('db.password','dbPassword'))) {
+            $sv = Read-SettingsString $pair[0]
+            if ($null -ne $sv) { $c | Add-Member -NotePropertyName $pair[1] -NotePropertyValue $sv -Force }
+        }
         return $c
     }
     return $null
@@ -664,6 +687,40 @@ function Cmd-Setup {
         webPort       = (Pick "webPort" "WebPort" 8080)
         shutdownPort  = (Pick "shutdownPort" "ShutdownPort" 8005)
     }
+    # --- Authoritative db.name resolution (before the first Save-Config) -------
+    # db.name has NO safe implicit default: a missing db.name sends the server to
+    # the shared platform-default database ("lsfusion"), silently orphaning this
+    # project's data. The file the server actually reads is conf/settings.properties
+    # (Spring `file:conf/settings.properties` in lsfusion.xml) in BOTH Maven and
+    # non-Maven modes, with the project-root settings.properties as a legacy
+    # mirror. So settings.properties — NOT config.json, NOT the per-project
+    # auto-name — is the source of truth. Resolve strongest-first: an explicit
+    # -DbName, else the name already persisted in settings.properties (preserved
+    # VERBATIM), else whatever Pick produced (config.json cache, or the
+    # deterministic per-path default for a genuinely fresh project). Doing this
+    # BEFORE Save-Config means config.json is never even briefly written with the
+    # auto-name when a real name exists — including when .lsfusion-dev/ was wiped
+    # (then Load-Config returned $null and Pick fell through to the auto-name).
+    if (-not $ScriptBound.ContainsKey("DbName")) {
+        $confDbName = Get-SettingsValue (Join-Path $ProjectDir "conf\settings.properties") "db.name"
+        $rootDbName = Get-SettingsValue (Join-Path $ProjectDir "settings.properties") "db.name"
+        $persistedDbName = if ("$confDbName".Trim()) { $confDbName } elseif ("$rootDbName".Trim()) { $rootDbName } else { $null }
+        if ($persistedDbName -and ($persistedDbName -ne $cfg.dbName)) {
+            Info "Preserving db.name '$persistedDbName' from settings.properties (pass -DbName <name> to change it)."
+            $cfg.dbName = $persistedDbName
+        }
+        # A repo-committed db.name (conf/settings.properties shipped in the clone,
+        # before this checkout ever had its own .lsfusion-dev/config.json) makes
+        # every clone share one database. Flag it once, the first time we see it -
+        # but only when it really looks committed: no config.json yet, a
+        # non-default name, and no matching project-root mirror (lsfdev keeps root
+        # and conf in sync, so a corroborating root file means we manage it and
+        # the config cache was merely wiped, not a fresh clone).
+        $rootCorroborates = ("$rootDbName".Trim() -ne "") -and ("$rootDbName".Trim() -eq "$confDbName".Trim())
+        if ("$confDbName".Trim() -and (-not $existing) -and ($confDbName -ne (New-DbName $ProjectDir)) -and (-not $rootCorroborates)) {
+            Warn "Project ships conf/settings.properties with db.name '$confDbName' - every clone of this repo shares that database. Pass 'setup -DbName <unique> -Force' if this instance needs its own DB."
+        }
+    }
     # When every port is still at its default, none was passed explicitly, and
     # a default is already taken by a foreign process (typical: a second agent
     # session on the same box), derive a deterministic per-project port set
@@ -841,20 +898,12 @@ function Cmd-Setup {
         Apply-SettingsOverride $confSettings "db.password" $cfg.dbPassword ($ScriptBound.ContainsKey("DbPassword")) | Out-Null
         Apply-SettingsOverride $confSettings "db.user"     $cfg.dbUser     ($ScriptBound.ContainsKey("DbUser"))     | Out-Null
         Apply-SettingsOverride $confSettings "db.server"   $cfg.dbServer   ($ScriptBound.ContainsKey("DbServer"))   | Out-Null
+        # db.name is resolved authoritatively (settings.properties first) before
+        # the config was saved, so $cfg.dbName already holds the value to persist;
+        # Apply-SettingsOverride leaves an existing conf/ db.name untouched and
+        # fills it in only when absent (a fresh project / migration from the root
+        # mirror). An explicit -DbName overwrites it.
         Apply-SettingsOverride $confSettings "db.name"     $cfg.dbName     ($ScriptBound.ContainsKey("DbName"))     | Out-Null
-        # A repo-committed db.name defeats the "unique DB per project" default:
-        # every clone of the repo points at the same database, and two instances
-        # on one box would fight over the schema. Don't silently adopt it - keep
-        # it (the project's choice wins, like every committed setting) but warn,
-        # and make config.json reflect the name the server will actually use.
-        if (-not $ScriptBound.ContainsKey("DbName")) {
-            $committedDbName = Get-SettingsValue $confSettings "db.name"
-            if ($committedDbName -and ($committedDbName -ne $cfg.dbName)) {
-                $cfg.dbName = $committedDbName
-                Save-Config $cfg
-                Warn "Project commits db.name '$committedDbName' - every clone of this repo shares that database. Pass 'setup -DbName <unique> -Force' if this instance needs its own DB."
-            }
-        }
         # Ports: written when explicitly passed OR when non-default (the
         # hash-derived set from the busy-defaults fallback must persist here
         # too - the server reads ports from this file). Defaults stay implicit.
@@ -871,25 +920,29 @@ function Cmd-Setup {
         }
         Ok "conf/settings.properties updated (Maven project - this is the file the server reads)."
     } else {
+    # Non-Maven layout. The file the server reads at RUNTIME is still
+    # conf/settings.properties (Spring `file:conf/settings.properties`, relative
+    # to the JVM cwd = project root); the project-root settings.properties is a
+    # human-readable MIRROR that older lsfdev versions wrote. We keep the mirror
+    # in sync here and assert the authoritative conf/ copy further below. db.name
+    # was already resolved authoritatively (settings.properties first) before the
+    # config was saved, so $cfg.dbName is the value to persist - written
+    # UNCONDITIONALLY (it has no safe default).
     $settings = Join-Path $ProjectDir "settings.properties"
-    # db.name is install-specific state the server reads from THIS file, and it
-    # has NO safe implicit default (a missing db.name sends the server to the
-    # shared platform-default database, silently orphaning this project's data).
-    # So a re-setup must NEVER drop or change it. Resolve the name to persist,
-    # strongest first: an explicit -DbName, else the name already in this file
-    # (the DB currently in use - protects against a -Force re-run done for an
-    # unrelated reason, e.g. a locale change, when config.json was wiped), else
-    # the cfg value (config.json, or the deterministic per-path default). Then
-    # ALWAYS write it - this is the "unique DB per project" promise the skill
-    # makes, and the source of a real data-loss bug when it was conditional.
-    $existingDbName = if (Test-Path $settings) { Get-SettingsValue $settings "db.name" } else { $null }
-    if (-not $ScriptBound.ContainsKey("DbName") -and $existingDbName -and ($existingDbName -ne $cfg.dbName)) {
-        Info "Preserving db.name '$existingDbName' from the existing settings.properties (pass -DbName <name> to change it)."
-        $cfg.dbName = $existingDbName
-        Save-Config $cfg
-    }
     if ((Test-Path $settings) -and -not $Force) {
-        Ok "settings.properties already exists (left untouched; use -Force to regenerate)."
+        # Keep the mirror's comments / extra keys, but surgically apply the
+        # resolved db.name plus any db.* the caller passed explicitly. This is
+        # what stops a plain re-setup from dropping db.name AND makes
+        # `setup -DbName <x>` (without -Force) update the file too, instead of
+        # silently changing only config.json (the two used to drift apart here).
+        Set-SettingsProperty $settings "db.name" $cfg.dbName
+        if ($ScriptBound.ContainsKey("DbServer"))      { Set-SettingsProperty $settings "db.server"      $cfg.dbServer }
+        if ($ScriptBound.ContainsKey("DbUser"))        { Set-SettingsProperty $settings "db.user"        $cfg.dbUser }
+        if ($ScriptBound.ContainsKey("DbPassword"))    { Set-SettingsProperty $settings "db.password"    $cfg.dbPassword }
+        if ($ScriptBound.ContainsKey("RmiPort"))       { Set-SettingsProperty $settings "rmi.port"       $cfg.rmiPort }
+        if ($ScriptBound.ContainsKey("HttpPort"))      { Set-SettingsProperty $settings "http.port"      $cfg.httpPort }
+        if ($ScriptBound.ContainsKey("WebSocketPort")) { Set-SettingsProperty $settings "webSocket.port" $cfg.webSocketPort }
+        Ok "settings.properties present - db.name (and any explicitly passed db.* / ports) updated; use -Force to regenerate the whole file."
     } elseif ($isExistingProject) {
         # Minimal overrides only: the project's own lsfusion.properties drives
         # topModule, namespaces, etc. We inject install-specific database
@@ -924,7 +977,8 @@ function Cmd-Setup {
         if ($cfg.webSocketPort -ne 8887) { $portLines += "webSocket.port = $($cfg.webSocketPort)`r`n" }
         $content = @"
 # lsFusion application server settings - generated by lsfdev.ps1
-# Edit freely; the server reads this file on startup.
+# This is a mirror; the server reads conf/settings.properties at runtime. Edit
+# either (setup and start keep conf/ authoritative and in sync with this file).
 db.server = $($cfg.dbServer)
 db.name = $($cfg.dbName)
 db.user = $($cfg.dbUser)
@@ -934,6 +988,24 @@ $portLines$topLine
         Set-Content -Path $settings -Value $content -Encoding UTF8
         Ok "settings.properties written."
     }
+
+    # conf/settings.properties is the file the server actually reads at runtime,
+    # so make it authoritative here regardless of -Force: surgically assert the
+    # resolved db.name (unconditional - no safe default) plus the db.* / ports in
+    # effect, preserving any other keys the user added. This is the other half of
+    # the `setup -DbName <x>` fix - without it, only config.json and the root
+    # mirror changed while the server kept reading the old conf/ db.name.
+    $confDir = Join-Path $ProjectDir "conf"
+    New-Item -ItemType Directory -Force -Path $confDir | Out-Null
+    $confSettings = Join-Path $confDir "settings.properties"
+    Set-SettingsProperty $confSettings "db.name" $cfg.dbName
+    Apply-SettingsOverride $confSettings "db.password" $cfg.dbPassword ($ScriptBound.ContainsKey("DbPassword")) | Out-Null
+    Apply-SettingsOverride $confSettings "db.user"     $cfg.dbUser     ($ScriptBound.ContainsKey("DbUser"))     | Out-Null
+    Apply-SettingsOverride $confSettings "db.server"   $cfg.dbServer   ($ScriptBound.ContainsKey("DbServer"))   | Out-Null
+    if ($ScriptBound.ContainsKey("RmiPort")       -or $cfg.rmiPort       -ne 7652) { Set-SettingsProperty $confSettings "rmi.port"       $cfg.rmiPort }
+    if ($ScriptBound.ContainsKey("HttpPort")      -or $cfg.httpPort      -ne 7651) { Set-SettingsProperty $confSettings "http.port"      $cfg.httpPort }
+    if ($ScriptBound.ContainsKey("WebSocketPort") -or $cfg.webSocketPort -ne 8887) { Set-SettingsProperty $confSettings "webSocket.port" $cfg.webSocketPort }
+    Ok "conf/settings.properties updated (the file the server reads at runtime)."
     }
 
     # --- .gitignore ---
@@ -1048,21 +1120,26 @@ function Cmd-StartServer {
         Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
-        # Always stage settings.properties from the project root - lsFusion
-        # reads it off the classpath, and target\classes is the only root.
-        # ALSO mirror it into <project>\conf\: the platform (matching the
-        # apt-installer layout that uses /etc/lsfusion6-server symlinked as
-        # conf/) reads "conf/settings.properties" relative to the JVM working
-        # directory for certain keys (notably db.name). Without this mirror,
-        # custom db.name in settings.properties is silently ignored and the
-        # server falls back to the default DB "lsfusion".
-        $settingsFile = Join-Path $ProjectDir "settings.properties"
-        if (Test-Path $settingsFile) {
-            Copy-Item -Path $settingsFile -Destination $stageDir -Force
-            $confDir = Join-Path $ProjectDir "conf"
-            New-Item -ItemType Directory -Path $confDir -Force -ErrorAction SilentlyContinue | Out-Null
-            Copy-Item -Path $settingsFile -Destination $confDir -Force
+        # The server reads conf/settings.properties at runtime (Spring
+        # `file:conf/settings.properties` in lsfusion.xml, relative to the JVM
+        # working directory = project root). That file is AUTHORITATIVE and is
+        # written by setup; a hand-edit to it (e.g. db.name) MUST survive a
+        # restart, so we do NOT overwrite it from the project-root mirror here —
+        # blindly copying root -> conf is exactly what used to revert a manually
+        # set db.name on restart. We only bootstrap conf/ from the mirror when it
+        # does not exist yet (projects set up by an older lsfdev that wrote only
+        # the root file). The mirror itself is staged onto the classpath too, but
+        # always sourced from the file the server actually reads (conf/), never
+        # the reverse, so a stale root value can never resurrect over a conf/ edit.
+        $rootSettings = Join-Path $ProjectDir "settings.properties"
+        $confDir      = Join-Path $ProjectDir "conf"
+        $confSettings = Join-Path $confDir "settings.properties"
+        New-Item -ItemType Directory -Path $confDir -Force -ErrorAction SilentlyContinue | Out-Null
+        if (-not (Test-Path $confSettings) -and (Test-Path $rootSettings)) {
+            Copy-Item -Path $rootSettings -Destination $confSettings -Force
         }
+        $stageSrc = if (Test-Path $confSettings) { $confSettings } elseif (Test-Path $rootSettings) { $rootSettings } else { $null }
+        if ($stageSrc) { Copy-Item -Path $stageSrc -Destination $stageDir -Force }
 
         # Copy from the canonical Maven source roots first.
         $stagedFromMaven = $false
