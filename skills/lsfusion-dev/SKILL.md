@@ -14,22 +14,14 @@ description: >-
 
 # lsFusion development
 
-> **Companion MCP server — `lsfusion-ai`.** This skill is paired with the
-> [`ai.lsfusion.org`](https://ai.lsfusion.org/mcp) MCP server (registered under the
-> name `lsfusion-ai` by the `lsfusion-ai-skills` plugin). Prefer its tools over
-> guessing lsFusion syntax or behaviour:
->
-> - **`mcp__lsfusion-ai__lsfusion_get_guidance`** — call this **first**, at the start
->   of any lsFusion task, if its guidance isn't already in context, and then follow
->   every rule it returns.
-> - **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** — semantic search over the official
->   docs (`language` / `paradigm` / `how-to` / `brief` / `rules`); use it to confirm
->   syntax, operators, and concepts instead of guessing.
-> - **`mcp__lsfusion-ai__lsfusion_report_feedback`** — submit a docs/behaviour feedback
->   signal, but **only after the user explicitly consents**, and never send source
->   code, file paths, or schema/customer names.
->
-> If these tools aren't available the server isn't installed — see the
+> **Companion MCP server — `lsfusion-ai`** ([`ai.lsfusion.org`](https://ai.lsfusion.org/mcp),
+> registered by the `lsfusion-ai-skills` plugin). Call
+> **`mcp__lsfusion-ai__lsfusion_get_guidance`** **first** in any lsFusion task
+> (if its rules aren't already in context) and follow every rule it returns —
+> the element order, the coding rules, and the `lsfusion_report_feedback`
+> consent policy all live there. Confirm syntax with
+> **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** instead of guessing. If these
+> tools are missing, the server isn't installed — see the
 > [ai-skills README](https://github.com/lsfusion/ai-skills#readme) to add it.
 
 This skill turns the current folder into a runnable lsFusion project: it checks
@@ -58,20 +50,11 @@ web server does not need a restart).
 
 ## CRITICAL: writing `.lsf` code
 
-An lsFusion MCP server is connected. For **any** task that involves reading or
-writing lsFusion code you **must** use it — this is non-negotiable and the MCP
-itself enforces it:
-
-1. Call `lsfusion_get_guidance` once at the start of an lsFusion task (if its
-   rules are not already in context) and follow the rules it returns.
-2. Use `lsfusion_retrieve_docs` to look up exact syntax and semantics before
-   writing or changing code. Query in English for best recall.
-3. Reason about elements in order: **modules/classes → properties → actions →
-   forms → events/constraints**. Do not jump straight to forms.
-
-Do **not** invent lsFusion syntax from memory. See
-[references/workflow.md](references/workflow.md) for the code-writing loop and a
-minimal working module.
+Do **not** invent lsFusion syntax from memory. For **any** task that reads or
+writes lsFusion code, use the MCP server (header note above) — this is
+non-negotiable and the MCP itself enforces it: `lsfusion_get_guidance` first,
+then `lsfusion_retrieve_docs` (query in English for best recall) for the exact
+syntax and semantics of every construct, before writing or changing code.
 
 ## The `lsfdev.ps1` CLI
 
@@ -180,9 +163,9 @@ with and stay consistent within the project.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Headless-Chrome screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). |
 | `open` | Open the web UI in the user's default browser. |
-| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see workflow.md and the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
+| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
 Key options: `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
 (`7` — default; `stable`; `dev`/`snapshot`; a major-version alias; or an exact
@@ -418,7 +401,7 @@ sync.
 
 ### 3. Write the `.lsf` code
 
-Follow the MCP rules above and [references/workflow.md](references/workflow.md).
+Follow the MCP rules above (guidance first, then a docs lookup per construct).
 
 **Default scaffold for a new from-scratch project.** Use the standard
 **Maven-style directory layout** that every existing lsFusion solution
@@ -613,27 +596,17 @@ client on PATH and no DB credentials to dig out. Skip it for ordinary
 edit→restart cycles; it only matters after the first full schema load or a
 sync that touched many tables.
 
-> **UTF-8 / non-ASCII pitfall — read before sending Cyrillic (or any
-> non-ASCII) through the Action API.** The transport is NOT the problem:
-> with the server JVM on UTF-8 (lsfdev always passes
-> `-Dfile.encoding=UTF-8`), POST bodies and query parameters both carry
-> non-ASCII intact — verified byte-for-byte on 6.2 and 7.0-SNAPSHOT
-> (2026-06). The real corruption happens **on the Windows client side**, in
-> two places: **outbound**, an **inline** `-Script` value crosses the
-> bash → PowerShell argv boundary (Windows ANSI code page) and non-ASCII is
-> mangled to `?` *before anything is sent*; and **inbound**, piping a UTF-8
-> response through console tools re-decodes it in the ANSI code page and
-> *fabricates* mojibake that is not in the data (check bytes from a saved
-> file, not console output, before blaming the server). So put any
-> non-ASCII script in a UTF-8 file and pass `-ScriptFile`:
+> **UTF-8 / non-ASCII pitfall.** Put any non-ASCII script text (Cyrillic
+> names, localized strings) in a UTF-8 file and pass `-ScriptFile` — never
+> inline via `-Script` (the Windows argv boundary mangles it to `?` before
+> anything is sent) — and judge responses by the bytes of a saved file, not
+> console output (console pipes fabricate mojibake that is not in the data).
+> The transport itself is fine; mechanics and verified details are in the
+> **lsfusion-eval** skill:
 >
 > ```
 > lsfdev.ps1 api -ScriptFile "C:/Work/proj/.lsfusion-dev/seed.lsf"
 > ```
->
-> `-ScriptFile` is read straight from disk as UTF-8, so the text never goes
-> through argv at all — this is the robust way to seed test data with names,
-> addresses, or any localized strings.
 
 **Restart only for schema changes. For runtime data operations, use
 lsfusion-eval — do NOT create a module and restart.** A `restart`
@@ -690,19 +663,14 @@ inside an action body runs there directly. No `.lsf` file, no top
 REQUIRE entry, no restart cycle — round-trip is sub-second instead of
 30+ s.
 
-Signs you are about to make this mistake:
-
-- You catch yourself writing a `TestData.lsf` / `SeedData.lsf` /
-  `Migration001.lsf` module purely to call it once and never again.
-- You're adding an action to the top REQUIRE that the production
-  config will never want to load.
-- The work is "create N rows" or "set property X on object Y", not
-  "introduce a new property / class / form".
-
-In all three, stop and switch to lsfusion-eval. A permanent module
-should exist when the *application* genuinely needs the action
-later — admin tools, importers, scheduled jobs. One-shot data
-manipulation should never leave a trace in the codebase.
+Signs you are about to make this mistake: a `TestData.lsf` / `SeedData.lsf`
+/ `Migration001.lsf` module written to be called once; a top-`REQUIRE`
+entry the production config will never want; work shaped like "create N
+rows / set property X", not "introduce a class / property / form". In all
+three, stop and switch to lsfusion-eval — one-shot data manipulation
+should never leave a trace in the codebase (a permanent module is for
+actions the application genuinely needs later: admin tools, importers,
+scheduled jobs).
 
 ### 5. Verify the result
 
@@ -729,57 +697,19 @@ checking the unit-test output.
    note in step 4 (use the `api` command / `-ScriptFile`, not a raw `curl`
    POST body).
 
-   **Reading a value back: use `EXPORT FROM` (any version) or `RETURN`
-   (7.0+ only), never `MESSAGE`.** The `api` command prints the HTTP
-   response body. `EXPORT FROM res = <expr>;` puts a scalar (or rows, with
-   `EXPORT JSON FROM ...`) into the body on **every** platform version.
-   On **7.0+** there is the shorter `RETURN <expr>;` — and since the skill
-   now defaults to `-Version 7`, it works out of the box. But on `-Version
-   stable` (currently **6.2**) `RETURN` is a **parse error** (`extraneous
-   input ... expecting ';'`), so reach for `EXPORT FROM` when a script must
-   also run on older platforms. A plain
-   `MESSAGE` over HTTP is **swallowed entirely** — empty 200, nothing in
-   the response, nothing in the log; `MESSAGE ... NOWAIT` at least lands
-   in the **server log** (`Server message: ...`), and the `api` command
-   tails those lines and prints them after the call.
-
-   **A constraint-canceled `APPLY` is silent — HTTP 200 either way.** If a
-   seed/mutation script violates a constraint (`NONULL`, `CONSTRAINT`,
-   uniqueness), `APPLY` cancels, **no row lands, and the response is still
-   an empty 200** — indistinguishable from success at the transport level.
-   Never trust the status code for mutations: end every mutation script
-   with a self-check so the answer arrives in one call. Keep the
-   value-returning statement at the **top level** — an eval call already
-   runs in its own session, so no `NEWSESSION` wrapper is needed, and
-   wrapping matters for the `EXPORT` form specifically: `EXPORT`'s result
-   is a session-local property, silently discarded when the `NEWSESSION`
-   exits (`RETURN`, being stack control flow, survives `NEWSESSION` — but
-   don't add the wrapper just to rely on that):
-
-   ```lsf
-   // any version (6.x and 7.0+):
-   // ... NEW / assignments ...
-   APPLY;
-   EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');
-
-   // 7.0+ alternative:
-   // ... NEW / assignments ...
-   APPLY;
-   IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');
-   RETURN 'OK: ' + STRING((OVERRIDE (GROUP SUM 1 IF ...), 0));
-   ```
-
-   `applyMessage()` carries the human-readable constraint text — wrapped in
-   `OVERRIDE` because it can be `NULL`, and `'CANCELED: ' + NULL` would
-   collapse the whole answer to an empty body. The `api` command adds two
-   safety nets of its own: it prints a version-appropriate hint whenever
-   the body comes back empty, and it tails the server log for
-   `Server message:` lines after every call — which surfaces both
-   `MESSAGE ... NOWAIT` output **and** the constraint text a canceled
-   `APPLY` logs, so even an un-instrumented seed script usually shows its
-   failure reason right in the call output. The self-check recipe is
-   still the contract to write: it works through any HTTP client, not just
-   `lsfdev.ps1 api`.
+   **Reading values back and confirming mutations has sharp edges — the
+   canonical recipes are in the lsfusion-eval skill** ("Getting values
+   back", "Chaining and verifying"). In short: `RETURN <expr>;` is 7.0+
+   only (a parse error on 6.x — use `EXPORT FROM res = <expr>;` there),
+   `MESSAGE` is swallowed over HTTP, and a constraint-canceled `APPLY`
+   returns the **same empty 200 as success** — so end every mutation script
+   with a top-level self-check (no `NEWSESSION` wrapper), e.g.
+   `APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');`.
+   The `api` command adds two safety nets of its own: it prints a
+   version-appropriate hint whenever the body comes back empty, and it
+   tails the server log for `Server message:` lines after every call —
+   which surfaces both `MESSAGE ... NOWAIT` output and the constraint text
+   a canceled `APPLY` logs.
 
 3. **UI, last.** When log + API agree the build is healthy, run
    `verify`. It drives **Playwright** (headless Chromium) to:
@@ -856,10 +786,8 @@ lsfdev.ps1 api -Script "LOCAL f = FILE (); PRINT myForm OBJECTS o = <expr> PDF T
 `WRITE f() TO '<path>'` dumps it to disk (extension auto-appended →
 `out.pdf`). Open the PDF with your file-reading tool and actually eyeball it —
 a wrong field name/type or band height only shows in the rendered output.
-Template fields are the form property references verbatim (`date(o)`,
-`quantity(d)`), with the object key `<group>.object`; numerics map to
-`java.math.BigDecimal`, dates to `java.util.Date`. (Use `$V{REPORT_COUNT}`
-for line numbers to avoid a field-type guess.)
+For template / field-mapping rules, retrieve the `Report_design` docs — the
+guidance's report rules mandate that before touching any `.jrxml` anyway.
 
 **Do not query PostgreSQL directly to inspect data.** lsFusion owns the
 schema — table names are mangled (`<class>_<namespace>`, `_x_yz` columns),
@@ -943,7 +871,7 @@ verification — the workflow is identical to a scaffolded project.
 When extending an existing project, **explore before adding**: use
 `lsfusion_retrieve_docs` and any project-element search the MCP exposes to
 understand the existing modules, namespaces, and conventions, then add new
-elements that fit in. See [references/workflow.md](references/workflow.md).
+elements that fit in.
 
 ## Where lsFusion reads its working parameters from
 
@@ -995,9 +923,6 @@ using whatever the resolution chain above produces.
   `<project-root>/conf/settings.properties` contain the DB password in
   plain text (this is how lsFusion works) — mention this to the user if
   the repo is shared.
-- Ports used: `5432` PostgreSQL, `7652` RMI, `7651` Action API, `8887`
-  WebSocket (always bound by the app server), `8080` web UI, `8005` Tomcat
-  shutdown. `status` reports conflicts.
 - Deeper runtime details, all config keys, and a troubleshooting table are in
   [references/runtime.md](references/runtime.md) — read it when a command fails
   or the user asks about configuration.

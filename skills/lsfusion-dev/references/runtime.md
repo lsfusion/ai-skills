@@ -96,19 +96,13 @@ the navigator with no login form, both in the user's browser and in headless
 `verify` runs. Outside devmode the default credentials (`admin` / empty
 password) apply and the login form is rendered as usual.
 
-Devmode auth has one trap that drives how the `api` command talks to the
-Action API: devmode auto-auth applies **only to a request that carries no
-`Authorization` header at all** (it treats it as the anonymous user). A
-request that *does* send a header makes the server run a real credential
-check on what was sent — a wrong password gets **HTTP 401** even in devmode.
-An **empty-password** Basic for `admin` is accepted by current builds
-(verified on 6.2 and 7.0-SNAPSHOT, 2026-06), though a snapshot-era build was
-once observed rejecting it with 401. The no-header form has no such history,
-so the `api` command sends **no** `Authorization` header unless a non-empty
-admin password is configured (`-AdminPassword` at setup, or stored in
-`config.json`); with the default blank password it calls anonymously. This is
-the same rule the **lsfusion-eval** skill documents: devmode → no `-u`;
-password set / rotated → `-u admin:<password>`.
+Devmode auth has one trap: auto-auth applies **only to a request that
+carries no `Authorization` header at all** — a request with a header gets a
+real credential check (a wrong password is **HTTP 401** even in devmode).
+That is why the `api` command sends **no** header unless a non-empty admin
+password is configured (`-AdminPassword` at setup, or stored in
+`config.json`). Full rule table and build history: the **lsfusion-eval**
+skill's auth section.
 
 The three `-Ddb.denyDrop{Modules,Tables,Properties}=false` flags let the
 schema sync remove modules, tables, and columns that disappear between
@@ -219,11 +213,6 @@ Once a version is in `config.json`, later `setup` runs reuse it verbatim — the
 resolved version is sticky, so the platform never gets upgraded silently. Pass
 an alias again (e.g. `setup -Version 7 -Force`) when you want to move to
 the current latest.
-
-## Updating after editing `.lsf` files
-
-Any change to a `.lsf` module requires an application-server restart:
-`lsfdev.ps1 restart`. The web server (Tomcat) does **not** need restarting.
 
 ## Lightstart {#lightstart}
 

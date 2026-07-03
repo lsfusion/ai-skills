@@ -5,22 +5,14 @@ description: Deploy an lsFusion application to a remote Linux server (Ubuntu/Deb
 
 # lsFusion remote deploy
 
-> **Companion MCP server — `lsfusion-ai`.** This skill is paired with the
-> [`ai.lsfusion.org`](https://ai.lsfusion.org/mcp) MCP server (registered under the
-> name `lsfusion-ai` by the `lsfusion-ai-skills` plugin). Prefer its tools over
-> guessing lsFusion syntax or behaviour:
->
-> - **`mcp__lsfusion-ai__lsfusion_get_guidance`** — call this **first**, at the start
->   of any lsFusion task, if its guidance isn't already in context, and then follow
->   every rule it returns.
-> - **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** — semantic search over the official
->   docs (`language` / `paradigm` / `how-to` / `brief` / `rules`); use it to confirm
->   syntax, operators, and concepts instead of guessing.
-> - **`mcp__lsfusion-ai__lsfusion_report_feedback`** — submit a docs/behaviour feedback
->   signal, but **only after the user explicitly consents**, and never send source
->   code, file paths, or schema/customer names.
->
-> If these tools aren't available the server isn't installed — see the
+> **Companion MCP server — `lsfusion-ai`** ([`ai.lsfusion.org`](https://ai.lsfusion.org/mcp),
+> registered by the `lsfusion-ai-skills` plugin). Call
+> **`mcp__lsfusion-ai__lsfusion_get_guidance`** **first** in any lsFusion task
+> (if its rules aren't already in context) and follow every rule it returns —
+> the element order, the coding rules, and the `lsfusion_report_feedback`
+> consent policy all live there. Confirm syntax with
+> **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** instead of guessing. If these
+> tools are missing, the server isn't installed — see the
 > [ai-skills README](https://github.com/lsfusion/ai-skills#readme) to add it.
 
 This skill takes an lsFusion configuration — whether a Maven project from GitHub or `.lsf` files written from scratch — and gets it serving on a remote Linux server managed by systemd, talking to a real PostgreSQL.
@@ -592,7 +584,7 @@ anything else when you need to know "is feature X really on the server?".
 
 ### Refresh PostgreSQL planner statistics after a first install or a big schema change — call `analyzeDBAction()`
 
-lsFusion generates large, join-heavy SQL. Right after a fresh DB load — or a sync that created/changed many tables — PostgreSQL has **no planner statistics** for those tables, so the first queries and form opens can be dramatically slow until autovacuum eventually catches up. The platform ships a built-in maintenance action for exactly this: **`analyzeDBAction()`** (from the system `Service` module — also callable as `Service.analyzeDBAction()`), which runs PostgreSQL `ANALYZE` on the server's own connection. Call it once, immediately after you see `STARTED`, over the Action API (deployed = devmode OFF = `-u admin:` with empty password — see the **lsfusion-eval** skill):
+A freshly-loaded DB has **no PostgreSQL planner statistics**, so the first queries and form opens can crawl until autovacuum catches up. Immediately after `STARTED`, call the platform's built-in **`analyzeDBAction()`** (runs `ANALYZE` on the server's own connection) once over the Action API — rationale and details in the **lsfusion-dev** skill, step 4; the auth rule (deployed = devmode OFF = `-u admin:` with empty password) in **lsfusion-eval**:
 
 ```bash
 curl -sS -u 'admin:' -X POST -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
@@ -600,7 +592,7 @@ curl -sS -u 'admin:' -X POST -H 'Content-Type: application/x-www-form-urlencoded
   https://<host>/eval/action
 ```
 
-This is **not** the same as lsFusion's own `Recalculating stats and materializations at the first start` log line — that fills the platform's internal optimizer stat tables, which is separate from PostgreSQL's `ANALYZE`. Prefer the action over raw `psql` (no DB creds, no shell into PostgreSQL, works the same locally and remotely). Run it after the **first** deploy and after any deploy that adds/removes many classes/properties; for steady-state redeploys that only change resources (JS/CSS) or a handful of properties it's unnecessary.
+Run it after the **first** deploy and after any deploy that adds/removes many classes/properties; skip it for steady-state redeploys that only change resources (JS/CSS) or a handful of properties.
 
 ### Lock the drop guards back to `true` once the deploy succeeded
 

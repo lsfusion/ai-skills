@@ -21,22 +21,14 @@ description: >-
 
 # lsFusion HTTP Action API & remote-install introspection
 
-> **Companion MCP server — `lsfusion-ai`.** This skill is paired with the
-> [`ai.lsfusion.org`](https://ai.lsfusion.org/mcp) MCP server (registered under the
-> name `lsfusion-ai` by the `lsfusion-ai-skills` plugin). Prefer its tools over
-> guessing lsFusion syntax or behaviour:
->
-> - **`mcp__lsfusion-ai__lsfusion_get_guidance`** — call this **first**, at the start
->   of any lsFusion task, if its guidance isn't already in context, and then follow
->   every rule it returns.
-> - **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** — semantic search over the official
->   docs (`language` / `paradigm` / `how-to` / `brief` / `rules`); use it to confirm
->   syntax, operators, and concepts instead of guessing.
-> - **`mcp__lsfusion-ai__lsfusion_report_feedback`** — submit a docs/behaviour feedback
->   signal, but **only after the user explicitly consents**, and never send source
->   code, file paths, or schema/customer names.
->
-> If these tools aren't available the server isn't installed — see the
+> **Companion MCP server — `lsfusion-ai`** ([`ai.lsfusion.org`](https://ai.lsfusion.org/mcp),
+> registered by the `lsfusion-ai-skills` plugin). Call
+> **`mcp__lsfusion-ai__lsfusion_get_guidance`** **first** in any lsFusion task
+> (if its rules aren't already in context) and follow every rule it returns —
+> the element order, the coding rules, and the `lsfusion_report_feedback`
+> consent policy all live there. Confirm syntax with
+> **`mcp__lsfusion-ai__lsfusion_retrieve_docs`** instead of guessing. If these
+> tools are missing, the server isn't installed — see the
 > [ai-skills README](https://github.com/lsfusion/ai-skills#readme) to add it.
 
 This skill covers two complementary ways to inspect a running lsFusion
@@ -80,23 +72,13 @@ you make from reading local code is wrong.
 | Edit `.lsf` source | The lsfusion-dev skill + IDE MCP tools |
 | Deploy a new jar | The lsfusion-deploy skill |
 
-The **fixed verification order — same for local and remote, never UI
-first** is:
-
-1. **Server log** — `tail` `/var/log/lsfusion6-server/stdout.log` over SSH
-   on a deployed host, or `lsfdev.ps1 log` locally. Read this **first**;
-   if startup failed, schema didn't sync, or modules/tables got dropped,
-   nothing else you check will make sense.
-2. **API** — this skill's `/eval/action` and `/files/*` endpoints. Cheap,
-   exact, reachable over HTTPS without SSH. Confirms names resolve, data
-   counts, deployed source matches.
-3. **UI** — Playwright screenshots (this skill's Part 3 for remote, or
-   the lsfusion-dev skill's `verify` for local). Most expensive but the
-   only way to prove what an end user actually sees.
-
-`psql` directly is only for what neither log nor API can answer (DBA
-recovery, physical-layout debugging) — and only after asking the user.
-Don't reach for `psql` to "just check what's there"; use the API.
+The **fixed verification order** (rationale in the lsfusion-dev skill,
+step 5) is the same locally and remotely — never UI first: **server log**
+(`tail /var/log/lsfusion6-server/stdout.log` over SSH, or `lsfdev.ps1 log`)
+→ **API** (this skill's `/eval/action` and `/files/*`) → **UI** (Playwright:
+Part 3 for remote, lsfusion-dev `verify` for local). Direct `psql` is only
+for what neither log nor API can answer (DBA recovery, physical-layout
+debugging) — and only after asking the user.
 
 ## Part 1: HTTP Action API
 
@@ -735,22 +717,6 @@ and replace the body with whatever your task needs. Output goes to
 
 - **`-u admin:` ≠ no `-u`.** Repeat after me. The single mistake worth more
   than all the others combined.
-- **Non-ASCII corruption is client-side, not transport-side.** With the
-  server JVM on UTF-8 (the dev and deploy skills both ensure it), POST
-  bodies and query strings carry Cyrillic intact on 6.2 and 7.0 alike —
-  verified byte-for-byte. Keep the `charset=UTF-8` suffix as hygiene, but
-  when characters break, look at the Windows client first (next bullet) or
-  at a legacy server installed under a non-UTF-8 locale (lsfusion-deploy
-  locale section).
-- **On Windows, inline non-ASCII dies at the argv boundary — and console
-  pipes fake mojibake on the way back.** Git Bash re-encodes a native
-  `curl.exe`'s arguments to the ANSI code page, so Cyrillic/CJK in an inline
-  `script=...` argument is already `?` before curl even runs. And piping a
-  UTF-8 response through console tools re-decodes it in the ANSI code page,
-  fabricating mojibake that is not in the data. Send non-ASCII scripts from
-  a file (`--data-urlencode "script@C:/path/file.lsf"`), and verify results
-  from a saved file read as UTF-8 (`curl -o resp.json`), not from console
-  text.
 - **Use `--data-urlencode`, not `--data`.** With `--data` the shell does
   no encoding and `&`, `+`, `=`, `%` inside your script become protocol
   syntax — the server then parses garbage.
@@ -766,14 +732,6 @@ and replace the body with whatever your task needs. Output goes to
   recommends. If the deployed project doesn't have it, `/eval/action`
   returns 404 — you'll have to deploy a temporary build with `Eval` added,
   or use `/exec?action=<an action the project itself declares with @@api>`.
-- **`MESSAGE` is pointless in API scripts.** Over HTTP its text is swallowed
-  entirely: not in the response body, and (plain `MESSAGE`) not even in the
-  server log — only `MESSAGE ... NOWAIT` leaves a `Server message:` log line.
-  The constraint text of a canceled `APPLY` behaves the same way: server log
-  only, never the response. So over the API, data comes back **only** via
-  `EXPORT FROM` (any version) / `RETURN <expr>;` (7.0+), and a mutation
-  outcome **only** via an explicit check:
-  `APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');`.
 - **The eval API is a runtime tool.** Don't use it as a substitute for
   proper migration scripts or for changing production data without
   approval — that's exactly the kind of action the user trust pattern
