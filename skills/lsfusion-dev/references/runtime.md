@@ -18,6 +18,8 @@ configuration, or when you need to change ports/versions.
     ├── tomcat.out.log
     ├── server.pid / tomcat.pid
     ├── server-initialized.flag   marker; light start is used once it exists
+    ├── verify_playwright.py      helper re-copied from the skill on each verify
+    │                             (plugin skill dirs aren't visible to python.exe)
     ├── verify-login.png          Playwright screenshot of the login page
     ├── verify-app.png            Playwright screenshot after the login attempt
     └── verify-dom.html / verify-console.txt

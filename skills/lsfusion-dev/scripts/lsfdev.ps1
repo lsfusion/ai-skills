@@ -1445,8 +1445,15 @@ function Cmd-Verify {
     if (-not $py) { throw "Python 3 not found. Install Python 3 to use Playwright verification." }
     Ensure-Playwright $py
 
-    $scriptPath = Join-Path $PSScriptRoot "verify_playwright.py"
-    if (-not (Test-Path $scriptPath)) { throw "verify_playwright.py not found at $scriptPath" }
+    # Run the helper from a copy in the state dir: when the skill is installed
+    # as a Claude Code plugin, scripts/ lives on a virtualized filesystem that
+    # this PowerShell process can read but spawned native processes cannot —
+    # python.exe gets "[Errno 2] No such file or directory" on the same path
+    # even though Test-Path returns true (lsfusion/ai-skills#2).
+    $scriptSrc = Join-Path $PSScriptRoot "verify_playwright.py"
+    if (-not (Test-Path $scriptSrc)) { throw "verify_playwright.py not found at $scriptSrc" }
+    $scriptPath = Join-Path $StateDir "verify_playwright.py"
+    Copy-Item -LiteralPath $scriptSrc -Destination $scriptPath -Force
 
     # Clean stale artefacts from earlier Chrome-based verify runs.
     Remove-Item (Join-Path $StateDir "verify.png"), (Join-Path $StateDir "chrome.err.log"),
