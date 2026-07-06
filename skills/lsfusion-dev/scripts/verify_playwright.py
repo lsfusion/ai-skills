@@ -63,6 +63,16 @@ def main() -> int:
                     help="after the click-through, double-click a grid row by "
                          "visible text to open its edit card, then screenshot "
                          "it; e.g. \"Coffee beans\"")
+    ap.add_argument("--do", dest="do_actions", action="append", default=[],
+                    help="generic interaction step, run in order AFTER the "
+                         "--click/--double-click navigation; repeatable. "
+                         "Forms: click:<selector>, dblclick:<selector>, "
+                         "fill:<selector>=><value>, type:<selector>=><value>, "
+                         "press:<key>, eval:<js>, wait:<ms>. <selector> is any "
+                         "Playwright selector (css, text=..., :has-text(...)), "
+                         "which is what reaches buttons/inputs inside CUSTOM "
+                         "(React) components that the text-based --click "
+                         "cannot hit")
     ap.add_argument("--viewport-width", type=int, default=1920)
     ap.add_argument("--viewport-height", type=int, default=1080)
     ap.add_argument("--locale", default="",
@@ -76,11 +86,12 @@ def main() -> int:
     app_png      = out_dir / "verify-app.png"
     click_png    = out_dir / "verify-click.png"
     dblclick_png = out_dir / "verify-dblclick.png"
+    do_png       = out_dir / "verify-do.png"
     dom_path     = out_dir / "verify-dom.html"
     console_path = out_dir / "verify-console.txt"
 
     # Wipe previous artefacts so callers can rely on file presence.
-    for p in (login_png, app_png, click_png, dblclick_png, dom_path, console_path):
+    for p in (login_png, app_png, click_png, dblclick_png, do_png, dom_path, console_path):
         if p.exists():
             p.unlink()
 
@@ -101,11 +112,17 @@ def main() -> int:
             "target": "",
             "error": None,
         },
+        "do": {
+            "requested": bool(args.do_actions),
+            "steps": [],
+            "error": None,
+        },
         "artifacts": {
             "login_screenshot":    str(login_png),
             "app_screenshot":      str(app_png),
             "click_screenshot":    str(click_png),
             "dblclick_screenshot": str(dblclick_png),
+            "do_screenshot":       str(do_png),
             "dom":                 str(dom_path),
             "console":             str(console_path),
         },
@@ -246,6 +263,76 @@ def main() -> int:
                     except (PWTimeout, PWError) as e:
                         result["double_click"]["error"] = f"double-click on {dbl!r} failed: {e}"
                     page.screenshot(path=str(dblclick_png))
+
+                # Optional generic interaction steps (--do, repeatable): the
+                # escape hatch for anything the text-based navigation above
+                # cannot reach - buttons/inputs inside CUSTOM (React)
+                # components, filters, dialogs. Each step is "verb:rest" with
+                # any Playwright selector; steps run in order and the chain
+                # stops at the first failure (later steps usually depend on
+                # earlier ones). A screenshot is taken after the chain either
+                # way.
+                if result["do"]["requested"]:
+                    for raw in args.do_actions:
+                        step = {"action": raw, "ok": False, "detail": ""}
+                        result["do"]["steps"].append(step)
+                        try:
+                            verb, _, rest = raw.partition(":")
+                            verb = verb.strip().lower()
+                            if verb in ("click", "dblclick"):
+                                loc = page.locator(rest).first
+                                if verb == "click":
+                                    loc.click(timeout=15000)
+                                else:
+                                    loc.dblclick(timeout=15000)
+                                page.wait_for_timeout(500)
+                            elif verb in ("fill", "type"):
+                                # Selector/value split: prefer the unambiguous
+                                # '=>'; fall back to the LAST '=' (CSS attribute
+                                # selectors like [name="x"] contain '=' too).
+                                if "=>" in rest:
+                                    sel, _, value = rest.partition("=>")
+                                else:
+                                    sel, _, value = rest.rpartition("=")
+                                sel = sel.strip()
+                                if not sel:
+                                    raise ValueError(
+                                        "no selector in fill/type step - use "
+                                        "fill:<selector>=><value>")
+                                loc = page.locator(sel).first
+                                if verb == "fill":
+                                    loc.fill(value)
+                                else:
+                                    # 'type' presses real keys - for React-style
+                                    # inputs that ignore programmatic value sets.
+                                    loc.click(timeout=15000)
+                                    if hasattr(loc, "press_sequentially"):
+                                        loc.press_sequentially(value, delay=30)
+                                    else:  # older Playwright
+                                        loc.type(value, delay=30)
+                            elif verb == "press":
+                                page.keyboard.press(rest.strip())
+                            elif verb == "eval":
+                                # Expression or '() => {...}' function body; the
+                                # value comes back in the step detail.
+                                step["detail"] = repr(page.evaluate(rest))
+                            elif verb == "wait":
+                                page.wait_for_timeout(int(rest.strip() or "500"))
+                            else:
+                                raise ValueError(
+                                    f"unknown verb {verb!r} - use "
+                                    "click/dblclick/fill/type/press/eval/wait")
+                            step["ok"] = True
+                        except (PWTimeout, PWError, ValueError) as e:
+                            step["detail"] = str(e).split("\n")[0]
+                            result["do"]["error"] = f"step {raw!r} failed"
+                            break
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except PWTimeout:
+                        pass
+                    page.wait_for_timeout(800)
+                    page.screenshot(path=str(do_png))
 
                 dom_path.write_text(page.content(), encoding="utf-8")
 

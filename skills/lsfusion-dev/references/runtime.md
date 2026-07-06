@@ -13,7 +13,10 @@ configuration, or when you need to change ports/versions.
     ├── config.json         skill config (versions, ports, credentials)
     ├── lsfusion-server-<ver>.jar
     ├── tomcat/             Apache Tomcat 9; the client war lives here as
-    │                       webapps/ROOT.war (the download itself is not kept)
+    │                       webapps/<app id>.war -> web context /<app id>
+    │                       (app id = db.name; the download itself is not
+    │                       kept; webapps/ROOT holds only a redirect page
+    │                       to /<app id>/)
     ├── server.out.log / server.err.log
     ├── tomcat.out.log
     ├── server.pid / tomcat.pid
@@ -22,6 +25,8 @@ configuration, or when you need to change ports/versions.
     │                             (plugin skill dirs aren't visible to python.exe)
     ├── verify-login.png          Playwright screenshot of the login page
     ├── verify-app.png            Playwright screenshot after the login attempt
+    ├── verify-click.png / verify-dblclick.png   -Click / -DoubleClick results
+    ├── verify-do.png             state after the -Do interaction steps
     └── verify-dom.html / verify-console.txt
 ```
 
@@ -80,7 +85,9 @@ time, based on `Find-Maven`.
 java <--add-opens flags> -Dlsfusion.server.devmode=true \
      -Ddb.denyDropModules=false -Ddb.denyDropTables=false \
      -Ddb.denyDropProperties=false \
-     [-Dlsfusion.server.lightstart=true] -Xmx2g -Dfile.encoding=UTF-8 \
+     [-Dlsfusion.server.lightstart=true] \
+     -Ddb.name=<name> [-Ddb.server=… -Ddb.user=… -Ddb.password=…] \
+     -Xmx2g -Dfile.encoding=UTF-8 \
      -cp "target\classes;.lsfusion-dev\lsfusion-server-<ver>.jar" \
      lsfusion.server.logics.BusinessLogicsBootstrap
 ```
@@ -88,6 +95,25 @@ java <--add-opens flags> -Dlsfusion.server.devmode=true \
 Success is the log line `Server has successfully started`. Listens on RMI
 `7652`, HTTP Action API `7651`, and WebSocket `8887` (all shiftable via
 `rmi.port` / `http.port` / `webSocket.port`).
+
+The `-Ddb.*` args duplicate the values just resolved from
+`settings.properties` (which stays the source of truth between runs — the
+skill re-reads it and re-asserts `db.name` into `conf/settings.properties`
+before every launch). `-D` is the strongest resolution layer, so the server
+provably runs against the reported database even if a settings-file layer is
+unreadable or mis-parsed — the incident that motivated this had `db.name`
+silently ignored (BOM'd first key) while ports from the same file applied.
+After a successful start the skill additionally **verifies the actual
+binding** through `pg_stat_activity` (JVM TCP connections are matched to
+backends by `client_port`; psql is searched on PATH, then next to the
+PostgreSQL **service's** binary — `Win32_Service.PathName` points into the
+install's `bin\` for any install location — then under
+`%ProgramFiles%\PostgreSQL\<ver>\bin`) and prints either
+`Database binding verified` or a loud `DATABASE MISMATCH`. `status` shows the
+same as `Database: <name> (N connections)` and flags a mismatch for a running
+server. Values with whitespace can't survive argument joining and stay
+file-only; ports are deliberately file-only (safe defaults, no silent-fallback
+history).
 
 **Development JVM options.** `-Dlsfusion.server.devmode=true` is always set for
 local development. Beyond turning on dev-friendly behaviour, **devmode also
@@ -127,10 +153,14 @@ If a light-start restart behaves oddly after a data-model change, redo it with
 
 **Web server** (`start-web`): Tomcat is started by invoking its
 `org.apache.catalina.startup.Bootstrap` directly (so the skill owns the PID).
-The war is deployed as `webapps/ROOT.war`, so the UI is at the context root
-`http://localhost:8080/`. The web client connects to the application server
-over RMI on `localhost:7652` by default — no extra configuration is needed when
-everything runs locally with default ports.
+The war is deployed as `webapps/<app id>.war` — the app id being `db.name` —
+so the UI is at `http://localhost:8080/<app id>/`; the root `/` serves a
+one-line redirect there (projects set up by pre-app-id skill versions keep
+`ROOT.war` at `/` until the next `setup`, which renames the war in place — no
+re-download; a `db.name` that is not context-safe also stays at `/`). The
+web client connects to the application server over RMI on `localhost:7652` by
+default — no extra configuration is needed when everything runs locally with
+default ports.
 
 ## settings.properties keys
 
@@ -143,7 +173,7 @@ from it, with `.lsfusion-dev/config.json` only a cache. Keys the skill writes:
 | Key | Meaning | Default |
 |---|---|---|
 | `db.server` | PostgreSQL host (add `:port` if not 5432) | `localhost` |
-| `db.name` | database name — generated uniquely per project (`lsfusion_<folder>_<hash>`) unless `-DbName` is given | (per project) |
+| `db.name` | database name = **the app id** (`setup -AppId`): the web context path is derived from this same value, no separate key. When the value is not a valid context name (an expert `-DbName`), only the DB uses it and the web client deploys at `/` | `<folder>_<hash4>` |
 | `db.user` | PostgreSQL user | `postgres` |
 | `db.password` | PostgreSQL password | (empty) |
 | `logics.topModule` | top module to load; blank = load all found | (blank) |
@@ -177,6 +207,7 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | `Connection refused` / `could not connect` to the DB | PostgreSQL is down. Start the PostgreSQL service, re-run `start-server`. |
 | `password authentication failed` | Wrong `db.password`. Re-run `setup -DbPassword <correct> -Force`, or edit `settings.properties`. |
 | `database "..." does not exist` and it is not auto-created | Create the database named by `db.name` in `settings.properties`: `createdb -U postgres <db.name>` (or via pgAdmin), then `restart`. |
+| Server silently ignores `db.name` (or another first-line key) and uses the shared default DB `lsfusion`, although `settings.properties` names another | A **UTF-8 BOM** at the start of `conf/settings.properties` — Java's properties loader does not strip it, so the first key reads as `﻿db.name`. Written by BOM-adding editors and by pre-2026-07 skill versions (PowerShell `Set-Content -Encoding UTF8`); lsfdev's own readers strip the BOM, so old `setup`/`status` still reported the intended name. Current skill versions triple-guard this: properties are written BOM-less (re-running `setup` — or any `start` — heals the file), `-Ddb.name` on the launch line outranks the file anyway, and after start the skill verifies the real binding via `pg_stat_activity` (`DATABASE MISMATCH` if not). If you hit this on an old install: the server may have been creating its schema in `lsfusion` all along — decide consciously whether to keep pointing there (`setup -DbName lsfusion`) or re-sync into the intended DB. |
 | `pg_hba.conf` / authentication method rejected | PostgreSQL must allow `md5`/`scram`/`trust` for the user. Edit `pg_hba.conf` and reload PostgreSQL. |
 | `error parsing`, `syntax error`, `expecting ...` | An `.lsf` syntax error. Read the file/line in the message, fix it with `lsfusion_retrieve_docs`, then `restart`. |
 | `module ... not found` | A `REQUIRE`d module name is wrong or missing. Check module names. |

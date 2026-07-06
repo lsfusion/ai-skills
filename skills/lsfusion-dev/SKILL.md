@@ -42,8 +42,9 @@ lsFusion has **two** processes, plus a database:
   on port `7651`, and a WebSocket server on port `8887`. Started with
   `java -cp ".;<jar>" lsfusion.server.logics.BusinessLogicsBootstrap`.
 - **Web server** — the `lsfusion-client-<ver>.war` deployed in Apache Tomcat.
-  Serves the browser UI on `http://localhost:8080/` and connects to the
-  application server over RMI (port `7652`).
+  Serves the browser UI at the project's **app-id context path** —
+  `http://localhost:8080/<app id>/` (the root `/` just redirects there) — and
+  connects to the application server over RMI (port `7652`).
 
 A change to any `.lsf` file requires **restarting the application server** (the
 web server does not need a restart).
@@ -161,21 +162,23 @@ with and stay consistent within the project.
 | `start` | `start-server` then `start-web`. |
 | `restart` | Stop everything, then `start`. Use this after editing `.lsf` files. |
 | `stop` | Stop the application server and Tomcat. |
-| `status` | Show which processes/ports are up. |
+| `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server). |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components (→ `verify-do.png`). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
-Key options: `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
+Key options: `-AppId` (the project's short identifier = its `db.name` **and**
+its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
 (`7` — default; `stable`; `dev`/`snapshot`; a major-version alias; or an exact
 tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
 `-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-Url`, `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
-`-ScriptFile`, `-Timeout`. Run the script with no command to print full
-usage.
+`-Do` (verify: generic click/fill/type/press/eval/wait steps by Playwright
+selector — see step 5), `-ScriptFile`, `-Timeout`. Run the script with no
+command to print full usage.
 
 If port `8080` is taken (e.g. another Tomcat), pass `setup -WebPort <free port>`
 — the skill rewrites Tomcat's `server.xml` accordingly, and every later command
@@ -231,15 +234,15 @@ five ports plus its own database**, then `setup` once with those values and
 `start`:
 
 ```
-# instance A — defaults (7652 / 7651 / 8887 / 8080)
-lsfdev.ps1 setup -ProjectDir "C:/Work/projA" -DbName projA -DbPassword <pwd>
-lsfdev.ps1 start -ProjectDir "C:/Work/projA"
+# instance A — defaults (7652 / 7651 / 8887 / 8080), app id names its DB + context
+lsfdev.ps1 setup -ProjectDir "C:/Work/projA" -AppId proja -DbPassword <pwd>
+lsfdev.ps1 start -ProjectDir "C:/Work/projA"          # UI: http://localhost:8080/proja/
 
-# instance B — shifted ports + its own DB, runs concurrently with A
-lsfdev.ps1 setup -ProjectDir "C:/Work/projB" -DbName projB -DbPassword <pwd> `
+# instance B — shifted ports + its own app id/DB, runs concurrently with A
+lsfdev.ps1 setup -ProjectDir "C:/Work/projB" -AppId projb -DbPassword <pwd> `
                  -RmiPort 7662 -HttpPort 7661 -WebSocketPort 8897 `
                  -WebPort 8091 -ShutdownPort 8006
-lsfdev.ps1 start -ProjectDir "C:/Work/projB"
+lsfdev.ps1 start -ProjectDir "C:/Work/projB"          # UI: http://localhost:8091/projb/
 ```
 
 `webSocket.port` is the one everybody forgets, and the failure is **silent**:
@@ -266,7 +269,8 @@ the database settings**: `setup` writes `rmi.port` / `http.port` /
 clone, or any launch path. You can equally set them by hand-editing
 `settings.properties` instead of passing the flags. `start`/`restart`/`stop`/
 `api` read them back from `settings.properties` (config.json is only a
-cache/fallback). `start-web` writes `conf/Catalina/localhost/ROOT.xml` with a
+cache/fallback). `start-web` writes `conf/Catalina/localhost/<app id>.xml`
+(the per-context descriptor, named after the deployed `<app id>.war`) with a
 `port` `<Parameter>` so that project's Tomcat dials its own server's
 `rmi.port` instead of the built-in default 7652. When hitting the Action API
 for a specific instance, use that instance's `http.port`
@@ -295,9 +299,11 @@ Do **not** use `restart` to change ports — its stop phase already reads the ne
 config. After the switch, the Action API moves with `http.port` (e.g.
 `http://localhost:<new http.port>/eval/action`); the web port is unaffected.
 
-**Each instance needs its own `-DbName`** — two servers pointed at the same
-database will fight over the schema. Use distinct names (the default name is
-derived from the project path, so distinct project dirs already differ).
+**Each instance needs its own app id** — the id IS `db.name`, and two servers
+pointed at the same database will fight over the schema. Distinct ids give
+distinct databases (and the no-`-AppId` fallback id is derived from the
+project path, so distinct project dirs differ too); `-DbName` sets the name
+explicitly when needed.
 
 The file the server actually reads at runtime is **`conf/settings.properties`**
 (in *both* Maven and non-Maven projects; in a non-Maven project the project-root
@@ -354,22 +360,50 @@ Run `check`. It reports Java, PostgreSQL, Python, git, and Maven.
 
 ### 2. Set up
 
-You need the PostgreSQL connection details first. The defaults are server
-`localhost` and user `postgres`; the **database name is generated uniquely per
-project** (e.g. `lsfusion_<folder>_<hash>`) so separate lsFusion projects never
-share or collide on one database — pass `-DbName` only if you need a specific
-name. The PostgreSQL **password** is installation-specific — ask the user for
-it if `check` could not connect, then:
+**Pick a short app id first — always pass `-AppId` on the first setup of a
+project.** When creating an application, choose a short identifier for it —
+lowercase letter first, then letters/digits/underscores, ≤ 30 chars, e.g.
+`clinic` for a clinic-management app — derived from what the app *is* (its
+domain or project name), not from the folder path. This one identifier **is
+the project's `db.name`** and covers everything downstream:
+
+- it is the **PostgreSQL database name** — `-AppId x` is in effect a
+  validated `-DbName x` (pass one or the other, not both), and
+- it becomes the **web context path**, derived from `db.name` with no extra
+  key to keep in sync: the client war is deployed as `<app id>.war`, so the
+  UI lives at `http://localhost:<web port>/<app id>/` (the root `/` serves a
+  redirect there).
+
+Tell the user which id you picked. If `setup` runs without `-AppId`, the skill
+derives a fallback id from the folder name plus a 4-hex path hash (e.g.
+`clinic_3f9a`), so two same-named checkouts still get distinct databases — but
+a deliberately chosen id is shorter and nicer, so don't rely on the fallback
+for a new app. The id is persisted as `db.name` in `settings.properties` (the
+usual source of truth) and survives re-setups. **Changing it later
+(`setup -AppId <new>`) repoints BOTH the database and the web context**: the
+deployed war is renamed in place, but the data stays in the old database —
+setup warns about this; if you only want to move the web context while keeping
+the data, don't change the id. A `db.name` set via `-DbName` that is not a
+valid context name (uppercase, dots, a stock Tomcat webapp name) is accepted
+as the database name, and the web client then simply deploys at the context
+root `/` as before.
+
+You also need the PostgreSQL connection details. The defaults are server
+`localhost` and user `postgres`. The PostgreSQL **password** is
+installation-specific — ask the user for it if `check` could not connect, then:
 
 ```
-powershell -ExecutionPolicy Bypass -File .claude/skills/lsfusion-dev/scripts/lsfdev.ps1 setup -DbPassword "<password>"
+powershell -ExecutionPolicy Bypass -File .claude/skills/lsfusion-dev/scripts/lsfdev.ps1 setup -AppId <short id> -DbPassword "<password>"
 ```
 
 `setup` downloads ~410 MB (server jar 146 MB, client war 251 MB, Tomcat ~12 MB),
 so it takes a while — run it with a generous timeout and tell the user it is
-downloading. The client war is **moved straight into Tomcat as `ROOT.war`** and
-the download is not retained, so only the server jar and Tomcat stay on disk.
-`setup` also writes `settings.properties` and a starter `.gitignore` entry.
+downloading. The client war is **moved straight into Tomcat as `<app id>.war`**
+(that war name is what makes the web context path `/<app id>`) and the download
+is not retained, so only the server jar and Tomcat stay on disk. `setup` also
+writes `settings.properties` and a starter `.gitignore` entry. Changing the app
+id later renames the deployed war in place (no re-download) — and, since the id
+is `db.name`, repoints the database as well.
 
 **Which lsFusion version.** **Default to `-Version 7`** — the latest 7.x
 build on the download server. The `7` alias tracks the highest 7.x available
@@ -523,6 +557,22 @@ remembering: **in devmode lsFusion auto-authenticates as `admin`, so the
 web client opens directly on the navigator and the login form never
 appears** — both for the user's browser tab and for the headless `verify`
 run. (The default credentials matter only outside devmode.)
+
+**Database binding is pinned and then verified — read the verdict.** The
+launch line also carries `-Ddb.name` (plus `-Ddb.server`/`-Ddb.user`/
+`-Ddb.password` when set), mirroring the values resolved from
+`settings.properties`; `-D` is the strongest resolution layer, so the server
+provably lands on the reported database even if a settings-file layer is
+mis-parsed (a BOM-damaged file, a platform regression — a real incident put
+a project's data into the shared default DB `lsfusion` this way, where a
+neighbour server's schema sync then wiped it, while ports from the same file
+applied fine). After `Server has successfully started`, `start-server` checks
+the **actual** connection through `pg_stat_activity` and prints
+`Database binding verified: … connected to '<name>'` — or a loud
+`DATABASE MISMATCH`. Treat a mismatch as stop-the-line: stop the server and
+investigate before writing any data (runtime.md, *"silently ignores
+db.name"*). `status` shows the same at a glance as `Database: <name>
+(N connections)`; 0 connections under a running server is the same red flag.
 
 **UI language.** On a host with a non-English locale the system UI
 (navigator, captions, validation messages) comes up in the **host
@@ -741,12 +791,40 @@ checking the unit-test output.
    lsfdev.ps1 verify -Click "Master data > Items" -DoubleClick "Coffee beans"
    ```
 
+   **To drive elements `-Click` cannot reach — buttons/inputs inside `CUSTOM`
+   (React) components, filters, dialogs — pass `-Do`**: an ordered list of
+   generic interaction steps, run after the `-Click`/`-DoubleClick`
+   navigation, each `verb:rest` with **any Playwright selector** (css,
+   `text=...`, `button:has-text(...)`):
+
+   - `click:<selector>` / `dblclick:<selector>` — e.g. `click:text=Поставить`
+     hits a React button by its caption;
+   - `fill:<selector>=><value>` — set an input's value (`=>` separates
+     selector from value; a plain last `=` also works);
+   - `type:<selector>=><value>` — same but pressing real keys, for React
+     inputs that ignore programmatic fills;
+   - `press:<key>` (e.g. `Enter`), `eval:<js>` (result lands in the report),
+     `wait:<ms>`.
+
+   ```
+   lsfdev.ps1 verify -Click "Расписание" -Do "fill:input.comment=>Иванов", "click:button:has-text('Поставить')"
+   ```
+
+   The chain stops at the first failed step; each step's ok/error (and every
+   `eval` result) is printed, and the post-chain state goes to
+   `verify-do.png`. Non-ASCII values in `-Do` cross the same argv boundary as
+   `api -Script` — when calling through bash + `powershell.exe`, put Cyrillic
+   text in an `eval:` step or run the command via an in-process PowerShell
+   tool instead (see the UTF-8 pitfall in step 4).
+
    Captions and row text are locale/data-dependent — if a click misses, read
    the actual text off `verify-app.png` / `verify-click.png` first and retry
-   with what is rendered. This covers the common "did my form/card render?"
-   check; for anything more involved (multi-step flows, filling fields,
-   remote hosts), use the lsfusion-eval skill's Part 3 — it ships a Python
-   Playwright template that goes beyond `verify`'s scope.
+   with what is rendered. `-Click`/`-DoubleClick`/`-Do` cover "did it render"
+   checks and single-form interactions; for anything bigger — multi-form
+   flows, assertions between steps, remote hosts — **don't fight `verify`:
+   write a real Playwright script.** The lsfusion-eval skill's Part 3 ships a
+   ready Python template (login, waits, and lsFusion-specific selectors
+   already handled) — start from it, not from scratch.
 
    The viewport defaults to **1920×1080** — judge layout at a realistic
    size before calling it broken: on a narrow viewport dense forms
@@ -809,7 +887,9 @@ even read-only ones can lead you to false conclusions you then act on.
 After `start` / `restart` succeeds — whether you scaffolded a new module,
 edited existing code, fixed a server failure, or just brought the project up
 for inspection — **always run `open`** so the user lands in the running
-application and can click through it. Do not stop at "the server is up": the
+application and can click through it. `open` already targets the app's
+context path (`http://localhost:<web port>/<app id>/`); quote that full URL,
+context path included, whenever you tell the user where the app runs. Do not stop at "the server is up": the
 user expects to actually use the UI and try out what you built. This step
 applies even when `verify` already produced a screenshot for your own check —
 the screenshot is for you, `open` is for the user.
@@ -836,7 +916,8 @@ front of step 2:
    `-Target`) and reports whether the layout looks like an lsFusion project.
    Requires `git` on `PATH`.
 2. **`cd` into the clone**, or pass `-ProjectDir <path>` to every command, then
-   run `setup -DbPassword <pwd>` exactly as for a new project. When the skill
+   run `setup -AppId <short id> -DbPassword <pwd>` exactly as for a new project
+   (the app id names the database and the web context path). When the skill
    detects an existing project (any of `pom.xml`, `src/main/lsfusion/`, or a
    `lsfusion.properties`), it writes a **minimal** `settings.properties`
    containing only install-specific overrides — DB credentials, and other
@@ -894,8 +975,14 @@ later layer overrides the previous one). Know it before you set `db.name`,
    override you want to apply at runtime without recompiling the project.**
 4. **JVM `-D...=value` arguments.** lsfdev injects a few unconditionally:
    `-Dlsfusion.server.devmode=true`, `-Ddb.denyDrop{Modules,Tables,Properties}=false`,
-   and (when light start is on) `-Dlsfusion.server.lightstart=true`. Any
-   `-D` you add by hand wins over the file-based layers below.
+   (when light start is on) `-Dlsfusion.server.lightstart=true`, and the
+   **`-Ddb.*` mirror of the resolved `settings.properties` values** — a
+   same-value duplicate that guarantees the database binding even if a file
+   layer is mis-parsed (the file remains the source of truth between runs;
+   lsfdev re-reads it and re-asserts `db.name` into `conf/settings.properties`
+   before every launch). Any `-D` you add by hand wins over the file-based
+   layers below (and, coming later on the command line, over lsfdev's own
+   `-Ddb.*`).
 5. **DB-stored settings** — `Administration → System → Settings → Parameters`
    in the UI. Useful for tunables that should survive a redeploy and that
    admins should be able to edit without filesystem access.
@@ -922,7 +1009,10 @@ using whatever the resolution chain above produces.
   `.gitignore`. Generated settings files at the project root and
   `<project-root>/conf/settings.properties` contain the DB password in
   plain text (this is how lsFusion works) — mention this to the user if
-  the repo is shared.
+  the repo is shared. The same password also appears on the server's java
+  command line (`-Ddb.password`, the binding belt) and thus in
+  `.lsfusion-dev/launch-cmd.txt` and the local process list — equivalent
+  exposure on a single-user dev box, but worth knowing.
 - Deeper runtime details, all config keys, and a troubleshooting table are in
   [references/runtime.md](references/runtime.md) — read it when a command fails
   or the user asks about configuration.

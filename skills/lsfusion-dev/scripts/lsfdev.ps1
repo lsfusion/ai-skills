@@ -13,6 +13,7 @@ param(
     [Parameter(Position = 0)]
     [string]$Command = "help",
     [string]$ProjectDir = "",
+    [string]$AppId = "",
     [string]$Version = "7",
     [string]$TomcatVersion = "",
     [string]$DbServer = "localhost",
@@ -25,6 +26,7 @@ param(
     [string]$Url = "",
     [string]$Click = "",
     [string]$DoubleClick = "",
+    [string[]]$Do = @(),
     [int]$ViewportWidth = 1920,
     [int]$ViewportHeight = 1080,
     [string]$Locale = "",
@@ -137,6 +139,18 @@ function Read-SettingsString($key) {
     return $null
 }
 
+# Write a .properties file as UTF-8 WITHOUT a BOM. PowerShell 5.1's
+# Set-Content -Encoding UTF8 always emits a BOM, and Java's Properties loader
+# does NOT strip it - the first key in the file silently becomes
+# "﻿db.name", the server never sees db.name, and it falls back to the
+# shared default database ("lsfusion"). Insidious because lsfdev's own
+# readers (Get-Content) DO strip the BOM, so setup/status keep reporting the
+# right name while the JVM disagrees. Re-writing through this helper also
+# heals files damaged by earlier skill versions or BOM-adding editors.
+function Write-PropertiesFile([string]$file, [string[]]$lines) {
+    [IO.File]::WriteAllText($file, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+}
+
 # Update an existing key in a .properties file, or append it if absent.
 # Preserves every other line (and creates the file if missing).
 function Set-SettingsProperty([string]$file, [string]$key, [string]$value) {
@@ -148,7 +162,7 @@ function Set-SettingsProperty([string]$file, [string]$key, [string]$value) {
         if ($lines[$i] -match $pattern) { $lines[$i] = "$key = $value"; $replaced = $true; break }
     }
     if (-not $replaced) { $lines += "$key = $value" }
-    Set-Content -Path $file -Value ($lines -join "`r`n") -Encoding UTF8
+    Write-PropertiesFile $file $lines
 }
 
 # Apply an install override into a settings file. An explicitly-passed flag
@@ -291,6 +305,17 @@ function Find-Python {
         if ($c) { return $c.Source }
     }
     return $null
+}
+
+# Escape an argument for a native process spawned by PowerShell 5.1, which
+# builds the child command line WITHOUT escaping embedded double quotes - a
+# -Do step like  eval:createElement("input")  otherwise reaches python as
+# createElement(input). MSVCRT parsing rules: double every backslash run that
+# sits immediately before a '"', then escape the '"' itself. (An argument
+# ENDING in backslashes that also contains whitespace remains a known PS 5.1
+# edge - avoid trailing backslashes in selectors/JS.)
+function ConvertTo-NativeArg([string]$s) {
+    return ($s -replace '(\\*)"', '$1$1\"')
 }
 
 function Test-PlaywrightInstalled([string]$pyExe) {
@@ -457,34 +482,183 @@ function Resolve-Version([string]$requested) {
     }
 }
 
-function New-DbName([string]$projectDir) {
-    # A per-project database name so separate lsFusion projects never share
-    # or collide on one database. Deterministic: same path -> same name.
-    $leaf = ((Split-Path $projectDir -Leaf).ToLower() -replace '[^a-z0-9]', '_')
-    if ($leaf.Length -gt 20) { $leaf = $leaf.Substring(0, 20) }
+function Get-ProjectPathHash([string]$projectDir, [int]$hexChars) {
+    # Deterministic per-path hex tail: same path -> same value. Seeds the
+    # derived app id (and the legacy db name, and the derived port set).
     $md5 = [System.Security.Cryptography.MD5]::Create()
     $hashBytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($projectDir.ToLower()))
     $md5.Dispose()
-    $hash = ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLower().Substring(0, 8)
-    return "lsfusion_${leaf}_${hash}"
+    return ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLower().Substring(0, $hexChars)
+}
+
+function New-AppId([string]$projectDir) {
+    # Fallback app id when none was chosen at setup: sanitized folder leaf plus
+    # a 4-hex path-hash tail, so two checkouts with the same folder name still
+    # get distinct ids (and therefore distinct databases). Deterministic per
+    # path. An explicit -AppId (a short, meaningful identifier chosen when the
+    # application is created) is the intended path - this is only the safety net.
+    $leaf = ((Split-Path $projectDir -Leaf).ToLower() -replace '[^a-z0-9]', '')
+    if ($leaf.Length -gt 12) { $leaf = $leaf.Substring(0, 12) }
+    if ($leaf -notmatch '^[a-z]') { $leaf = "app$leaf" }
+    return "${leaf}_$(Get-ProjectPathHash $projectDir 4)"
+}
+
+function New-DbName([string]$projectDir) {
+    # LEGACY per-project database name (pre-app-id skill versions). Kept only
+    # so setup can recognize auto-generated names from older installs (the
+    # repo-committed db.name check). New setups name the database after the
+    # app id instead - see New-AppId and the resolution in Cmd-Setup.
+    $leaf = ((Split-Path $projectDir -Leaf).ToLower() -replace '[^a-z0-9]', '_')
+    if ($leaf.Length -gt 20) { $leaf = $leaf.Substring(0, 20) }
+    return "lsfusion_${leaf}_$(Get-ProjectPathHash $projectDir 8)"
+}
+
+# True if $name can serve as a Tomcat war/context name: URL-path-safe chars
+# only, and not one of the stock Tomcat webapps (deploying manager.war over
+# the stock manager/ dir is undefined behavior).
+function Test-ContextSafe([string]$name) {
+    return ($name -match '^[a-z][a-z0-9_]{0,29}$') -and ($name -notin @('root', 'docs', 'examples', 'manager'))
+}
+
+# The Tomcat context name for this project. db.name IS the app id, so the war
+# is deployed as <db.name>.war and the UI lives at /<db.name>/ - no separate
+# key to keep in sync. ROOT (context /) in two cases: db.name is not a safe
+# context name (expert -DbName choices stay unrestricted), or the install
+# still has a legacy ROOT.war deployment (pre-app-context skill versions) that
+# the next setup will migrate.
+function Get-AppContext($cfg) {
+    $name = "$($cfg.dbName)"
+    if (-not (Test-ContextSafe $name)) { return "ROOT" }
+    $webapps = Join-Path $StateDir "tomcat\webapps"
+    if ((Test-Path (Join-Path $webapps "ROOT.war")) -and -not (Test-Path (Join-Path $webapps "$name.war"))) { return "ROOT" }
+    return $name
+}
+
+# The web UI base URL, context path included.
+function Get-WebUrl($cfg) {
+    $ctx = Get-AppContext $cfg
+    if ($ctx -eq "ROOT") { return "http://localhost:$($cfg.webPort)/" }
+    return "http://localhost:$($cfg.webPort)/$ctx/"
+}
+
+# psql is the skill's window into "which database is REALLY in use". It is
+# often not on PATH on Windows, so after PATH we derive it from the installed
+# PostgreSQL service's own binary path (works for any install location and
+# naturally picks the running version), then fall back to the standard
+# %ProgramFiles% locations. Resolved once per run (memoized).
+$script:PsqlResolved = $false
+$script:PsqlPath = $null
+function Find-Psql {
+    if ($script:PsqlResolved) { return $script:PsqlPath }
+    $script:PsqlResolved = $true
+    $c = Get-Command psql -ErrorAction SilentlyContinue
+    if ($c) { $script:PsqlPath = $c.Source; return $script:PsqlPath }
+    # The service's PathName is like:
+    #   "C:\Program Files\PostgreSQL\18\bin\pg_ctl.exe" runservice -N "postgresql-x64-18" ...
+    # - psql.exe sits in the same bin dir. Running services first.
+    try {
+        $svcs = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "postgres*" -or $_.DisplayName -like "*postgreSQL*" } |
+            Sort-Object { if ($_.State -eq 'Running') { 0 } else { 1 } })
+        foreach ($s in $svcs) {
+            $exe = if ("$($s.PathName)" -match '^\s*"([^"]+)"') { $Matches[1] } else { ("$($s.PathName)" -split '\s+')[0] }
+            if (-not $exe) { continue }
+            $cand = Join-Path (Split-Path $exe -Parent) "psql.exe"
+            if (Test-Path $cand) { $script:PsqlPath = $cand; return $script:PsqlPath }
+        }
+    } catch { }
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $root) { continue }
+        $cand = @(Get-ChildItem (Join-Path $root "PostgreSQL\*\bin\psql.exe") -ErrorAction SilentlyContinue |
+            Sort-Object { try { [int](Split-Path (Split-Path (Split-Path $_.FullName -Parent) -Parent) -Leaf) } catch { 0 } } -Descending)
+        if ($cand.Count) { $script:PsqlPath = $cand[0].FullName; return $script:PsqlPath }
+    }
+    return $null
+}
+
+# db.server may carry a non-default port as "host:port".
+function Get-PgHostPort($cfg) {
+    $h = "$($cfg.dbServer)"; $p = 5432
+    if ($h -match '^(.+):(\d+)$') { $h = $Matches[1]; $p = [int]$Matches[2] }
+    if (-not $h) { $h = "localhost" }
+    return @{ Host = $h; Port = $p }
+}
+
+# Run one psql query (against $db, default the postgres maintenance DB) and
+# return its -tAc output. $null means "could not inspect" (psql missing or the
+# call failed); an EMPTY STRING means the query succeeded with zero rows - the
+# distinction matters (e.g. "database not in pg_database" is a finding, not a
+# failure). Never throws.
+function Invoke-PgQuery($cfg, [string]$sql, [string]$db = "postgres") {
+    $ErrorActionPreference = 'SilentlyContinue'
+    $psql = Find-Psql
+    if (-not $psql) { return $null }
+    $hp = Get-PgHostPort $cfg
+    $old = $env:PGPASSWORD
+    $env:PGPASSWORD = $cfg.dbPassword
+    try {
+        $out = & $psql -U $cfg.dbUser -h $hp.Host -p $hp.Port -d $db -tAc $sql 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        if ($null -eq $out) { return "" }
+        return $out
+    } catch { return $null } finally { $env:PGPASSWORD = $old }
+}
+
+# After a successful start, verify which database the server is ACTUALLY on.
+# This is the check that would have caught the real-world incident where a
+# mis-parsed settings file (BOM'd first key) silently sent the server to the
+# shared default DB "lsfusion" while every lsfdev report showed the right name.
+# Exact method: the JVM's established TCP connections to PostgreSQL are paired
+# with pg_stat_activity rows via client_port, so the answer is per-process, not
+# per-name. Fallback: name-based connection count / pg_database existence.
+# Returns @{ state = ok | ok-weak | mismatch | unverified; detail = <text> }.
+function Test-DbBinding($cfg, [int]$serverPid) {
+    $ErrorActionPreference = 'SilentlyContinue'
+    if (-not (Find-Psql)) { return @{ state = 'unverified'; detail = 'psql not found (PATH and standard install dirs)' } }
+    $hp = Get-PgHostPort $cfg
+    $ports = @(Get-NetTCPConnection -OwningProcess $serverPid -State Established -ErrorAction SilentlyContinue |
+        Where-Object { $_.RemotePort -eq $hp.Port } | ForEach-Object { "$($_.LocalPort)" })
+    if ($ports.Count) {
+        $rows = Invoke-PgQuery $cfg "SELECT datname || '|' || client_port FROM pg_stat_activity WHERE client_port IS NOT NULL AND datname IS NOT NULL"
+        if ($null -ne $rows) {
+            $actual = @($rows | ForEach-Object {
+                $parts = "$_".Trim().Split('|')
+                if ($parts.Count -eq 2 -and ($ports -contains $parts[1])) { $parts[0] }
+            } | Where-Object { $_ } | Sort-Object -Unique)
+            if ($actual.Count) {
+                if ($actual.Count -eq 1 -and $actual[0] -eq $cfg.dbName) { return @{ state = 'ok'; detail = $actual[0] } }
+                return @{ state = 'mismatch'; detail = ($actual -join ', ') }
+            }
+        }
+    }
+    $dbq = ($cfg.dbName -replace "'", "''")
+    $exists = Invoke-PgQuery $cfg "SELECT 1 FROM pg_database WHERE datname='$dbq'"
+    if ($null -eq $exists) { return @{ state = 'unverified'; detail = 'pg_database query failed' } }
+    if ("$exists".Trim() -ne "1") { return @{ state = 'mismatch'; detail = "database '$($cfg.dbName)' does not exist on $($hp.Host):$($hp.Port)" } }
+    $cnt = "$(Invoke-PgQuery $cfg "SELECT count(*) FROM pg_stat_activity WHERE datname='$dbq'")".Trim()
+    if ($cnt -match '^\d+$' -and [int]$cnt -gt 0) { return @{ state = 'ok-weak'; detail = "'$($cfg.dbName)' exists and has $cnt connection(s) (attribution by name only)" } }
+    return @{ state = 'unverified'; detail = "database exists but no connections visible" }
 }
 
 function Ensure-Database($cfg) {
     # native psql/createdb may write to stderr; keep redirects non-terminating.
     $ErrorActionPreference = 'SilentlyContinue'
-    $psql = Get-Command psql -ErrorAction SilentlyContinue
+    $psql = Find-Psql
     if (-not $psql) {
         Info "psql not found - lsFusion will attempt to create the database itself."
         return
     }
+    $hp = Get-PgHostPort $cfg
     $old = $env:PGPASSWORD
     $env:PGPASSWORD = $cfg.dbPassword
     try {
-        $exists = (& psql -U $cfg.dbUser -h $cfg.dbServer -tAc "SELECT 1 FROM pg_database WHERE datname='$($cfg.dbName)'" 2>$null)
+        $exists = (& $psql -U $cfg.dbUser -h $hp.Host -p $hp.Port -tAc "SELECT 1 FROM pg_database WHERE datname='$($cfg.dbName -replace "'", "''")'" 2>$null)
         if ("$exists".Trim() -eq "1") {
             Info "Database '$($cfg.dbName)' already exists."
         } else {
-            & createdb -U $cfg.dbUser -h $cfg.dbServer $cfg.dbName 2>$null
+            $createdb = Join-Path (Split-Path $psql -Parent) "createdb.exe"
+            if (-not (Test-Path $createdb)) { $createdb = "createdb" }
+            & $createdb -U $cfg.dbUser -h $hp.Host -p $hp.Port $cfg.dbName 2>$null
             if ($LASTEXITCODE -eq 0) { Ok "Created database '$($cfg.dbName)'." }
             else { Warn "Could not create database (lsFusion will try on startup)." }
         }
@@ -579,8 +753,15 @@ function Cmd-Check {
     }
 
     Write-Host ""
-    $psql = Get-Command psql -ErrorAction SilentlyContinue
-    if ($psql) { Ok "psql found - $($psql.Source)" } else { Warn "psql not on PATH (optional, used to pre-create the database)." }
+    $psqlPath = Find-Psql
+    if ($psqlPath) {
+        $onPath = [bool](Get-Command psql -ErrorAction SilentlyContinue)
+        $how = if ($onPath) { "" } else { " (not on PATH - located next to the PostgreSQL service/install; used automatically)" }
+        Ok "psql found - $psqlPath$how"
+        Info "Used to pre-create the database and to verify the server's actual DB binding after start."
+    } else {
+        Warn "psql not found (PATH, PostgreSQL service dir, standard install dirs) - the DB is still created by lsFusion itself, but the post-start database-binding verification will be skipped."
+    }
     $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "postgres*" -or $_.DisplayName -like "*postgreSQL*" }
     if ($svc) {
         foreach ($s in $svc) {
@@ -622,7 +803,7 @@ function Cmd-Check {
             if (Test-Path $jar) { Ok "Server jar present." } else { Warn "Server jar missing - run setup again." }
         }
     } else {
-        Info "Project not set up yet. Next step: lsfdev.ps1 setup -DbPassword <password>"
+        Info "Project not set up yet. Next step: lsfdev.ps1 setup -AppId <short id> -DbPassword <password>"
     }
 }
 
@@ -673,7 +854,7 @@ function Cmd-Setup {
         version       = $resolvedVersion
         tomcatVersion = $tomcatVer
         dbServer      = (Pick "dbServer" "DbServer" "localhost")
-        dbName        = (Pick "dbName" "DbName" (New-DbName $ProjectDir))
+        dbName        = (Pick "dbName" "DbName" "")
         dbUser        = (Pick "dbUser" "DbUser" "postgres")
         dbPassword    = (Pick "dbPassword" "DbPassword" "")
         adminUser     = (Pick "adminUser" "AdminUser" "admin")
@@ -686,6 +867,41 @@ function Cmd-Setup {
         webSocketPort = (Pick "webSocketPort" "WebSocketPort" 8887)
         webPort       = (Pick "webPort" "WebPort" 8080)
         shutdownPort  = (Pick "shutdownPort" "ShutdownPort" 8005)
+    }
+    # --- App id resolution: db.name IS the app id -------------------------------
+    # One short identifier, chosen when the application is created, covers both:
+    # it is the PostgreSQL database name (db.name) AND the web context path (the
+    # client war is deployed as <db.name>.war, so the UI lives at
+    # http://localhost:<webPort>/<db.name>/). There is no separate key to keep in
+    # sync: the context is derived from db.name wherever it is needed.
+    # -AppId is the validated way to pick it; -DbName is the unrestricted expert
+    # override (any name PostgreSQL accepts - if it is not context-safe, the war
+    # simply deploys at the context root instead, see Test-ContextSafe).
+    $dbExplicit = $ScriptBound.ContainsKey("DbName")
+    if ($ScriptBound.ContainsKey("AppId")) {
+        $aid = "$AppId".Trim().ToLowerInvariant()
+        if ($aid -notmatch '^[a-z][a-z0-9_]{0,29}$') {
+            throw "Invalid app id '$aid': 1-30 chars, a lowercase letter first, then only [a-z0-9_] - it names the PostgreSQL database and the web context path."
+        }
+        if ($aid -in @('postgres', 'template0', 'template1', 'root', 'docs', 'examples', 'manager')) {
+            throw "App id '$aid' is reserved (PostgreSQL system database or stock Tomcat webapp) - pick another."
+        }
+        if ($dbExplicit -and ($cfg.dbName -ne $aid)) {
+            throw "-AppId '$aid' and -DbName '$($cfg.dbName)' differ - the app id IS the database name; pass just one of them."
+        }
+        $persisted = Read-SettingsString "db.name"
+        if ($persisted -and ($persisted -ne $aid)) {
+            Info "App id changed: '$persisted' -> '$aid'. This repoints BOTH the database and the web context; data in '$persisted' is kept but no longer used - pass -DbName '$persisted' instead if you only meant to keep the old database."
+        }
+        $cfg.dbName = $aid
+        $dbExplicit = $true
+    }
+    # Derived fallback for a genuinely fresh project (nothing persisted, nothing
+    # passed): short folder-leaf + path-hash id - see New-AppId. A name already
+    # persisted in settings.properties still wins (resolved just below).
+    if (-not $cfg.dbName) {
+        $cfg.dbName = New-AppId $ProjectDir
+        Info "App id (database + web context): '$($cfg.dbName)' - derived from the folder name; pass -AppId <short id> to choose your own."
     }
     # --- Authoritative db.name resolution (before the first Save-Config) -------
     # db.name has NO safe implicit default: a missing db.name sends the server to
@@ -701,12 +917,12 @@ function Cmd-Setup {
     # BEFORE Save-Config means config.json is never even briefly written with the
     # auto-name when a real name exists — including when .lsfusion-dev/ was wiped
     # (then Load-Config returned $null and Pick fell through to the auto-name).
-    if (-not $ScriptBound.ContainsKey("DbName")) {
+    if (-not $dbExplicit) {
         $confDbName = Get-SettingsValue (Join-Path $ProjectDir "conf\settings.properties") "db.name"
         $rootDbName = Get-SettingsValue (Join-Path $ProjectDir "settings.properties") "db.name"
         $persistedDbName = if ("$confDbName".Trim()) { $confDbName } elseif ("$rootDbName".Trim()) { $rootDbName } else { $null }
         if ($persistedDbName -and ($persistedDbName -ne $cfg.dbName)) {
-            Info "Preserving db.name '$persistedDbName' from settings.properties (pass -DbName <name> to change it)."
+            Info "Preserving app id / db.name '$persistedDbName' from settings.properties (pass -AppId or -DbName to change it)."
             $cfg.dbName = $persistedDbName
         }
         # A repo-committed db.name (conf/settings.properties shipped in the clone,
@@ -717,14 +933,15 @@ function Cmd-Setup {
         # and conf in sync, so a corroborating root file means we manage it and
         # the config cache was merely wiped, not a fresh clone).
         $rootCorroborates = ("$rootDbName".Trim() -ne "") -and ("$rootDbName".Trim() -eq "$confDbName".Trim())
-        if ("$confDbName".Trim() -and (-not $existing) -and ($confDbName -ne (New-DbName $ProjectDir)) -and (-not $rootCorroborates)) {
-            Warn "Project ships conf/settings.properties with db.name '$confDbName' - every clone of this repo shares that database. Pass 'setup -DbName <unique> -Force' if this instance needs its own DB."
+        if ("$confDbName".Trim() -and (-not $existing) -and ($confDbName -ne (New-DbName $ProjectDir)) -and
+            ($confDbName -ne (New-AppId $ProjectDir)) -and (-not $rootCorroborates)) {
+            Warn "Project ships conf/settings.properties with db.name '$confDbName' - every clone of this repo shares that database. Pass 'setup -AppId <unique> -Force' if this instance needs its own DB."
         }
     }
     # When every port is still at its default, none was passed explicitly, and
     # a default is already taken by a foreign process (typical: a second agent
     # session on the same box), derive a deterministic per-project port set
-    # from the same path hash that names the database. Hash-derived ports land
+    # from the same path hash that seeds the derived app id. Hash-derived ports land
     # parallel sessions on disjoint values instead of having every agent walk
     # the same "default+10" ladder and collide again.
     $portFlagsPassed = @("RmiPort", "HttpPort", "WebSocketPort", "WebPort", "ShutdownPort") |
@@ -827,7 +1044,18 @@ function Cmd-Setup {
 
         $tomcatHome = Join-Path $StateDir "tomcat"
         $webapps    = Join-Path $tomcatHome "webapps"
-        $rootWar    = Join-Path $webapps "ROOT.war"
+        # The war is deployed under the app id (= db.name), so Tomcat serves
+        # the UI at the /<db.name> context path. A db.name that is not a valid
+        # context name (expert -DbName choices are unrestricted) falls back to
+        # the context root, i.e. the pre-app-id ROOT.war layout.
+        $ctxName = $cfg.dbName
+        if (-not (Test-ContextSafe $ctxName)) {
+            Warn "db.name '$ctxName' is not usable as a Tomcat context/war name - deploying the web client at the context root (/) instead."
+            $ctxName = "ROOT"
+        }
+        $ctxDisplay = if ($ctxName -eq "ROOT") { "/" } else { "/$ctxName" }
+        $warName    = "$ctxName.war"
+        $warPath    = Join-Path $webapps $warName
 
         # Re-download is version-driven, NOT -Force-driven:
         #  - Tomcat (the servlet container) is independent of the lsFusion
@@ -835,15 +1063,23 @@ function Cmd-Setup {
         #    Tomcat — so we fetch it ONLY when it is missing. To move to a
         #    different Tomcat build, delete .lsfusion-dev/tomcat and re-run setup.
         #  - the client war IS versioned with the platform, so we refetch it only
-        #    when the platform version changed or the war is absent.
+        #    when the platform version changed or the war is absent (a rename
+        #    from a previous deployment name counts as present - see below).
         $needTomcat = -not (Test-Path (Join-Path $tomcatHome "bin\bootstrap.jar"))
-        $needWar    = (-not (Test-Path $rootWar)) -or $platformVersionChanged
+        # Any *.war in webapps under another name is a previous lsfdev
+        # deployment (stock Tomcat ships only exploded dirs, never wars): an
+        # old ROOT.war, or a deployment under a previous app id.
+        $staleWarsPre = @()
+        if (Test-Path $webapps) {
+            $staleWarsPre = @(Get-ChildItem $webapps -Filter *.war -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne $warName })
+        }
 
-        # Replacing Tomcat's files or the exploded ROOT app while Tomcat is
-        # running fails ("bootstrap.jar is used by another process", or the
-        # locked ROOT directory). Stop a running Tomcat first whenever we are
-        # about to touch either.
-        if ($needTomcat -or $needWar) {
+        # Replacing Tomcat's files, the war, or the exploded app while Tomcat
+        # is running fails ("bootstrap.jar is used by another process", or the
+        # locked exploded directory). Stop a running Tomcat first whenever we
+        # are about to touch any of them.
+        if ($needTomcat -or $staleWarsPre -or (-not (Test-Path $warPath)) -or $platformVersionChanged) {
             Stop-Tracked $TomcatPid @($cfg.webPort) "Running Tomcat (stopping before update)"
         }
 
@@ -869,17 +1105,60 @@ function Cmd-Setup {
             Ok "Tomcat already installed (kept - independent of the lsFusion version)."
         }
 
-        # Deploy the client war as ROOT.war. The ~250 MB war is downloaded to a
-        # temp file and *moved* into place, so a separate copy is never kept.
+        # Migrate deployments under any other name: it is the same ~250 MB
+        # client war, so rename it to <db.name>.war instead of re-downloading,
+        # and drop the old exploded dir + per-context descriptor. Recomputed
+        # after the Tomcat install (a reinstall wipes webapps/).
+        $staleWars = @()
+        if (Test-Path $webapps) {
+            $staleWars = @(Get-ChildItem $webapps -Filter *.war -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne $warName })
+        }
+        foreach ($sw in $staleWars) {
+            $oldCtx = [IO.Path]::GetFileNameWithoutExtension($sw.Name)
+            if ((-not $platformVersionChanged) -and (-not (Test-Path $warPath))) {
+                Move-Item $sw.FullName $warPath -Force
+                Info "Redeployed $($sw.Name) as $warName (same war, new web context $ctxDisplay)."
+            } else {
+                Remove-Item $sw.FullName -Force
+            }
+            Remove-Item (Join-Path $webapps $oldCtx) -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item (Join-Path $tomcatHome "conf\Catalina\localhost\$oldCtx.xml") -Force -ErrorAction SilentlyContinue
+        }
+        $needWar = (-not (Test-Path $warPath)) -or $platformVersionChanged
+
+        # Deploy the client war as <db.name>.war. The ~250 MB war is downloaded
+        # to a temp file and *moved* into place, so a separate copy is never kept.
         if ($needWar) {
             $warTmp = Join-Path $StateDir "lsfusion-client-download.war"
             Invoke-Download "$DownloadBase/lsfusion-client-$($cfg.version).war" $warTmp
-            Remove-Item (Join-Path $webapps "ROOT") -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item $rootWar -Force -ErrorAction SilentlyContinue
-            Move-Item $warTmp $rootWar -Force
-            Ok "Web client war deployed (lsFusion $($cfg.version))."
+            Remove-Item (Join-Path $webapps $ctxName) -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $warPath -Force -ErrorAction SilentlyContinue
+            Move-Item $warTmp $warPath -Force
+            Ok "Web client war deployed as $warName - web context $ctxDisplay (lsFusion $($cfg.version))."
         } else {
-            Ok "Web client war up to date (lsFusion $($cfg.version)) - not re-downloading."
+            Ok "Web client war up to date ($warName, web context $ctxDisplay, lsFusion $($cfg.version)) - not re-downloading."
+        }
+
+        $rootDir = Join-Path $webapps "ROOT"
+        if ($ctxName -eq "ROOT") {
+            # The app itself owns the context root. A leftover redirect stub
+            # from an earlier /<id> deployment (index.html, no WEB-INF) would
+            # stop Tomcat from expanding ROOT.war - clear it.
+            if ((Test-Path (Join-Path $rootDir "index.html")) -and -not (Test-Path (Join-Path $rootDir "WEB-INF"))) {
+                Remove-Item $rootDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } else {
+            # Keep the context root useful: replace Tomcat's stock welcome app
+            # (or a leftover exploded ROOT) with a one-line redirect to the app
+            # context, so http://localhost:<webPort>/ still lands in the app.
+            if (Test-Path (Join-Path $rootDir "index.jsp")) {   # stock Tomcat welcome app
+                Remove-Item $rootDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            New-Item -ItemType Directory -Force -Path $rootDir | Out-Null
+            $redirect = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/' + $ctxName + '/"><title>lsFusion</title></head>' +
+                        '<body><a href="/' + $ctxName + '/">/' + $ctxName + '/</a></body></html>'
+            Set-Content -Path (Join-Path $rootDir "index.html") -Value $redirect -Encoding UTF8
         }
 
         Patch-TomcatPorts $tomcatHome $cfg.webPort $cfg.shutdownPort
@@ -903,7 +1182,7 @@ function Cmd-Setup {
         # Apply-SettingsOverride leaves an existing conf/ db.name untouched and
         # fills it in only when absent (a fresh project / migration from the root
         # mirror). An explicit -DbName overwrites it.
-        Apply-SettingsOverride $confSettings "db.name"     $cfg.dbName     ($ScriptBound.ContainsKey("DbName"))     | Out-Null
+        Apply-SettingsOverride $confSettings "db.name"     $cfg.dbName     $dbExplicit                              | Out-Null
         # Ports: written when explicitly passed OR when non-default (the
         # hash-derived set from the busy-defaults fallback must persist here
         # too - the server reads ports from this file). Defaults stay implicit.
@@ -962,7 +1241,7 @@ function Cmd-Setup {
         if ($ScriptBound.ContainsKey("HttpPort") -or $cfg.httpPort -ne 7651) { $lines += "http.port = $($cfg.httpPort)" }
         if ($ScriptBound.ContainsKey("WebSocketPort") -or $cfg.webSocketPort -ne 8887) { $lines += "webSocket.port = $($cfg.webSocketPort)" }
         if ($ScriptBound.ContainsKey("TopModule") -and $cfg.topModule) { $lines += "logics.topModule = $($cfg.topModule)" }
-        Set-Content -Path $settings -Value ($lines -join "`r`n") -Encoding UTF8
+        Write-PropertiesFile $settings $lines
         Ok "settings.properties written (minimal - existing project)."
     } else {
         $topLine = ""
@@ -985,7 +1264,7 @@ db.user = $($cfg.dbUser)
 db.password = $($cfg.dbPassword)
 $portLines$topLine
 "@
-        Set-Content -Path $settings -Value $content -Encoding UTF8
+        Write-PropertiesFile $settings @($content -split "`r?`n")
         Ok "settings.properties written."
     }
 
@@ -1019,6 +1298,11 @@ $portLines$topLine
 
     Ensure-Database $cfg
     Write-Host ""
+    if ($NoWeb) {
+        Ok "App id / database '$($cfg.dbName)' (no web client: -NoWeb)."
+    } else {
+        Ok "App id '$($cfg.dbName)' - database '$($cfg.dbName)', web context $(Get-WebUrl $cfg)"
+    }
     Ok "Setup complete. Put your .lsf modules in $ProjectDir, then run: lsfdev.ps1 start"
 }
 
@@ -1057,6 +1341,24 @@ function Cmd-StartServer {
         -not (Test-Path (Join-Path $ProjectDir "conf\settings.properties"))) {
         Warn "settings.properties not found (looked in project root and conf/) - re-run setup."
     }
+    # conf/settings.properties is what the JVM actually reads - make sure it
+    # exists and carries the resolved db.name before EVERY launch, not only at
+    # setup: db.name has no safe default (a missing key silently sends the
+    # server to the shared 'lsfusion' database), and configs written by older
+    # skill versions could keep the name only in config.json. Bootstrap the
+    # file from the root mirror first so its other keys (db.password etc.)
+    # survive. Idempotent when the file is already right (Load-Config read the
+    # file's own value back into $cfg), and the rewrite also re-encodes a
+    # BOM-damaged file that the JVM would otherwise mis-parse (see
+    # Write-PropertiesFile).
+    $confBootDir  = Join-Path $ProjectDir "conf"
+    $confBoot     = Join-Path $confBootDir "settings.properties"
+    $rootBoot     = Join-Path $ProjectDir "settings.properties"
+    New-Item -ItemType Directory -Force -Path $confBootDir | Out-Null
+    if (-not (Test-Path $confBoot) -and (Test-Path $rootBoot)) {
+        Copy-Item -Path $rootBoot -Destination $confBoot -Force
+    }
+    Set-SettingsProperty $confBoot "db.name" $cfg.dbName
     # Count only modules that will actually be on the classpath, mirroring the
     # staging/classpath logic below: the Maven source roots when they exist,
     # else loose top-level .lsf (flat-project fallback). A recursive scan over
@@ -1122,24 +1424,13 @@ function Cmd-StartServer {
 
         # The server reads conf/settings.properties at runtime (Spring
         # `file:conf/settings.properties` in lsfusion.xml, relative to the JVM
-        # working directory = project root). That file is AUTHORITATIVE and is
-        # written by setup; a hand-edit to it (e.g. db.name) MUST survive a
-        # restart, so we do NOT overwrite it from the project-root mirror here —
-        # blindly copying root -> conf is exactly what used to revert a manually
-        # set db.name on restart. We only bootstrap conf/ from the mirror when it
-        # does not exist yet (projects set up by an older lsfdev that wrote only
-        # the root file). The mirror itself is staged onto the classpath too, but
-        # always sourced from the file the server actually reads (conf/), never
-        # the reverse, so a stale root value can never resurrect over a conf/ edit.
-        $rootSettings = Join-Path $ProjectDir "settings.properties"
-        $confDir      = Join-Path $ProjectDir "conf"
-        $confSettings = Join-Path $confDir "settings.properties"
-        New-Item -ItemType Directory -Path $confDir -Force -ErrorAction SilentlyContinue | Out-Null
-        if (-not (Test-Path $confSettings) -and (Test-Path $rootSettings)) {
-            Copy-Item -Path $rootSettings -Destination $confSettings -Force
-        }
-        $stageSrc = if (Test-Path $confSettings) { $confSettings } elseif (Test-Path $rootSettings) { $rootSettings } else { $null }
-        if ($stageSrc) { Copy-Item -Path $stageSrc -Destination $stageDir -Force }
+        # working directory = project root). That file is AUTHORITATIVE: the
+        # pre-launch block above already bootstrapped it (from the root mirror
+        # when needed) and asserted db.name into it. A copy is staged onto the
+        # classpath too, always sourced from conf/ - never the reverse - so a
+        # stale root-mirror value can never resurrect over a conf/ edit.
+        $confSettings = Join-Path $ProjectDir "conf\settings.properties"
+        if (Test-Path $confSettings) { Copy-Item -Path $confSettings -Destination $stageDir -Force }
 
         # Copy from the canonical Maven source roots first.
         $stagedFromMaven = $false
@@ -1207,21 +1498,36 @@ function Cmd-StartServer {
         $reason = if ($firstStart) { "first launch" } else { "-FullStart requested" }
         Info "Dev mode ON, light start OFF ($reason - full schema sync)."
     }
-    # Ports come from settings.properties (rmi.port / http.port / webSocket.port),
-    # the same place and scheme as db.* — the server reads them natively, so they
-    # hold no matter how it is launched, and survive a wiped .lsfusion-dev/. We
-    # deliberately do NOT pass -Drmi.port / -Dhttp.port / -DwebSocket.port here:
-    # a -D arg would silently outrank settings.properties and re-introduce the
-    # "ports live in two places" split.
+    # db.* ALSO go on the command line as -D system properties, mirroring the
+    # values just resolved from settings.properties. The file stays the source
+    # of truth between runs (Load-Config reads it back, and the pre-launch
+    # block re-asserts db.name into it), so the two layers cannot drift - the
+    # -D is a same-value duplicate. -D outranks every file layer, which makes
+    # the server provably run against the database reported here even when a
+    # settings file layer is unreadable or mis-parsed: a BOM'd first key, a
+    # staging/classpath quirk, a platform resolution regression - the
+    # real-world incident was data landing in the shared default DB while
+    # ports from the SAME file applied fine. Values with whitespace cannot
+    # survive Start-Process argument joining and stay file-only.
+    $dbArgs = @()
+    foreach ($pair in @(@("db.name", $cfg.dbName), @("db.server", $cfg.dbServer), @("db.user", $cfg.dbUser), @("db.password", $cfg.dbPassword))) {
+        $v = "$($pair[1])"
+        if ($v -and $v -match '^\S+$') { $dbArgs += "-D$($pair[0])=$v" }
+    }
+    # Ports keep coming from settings.properties ONLY (rmi.port / http.port /
+    # webSocket.port - the server reads them natively): they have safe
+    # defaults and no silent-fallback failure mode, so a -D duplicate would
+    # only re-introduce the "ports live in two places" split for no gain.
     # Extra user JVM args (setup -JvmArgs "..."), e.g. -Duser.language=ru or a
-    # bigger -Xmx. Appended AFTER the defaults so a user -Xmx wins (for
-    # duplicated JVM flags the last occurrence takes effect).
+    # bigger -Xmx. Appended AFTER the defaults so a user -Xmx (or an explicit
+    # user -Ddb.*) wins - for duplicated JVM flags the last occurrence takes
+    # effect.
     $extraJvm = @()
     if ($cfg.PSObject.Properties.Name -contains 'jvmArgs' -and $cfg.jvmArgs) {
         $extraJvm = @("$($cfg.jvmArgs)" -split '\s+' | Where-Object { $_ })
         Info "Extra JVM args: $($extraJvm -join ' ')"
     }
-    $jvmArgs = @() + (Add-Opens $java.Major) + $devArgs + @(
+    $jvmArgs = @() + (Add-Opens $java.Major) + $devArgs + $dbArgs + @(
         "-Xmx2g", "-Dfile.encoding=UTF-8") + $extraJvm + @(
         # Ownership marker for stop/restart: lets Stop-Tracked tell this
         # project's JVM apart from another session's server on the same ports.
@@ -1259,6 +1565,19 @@ function Cmd-StartServer {
     if ($verdict -eq "started") {
         New-Item -ItemType File -Force -Path $initMarker | Out-Null
         Ok "Application server started (RMI $($cfg.rmiPort), Action API $($cfg.httpPort), WebSocket $($cfg.webSocketPort))."
+        # Trust, but verify: confirm which database this JVM is REALLY on.
+        # settings.properties and the -Ddb.* launch args should make a mismatch
+        # impossible - if one is reported anyway, treat it as stop-the-line.
+        $bind = Test-DbBinding $cfg $proc.Id
+        switch ($bind.state) {
+            'ok'      { Ok "Database binding verified: this server is connected to '$($bind.detail)'." }
+            'ok-weak' { Ok "Database binding: $($bind.detail)." }
+            'mismatch' {
+                Bad "DATABASE MISMATCH: configured db.name is '$($cfg.dbName)' but the server is actually on: $($bind.detail)."
+                Info "Anything written now lands in the wrong database. Stop the server, inspect conf/settings.properties (encoding / first line - see runtime.md, 'silently ignores db.name') and the -Ddb.name in .lsfusion-dev/launch-cmd.txt, then restart."
+            }
+            default   { Info "(actual DB binding not verified: $($bind.detail). The -Ddb.name launch argument still pins the name at the strongest resolution layer.)" }
+        }
     } elseif ($verdict -eq "failed") {
         Bad "Application server process exited during startup. Last log lines:"
         $tailOut | ForEach-Object { Write-Host "    $_" }
@@ -1301,19 +1620,22 @@ function Cmd-StartWeb {
     # Point the web client at this instance's application server. The lsFusion
     # web client reads the app-server connection from Tomcat context parameters
     # `host` / `port` / `exportName`; `port` MUST equal the server's rmi.port.
-    # We write conf/Catalina/localhost/ROOT.xml (the per-context descriptor) so
-    # a non-default rmi.port is honored. Without this the client always dials
-    # the built-in default 7652 and a custom-port server is unreachable.
+    # We write conf/Catalina/localhost/<db.name>.xml (the per-context
+    # descriptor, named after the deployed <db.name>.war; ROOT.xml on root
+    # deployments - see Get-AppContext) so a non-default rmi.port is honored.
+    # Without this the client always dials the built-in default 7652 and a
+    # custom-port server is unreachable.
+    $ctxName = Get-AppContext $cfg
     $ctxDir = Join-Path $tomcatHome "conf\Catalina\localhost"
     New-Item -ItemType Directory -Force -Path $ctxDir | Out-Null
-    $rootXml = Join-Path $ctxDir "ROOT.xml"
+    $ctxXml = Join-Path $ctxDir "$ctxName.xml"
     @(
         '<Context>',
         '    <Parameter name="host" value="localhost" override="false"/>',
         "    <Parameter name=`"port`" value=`"$($cfg.rmiPort)`" override=`"false`"/>",
         '</Context>'
-    ) -join "`r`n" | Set-Content -Path $rootXml -Encoding UTF8
-    Info "Web client wired to application server RMI port $($cfg.rmiPort)."
+    ) -join "`r`n" | Set-Content -Path $ctxXml -Encoding UTF8
+    Info "Web client wired to application server RMI port $($cfg.rmiPort) (context /$(if ($ctxName -ne 'ROOT') { $ctxName }))."
 
     $tempDir = Join-Path $tomcatHome "temp"
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
@@ -1339,7 +1661,8 @@ function Cmd-StartWeb {
         -WorkingDirectory $tomcatHome -RedirectStandardOutput $TomcatOut `
         -RedirectStandardError (Join-Path $StateDir "tomcat.err.log") -NoNewWindow -PassThru
     $proc.Id | Set-Content $TomcatPid
-    Info "PID $($proc.Id). Waiting for the web UI on port $($cfg.webPort)..."
+    $webUrl = Get-WebUrl $cfg
+    Info "PID $($proc.Id). Waiting for the web UI at $webUrl ..."
 
     $deadline = (Get-Date).AddSeconds([Math]::Min($Timeout, 120))
     $up = $false
@@ -1347,7 +1670,7 @@ function Cmd-StartWeb {
         Start-Sleep -Seconds 3
         if ($proc.HasExited) { break }
         try {
-            Invoke-WebRequest "http://localhost:$($cfg.webPort)/" -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0 -ErrorAction Stop | Out-Null
+            Invoke-WebRequest $webUrl -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0 -ErrorAction Stop | Out-Null
             $up = $true; break
         } catch {
             if ($_.Exception.Response) { $up = $true; break }
@@ -1355,7 +1678,7 @@ function Cmd-StartWeb {
     }
     Write-Host ""
     if ($up) {
-        Ok "Web client is up: http://localhost:$($cfg.webPort)/"
+        Ok "Web client is up: $webUrl"
         Info "Default login: user '$($cfg.adminUser)', empty password."
     } else {
         # Not up. Pull together the Tomcat logs and look for a bind failure - the
@@ -1403,9 +1726,29 @@ function Cmd-Status {
     elseif (Test-PortOpen $rmi) { Warn "App server    : something is on RMI port $rmi (PID file stale)" }
     else { Info "App server    : stopped" }
 
+    # Database line: the configured name plus what is actually observable via
+    # pg_stat_activity - the count makes a silently-wrong binding visible at a
+    # glance (0 connections under a running server is a red flag).
+    $dbq = ("$($cfg.dbName)" -replace "'", "''")
+    $cnt = "$(Invoke-PgQuery $cfg "SELECT count(*) FROM pg_stat_activity WHERE datname='$dbq'")".Trim()
+    if ($cnt -match '^\d+$') {
+        $exists = "$(Invoke-PgQuery $cfg "SELECT 1 FROM pg_database WHERE datname='$dbq'")".Trim()
+        if ($exists -ne "1")   { Warn "Database      : $($cfg.dbName) (does not exist yet - created on first start)" }
+        elseif ([int]$cnt -gt 0) { Ok "Database      : $($cfg.dbName) ($cnt connection(s))" }
+        else                   { Info "Database      : $($cfg.dbName) (exists, no connections)" }
+        if (Process-Alive $sPid) {
+            $bind = Test-DbBinding $cfg $sPid
+            if ($bind.state -eq 'mismatch') {
+                Bad "DB MISMATCH   : server PID $sPid is actually on: $($bind.detail) (configured: '$($cfg.dbName)') - see runtime.md, 'silently ignores db.name'."
+            }
+        }
+    } else {
+        Info "Database      : $($cfg.dbName) (psql not available - cannot inspect connections)"
+    }
+
     $tPid = 0
     if (Test-Path $TomcatPid) { [int]::TryParse((Get-Content $TomcatPid -Raw).Trim(), [ref]$tPid) | Out-Null }
-    if ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Ok "Web client    : running (PID $tPid, http://localhost:$web/)" }
+    if ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Ok "Web client    : running (PID $tPid, $(Get-WebUrl $cfg))" }
     elseif (Test-PortOpen $web) { Warn "Web client    : something is on web port $web (PID file stale)" }
     else { Info "Web client    : stopped" }
 }
@@ -1439,7 +1782,7 @@ function Cmd-Verify {
     Head "Visual verification (Playwright)"
     $cfg = Get-ConfigOrFail
     $target = $Url
-    if (-not $target) { $target = "http://localhost:$($cfg.webPort)/" }
+    if (-not $target) { $target = Get-WebUrl $cfg }
 
     $py = Find-Python
     if (-not $py) { throw "Python 3 not found. Install Python 3 to use Playwright verification." }
@@ -1467,15 +1810,21 @@ function Cmd-Verify {
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
     if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
+    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/fill/type/press/eval/wait by Playwright selector)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
     # Use --name=value form so an empty password is preserved through
     # PowerShell's native-argument handling (without =, empty strings get
-    # dropped and argparse sees the next flag as the value).
+    # dropped and argparse sees the next flag as the value). Every free-text
+    # value goes through ConvertTo-NativeArg - PS 5.1 does not escape embedded
+    # double quotes on its own, and -Do steps (JS, attribute selectors) carry
+    # them routinely.
+    $doArgs = @($Do | Where-Object { $_ } | ForEach-Object { "--do=$(ConvertTo-NativeArg $_)" })
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
-        "--user=$($cfg.adminUser)" "--password=$($cfg.adminPassword)" "--click=$Click" "--double-click=$DoubleClick" `
+        "--user=$(ConvertTo-NativeArg $cfg.adminUser)" "--password=$(ConvertTo-NativeArg $cfg.adminPassword)" `
+        "--click=$(ConvertTo-NativeArg $Click)" "--double-click=$(ConvertTo-NativeArg $DoubleClick)" `
         --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
-        --timeout 30000) -join "`n"
+        @doArgs --timeout 30000) -join "`n"
     $pyExit = $LASTEXITCODE
 
     $r = $null
@@ -1519,6 +1868,17 @@ function Cmd-Verify {
             Warn "Row text is locale/data-dependent - check verify-click.png for the actual grid text."
         } elseif ($r.double_click.target) {
             Ok "Double-clicked row '$($r.double_click.target)' - edit card in verify-dblclick.png"
+        }
+    }
+    if ($r.do -and $r.do.requested) {
+        foreach ($s in $r.do.steps) {
+            if ($s.ok) { Ok "do: $($s.action)$(if ($s.detail) { "  ->  $($s.detail)" })" }
+            else { Warn "do FAILED: $($s.action) - $($s.detail)" }
+        }
+        if ($r.do.error) { Warn "-Do chain stopped at the first failure; remaining steps were skipped." }
+        if (Test-Path $r.artifacts.do_screenshot) {
+            $kb = [math]::Round((Get-Item $r.artifacts.do_screenshot).Length / 1KB, 1)
+            Ok "Do screenshot         : $($r.artifacts.do_screenshot) ($kb KB)"
         }
     }
     Info "Open the PNGs with the Read tool to see what was rendered."
@@ -1582,7 +1942,15 @@ function Cmd-Api {
     # the query parameter is the channel that behaves the same everywhere.)
     $enc = [uri]::EscapeDataString($scriptText)
     $uri = "http://localhost:$($cfg.httpPort)/eval/action?script=$enc"
-    Info "POST $uri"
+    # Do NOT echo the encoded URI: EscapeDataString turns every non-ASCII char
+    # into %XX%XX (a Cyrillic seed script inflates ~9x into kilobytes of %D0..
+    # noise in the transcript). Print the endpoint, the source, and a short
+    # plain-text preview instead.
+    $src = if ($ScriptFile) { "file $ScriptFile" } else { "inline -Script" }
+    Info "POST http://localhost:$($cfg.httpPort)/eval/action ($src, $($scriptText.Length) chars)"
+    $preview = ($scriptText -replace '\s+', ' ').Trim()
+    if ($preview.Length -gt 200) { $preview = $preview.Substring(0, 200) + " ..." }
+    Info "Script : $preview"
 
     # Snapshot the server log length so MESSAGE output can be surfaced after
     # the call. Over HTTP a plain MESSAGE is swallowed entirely (empty 200, no
@@ -1668,7 +2036,7 @@ function Cmd-Api {
 
 function Cmd-Open {
     $cfg = Get-ConfigOrFail
-    $u = "http://localhost:$($cfg.webPort)/"
+    $u = Get-WebUrl $cfg
     Start-Process $u
     Ok "Opened $u in the default browser."
 }
@@ -1730,8 +2098,8 @@ function Cmd-Clone {
 
     if (Test-ExistingProject $resolved) {
         Ok "Layout looks like an lsFusion project."
-        Info "Next step:"
-        Info "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" setup -ProjectDir `"$resolved`" -DbPassword <pwd>"
+        Info "Next step (pick a short -AppId: it names the database and the web context path):"
+        Info "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" setup -ProjectDir `"$resolved`" -AppId <short id> -DbPassword <pwd>"
     } else {
         Warn "Repository does not look like an lsFusion project (no pom.xml, src/main/lsfusion, or lsfusion.properties found)."
         Info "You can still try setup against it, but verify the project layout first."
@@ -1759,6 +2127,14 @@ lsfdev.ps1 - lsFusion development CLI
   versions       List lsFusion versions on download.lsfusion.org and aliases.
 
 Common options:
+  -AppId <id>           Short app identifier, chosen when the application is
+                        created. It IS the database name (db.name) and the web
+                        context path: the war deploys as <id>.war and the UI
+                        lives at http://localhost:<web port>/<id>/ (/ redirects
+                        there). Lowercase letter first, then [a-z0-9_], max 30
+                        chars; persisted as db.name in settings.properties;
+                        derived from folder name + path hash when omitted.
+                        A validated -DbName, in effect - pass one or the other.
   -DbPassword <pwd>     PostgreSQL password (needed for setup).
   -DbUser / -DbServer / -DbName
   -Version <ver>        lsFusion version: '7' (default), 'stable', 'dev', '6',
@@ -1787,6 +2163,20 @@ Common options:
                         grid row by visible cell text to open its edit card,
                         then screenshot it (e.g. -DoubleClick "Coffee beans").
                         Output goes to verify-dblclick.png.
+  -Do <step>[,<step>]   'verify' only: generic interaction steps, run in order
+                        AFTER the -Click/-DoubleClick navigation - the way to
+                        reach buttons/inputs inside CUSTOM (React) components
+                        that text-based -Click cannot hit. Each step is
+                        verb:rest with any Playwright selector (css, text=...,
+                        button:has-text(...)):
+                          click:<selector>          dblclick:<selector>
+                          fill:<selector>=><value>  type:<selector>=><value>
+                          press:<key>  eval:<js>  wait:<ms>
+                        'type' presses real keys (React inputs that ignore
+                        fill); eval returns its value into the report. Chain
+                        stops at the first failed step. Screenshot goes to
+                        verify-do.png. Example:
+                          verify -Click "Schedule" -Do "fill:input.comment=>Ivanov","click:text=Book"
   -ViewportWidth/-ViewportHeight
                         'verify' browser viewport (default 1920x1080; narrow
                         viewports make dense forms look broken).
