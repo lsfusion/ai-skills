@@ -27,6 +27,8 @@ configuration, or when you need to change ports/versions.
     ├── verify-app.png            Playwright screenshot after the login attempt
     ├── verify-click.png / verify-dblclick.png   -Click / -DoubleClick results
     ├── verify-do.png             state after the -Do interaction steps
+    ├── pw-session.pid / pw-session-profile/     persistent verify -Session
+    │                             browser (killed by verify -EndSession / stop)
     └── verify-dom.html / verify-console.txt
 ```
 

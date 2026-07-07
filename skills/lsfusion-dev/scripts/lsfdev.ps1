@@ -27,6 +27,9 @@ param(
     [string]$Click = "",
     [string]$DoubleClick = "",
     [string[]]$Do = @(),
+    [switch]$Session,
+    [switch]$EndSession,
+    [int]$CdpPort = 0,
     [int]$ViewportWidth = 1920,
     [int]$ViewportHeight = 1080,
     [string]$Locale = "",
@@ -70,6 +73,7 @@ $ServerErr  = Join-Path $StateDir "server.err.log"
 $ServerPid  = Join-Path $StateDir "server.pid"
 $TomcatOut  = Join-Path $StateDir "tomcat.out.log"
 $TomcatPid  = Join-Path $StateDir "tomcat.pid"
+$PwSessionPid = Join-Path $StateDir "pw-session.pid"   # persistent verify-session browser
 $DownloadBase = "https://download.lsfusion.org/java"
 
 # ---------------------------------------------------------------- helpers ---
@@ -1781,8 +1785,22 @@ function Cmd-Log {
 function Cmd-Verify {
     Head "Visual verification (Playwright)"
     $cfg = Get-ConfigOrFail
+    if ($EndSession) {
+        if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
+        else { Info "No persistent verify session to end." }
+        return
+    }
     $target = $Url
     if (-not $target) { $target = Get-WebUrl $cfg }
+    # Persistent session: a detached headless Chromium on a per-project CDP
+    # port. The page (navigation, open form, JS state) survives between
+    # verify calls, so multi-step scenarios skip the re-navigation cost.
+    $sessionPort = 0
+    if ($Session) {
+        $sessionPort = if ($CdpPort) { $CdpPort } else { 40000 + ($cfg.webPort % 20000) }
+        Info "Session: persistent browser on CDP port $sessionPort - page state survives between verify calls (end with 'verify -EndSession'; stop/restart also close it)."
+        if ($Locale) { Warn "-Locale is ignored in session mode (the browser context already exists)." }
+    }
 
     $py = Find-Python
     if (-not $py) { throw "Python 3 not found. Install Python 3 to use Playwright verification." }
@@ -1810,7 +1828,7 @@ function Cmd-Verify {
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
     if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
-    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/fill/type/press/eval/wait by Playwright selector)" }
+    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by Playwright selector)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
     # Use --name=value form so an empty password is preserved through
@@ -1819,11 +1837,23 @@ function Cmd-Verify {
     # value goes through ConvertTo-NativeArg - PS 5.1 does not escape embedded
     # double quotes on its own, and -Do steps (JS, attribute selectors) carry
     # them routinely.
-    $doArgs = @($Do | Where-Object { $_ } | ForEach-Object { "--do=$(ConvertTo-NativeArg $_)" })
+    # -Do steps travel via a UTF-8 JSON file, NOT argv: PowerShell 5.1 wraps a
+    # native argument in quotes only when it sees whitespace outside naively
+    # paired quote characters, so JS / attribute-selector steps with certain
+    # quote+space patterns (e.g. join(" | ")) get split apart no matter how
+    # they are escaped. A file cannot be corrupted by argv quoting.
+    $doArgs = @()
+    $doSteps = @($Do | Where-Object { $_ })
+    if ($doSteps.Count) {
+        $doFile = Join-Path $StateDir "verify-do.json"
+        [IO.File]::WriteAllText($doFile, (ConvertTo-Json -InputObject $doSteps -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+        $doArgs = @("--do-file=$doFile")
+    }
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
         "--user=$(ConvertTo-NativeArg $cfg.adminUser)" "--password=$(ConvertTo-NativeArg $cfg.adminPassword)" `
         "--click=$(ConvertTo-NativeArg $Click)" "--double-click=$(ConvertTo-NativeArg $DoubleClick)" `
         --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
+        --session-port $sessionPort `
         @doArgs --timeout 30000) -join "`n"
     $pyExit = $LASTEXITCODE
 
@@ -1836,6 +1866,9 @@ function Cmd-Verify {
     }
 
     Write-Host ""
+    if ($r.session -and $r.session.requested) {
+        Info "Session : $(if ($r.session.navigated) { 'page (re)navigated to the target URL' } else { 'continued the live page - no re-navigation, previous state intact' })"
+    }
     if ($r.title) { Info "Page title : $($r.title)" }
     if (Test-Path $r.artifacts.login_screenshot) {
         $kb = [math]::Round((Get-Item $r.artifacts.login_screenshot).Length / 1KB, 1)
@@ -2168,15 +2201,32 @@ Common options:
                         reach buttons/inputs inside CUSTOM (React) components
                         that text-based -Click cannot hit. Each step is
                         verb:rest with any Playwright selector (css, text=...,
-                        button:has-text(...)):
-                          click:<selector>          dblclick:<selector>
-                          fill:<selector>=><value>  type:<selector>=><value>
+                        button:has-text(...)); click/dblclick/hover/drag
+                        selectors accept an @x,y offset from the element's
+                        top-left corner:
+                          click:<sel>[@x,y]         dblclick:<sel>[@x,y]
+                          hover:<sel>[@x,y]         drag:<sel>[@x,y]=><sel>[@x,y]
+                          mouse:down[@x,y]  mouse:up[@x,y]  mouse:move@x,y[,steps]
+                          fill:<sel>=><value>       type:<sel>=><value>
                           press:<key>  eval:<js>  wait:<ms>
-                        'type' presses real keys (React inputs that ignore
-                        fill); eval returns its value into the report. Chain
-                        stops at the first failed step. Screenshot goes to
-                        verify-do.png. Example:
-                          verify -Click "Schedule" -Do "fill:input.comment=>Ivanov","click:text=Book"
+                        'drag' performs a real mousedown -> interpolated
+                        mousemoves -> mouseup gesture (drag-to-draw UIs: Gantt
+                        links, resize handles); 'mouse' gives raw
+                        viewport-coordinate primitives (move glides in 12
+                        interpolated steps by default so busy pages still see
+                        the path); 'type' presses real keys (React inputs
+                        that ignore fill); eval returns its value into the
+                        report. Chain stops at the first failed step.
+                        Screenshot goes to verify-do.png. Example:
+                          verify -Click "Schedule" -Do "fill:input.comment=>Ivanov","drag:.task-a=>.task-b","click:text=Book"
+  -Session              'verify' only: keep a persistent headless browser
+                        (per-project CDP port) so the page - navigation, open
+                        form, JS state - SURVIVES between verify calls:
+                        navigate once with -Click, then iterate with -Do only.
+                        Ended by 'verify -EndSession'; stop/restart also close
+                        it. -Locale has no effect on an existing session.
+  -EndSession           'verify' only: close the persistent session browser.
+  -CdpPort <port>       'verify -Session' only: override the derived CDP port.
   -ViewportWidth/-ViewportHeight
                         'verify' browser viewport (default 1920x1080; narrow
                         viewports make dense forms look broken).
@@ -2210,6 +2260,9 @@ try {
             if ($cfg) { $srvPorts = @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort); $webPorts = @($cfg.webPort) }
             Stop-Tracked $ServerPid $srvPorts "Application server"
             Stop-Tracked $TomcatPid $webPorts "Tomcat"
+            # The session browser holds a page of the app being restarted -
+            # a stale page after a schema change misleads more than it helps.
+            if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
             Cmd-StartServer
             if (-not $NoWeb) { Cmd-StartWeb }
         }
@@ -2220,6 +2273,7 @@ try {
             if ($cfg) { $srvPorts = @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort); $webPorts = @($cfg.webPort) }
             Stop-Tracked $ServerPid $srvPorts "Application server"
             Stop-Tracked $TomcatPid $webPorts "Tomcat"
+            if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
         }
         "status"       { Cmd-Status }
         "log"          { Cmd-Log }

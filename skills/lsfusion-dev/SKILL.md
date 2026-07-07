@@ -164,7 +164,7 @@ with and stay consistent within the project.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server). |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components (→ `verify-do.png`). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
@@ -176,9 +176,10 @@ tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
 `-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-Url`, `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
-`-Do` (verify: generic click/fill/type/press/eval/wait steps by Playwright
-selector — see step 5), `-ScriptFile`, `-Timeout`. Run the script with no
-command to print full usage.
+`-Do` (verify: generic click/hover/drag/mouse/fill/type/press/eval/wait steps
+by Playwright selector — see step 5), `-Session` / `-EndSession` (verify:
+persistent browser between calls), `-ScriptFile`, `-Timeout`. Run the script
+with no command to print full usage.
 
 If port `8080` is taken (e.g. another Tomcat), pass `setup -WebPort <free port>`
 — the skill rewrites Tomcat's `server.xml` accordingly, and every later command
@@ -799,6 +800,19 @@ checking the unit-test output.
 
    - `click:<selector>` / `dblclick:<selector>` — e.g. `click:text=Поставить`
      hits a React button by its caption;
+   - `hover:<selector>` — real mouse-over (tooltips, hover-revealed handles);
+   - `drag:<selector>=><selector>` — a **real gesture**: `mousedown` on the
+     source, intermediate `mousemove`s, `mouseup` on the target — what
+     drag-to-draw UIs (Gantt dependency links, resize handles, sliders)
+     actually listen for. `click`/`dblclick`/`hover`/`drag` selectors accept
+     an `@x,y` offset from the element's top-left corner
+     (`drag:.task-a@120,8=>.task-b@4,8` starts from a bar's edge connector);
+   - `mouse:down[@x,y]` / `mouse:up[@x,y]` / `mouse:move@x,y[,steps]` — raw
+     viewport-coordinate primitives when even `drag:` isn't enough (multi-leg
+     gestures, precise paths). `move` glides in 12 interpolated steps by
+     default — each waypoint is dispatched with a small settle, because rapid
+     CDP moves get coalesced into 1–2 DOM events on a busy page and drag-draw
+     handlers never see the path;
    - `fill:<selector>=><value>` — set an input's value (`=>` separates
      selector from value; a plain last `=` also works);
    - `type:<selector>=><value>` — same but pressing real keys, for React
@@ -807,7 +821,7 @@ checking the unit-test output.
      `wait:<ms>`.
 
    ```
-   lsfdev.ps1 verify -Click "Расписание" -Do "fill:input.comment=>Иванов", "click:button:has-text('Поставить')"
+   lsfdev.ps1 verify -Click "Расписание" -Do "fill:input.comment=>Иванов", "drag:.gantt-task-a=>.gantt-task-b", "click:button:has-text('Поставить')"
    ```
 
    The chain stops at the first failed step; each step's ok/error (and every
@@ -816,6 +830,18 @@ checking the unit-test output.
    `api -Script` — when calling through bash + `powershell.exe`, put Cyrillic
    text in an `eval:` step or run the command via an in-process PowerShell
    tool instead (see the UTF-8 pitfall in step 4).
+
+   **Iterating on a multi-step scenario? Add `-Session`.** By default every
+   `verify` run starts a fresh browser and pays the navigation (and the slow
+   first form open) again. With `-Session` the skill keeps one persistent
+   headless browser per project (detached Chromium on a derived CDP port) and
+   **continues the same live page on the next call** — navigation state, the
+   open form, even your `eval:` JS globals survive. So: navigate once
+   (`verify -Session -Click "Расписание"`), then iterate cheaply
+   (`verify -Session -Do "drag:..."`, look at `verify-do.png`, adjust, run
+   again). The session ends with `verify -EndSession`, and `stop`/`restart`
+   close it too (a page from before a schema restart would be stale).
+   `-Locale` has no effect on an already-running session.
 
    Captions and row text are locale/data-dependent — if a click misses, read
    the actual text off `verify-app.png` / `verify-click.png` first and retry

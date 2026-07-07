@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 try:
@@ -47,6 +50,77 @@ BENIGN_CONSOLE_SUBSTRINGS = (
 )
 
 
+def _split_pos(spec: str):
+    """Split 'selector@x,y' into (selector, {'x':..,'y':..}) — offset from the
+    element's top-left corner. Plain 'selector' returns (selector, None). The
+    LAST '@' followed by two numbers wins, so attribute selectors containing
+    '@' stay intact."""
+    m = re.match(r"^(.+)@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)$", spec.strip())
+    if m and m.group(1).strip():
+        return m.group(1).strip(), {"x": float(m.group(2)), "y": float(m.group(3))}
+    return spec.strip(), None
+
+
+def _acquire_session(p, port: int, args, out_dir: Path):
+    """Connect to (or spawn) a persistent headless Chromium on a CDP port.
+
+    The browser is spawned DETACHED, so it outlives this script: the page —
+    navigation state, the open form, JS globals — persists between verify
+    invocations. lsfdev kills it via the pw-session.pid file (verify
+    -EndSession, or any stop/restart). Returns (browser, page, navigated_hint)
+    where navigated_hint says whether the page was newly created."""
+    endpoint = f"http://127.0.0.1:{port}"
+
+    def _alive() -> bool:
+        try:
+            urllib.request.urlopen(f"{endpoint}/json/version", timeout=1).read()
+            return True
+        except OSError:
+            return False
+
+    if not _alive():
+        exe = p.chromium.executable_path
+        profile = out_dir / "pw-session-profile"
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        proc = subprocess.Popen(
+            [exe, "--headless=new", f"--remote-debugging-port={port}",
+             "--remote-debugging-address=127.0.0.1",
+             f"--user-data-dir={profile}",
+             "--no-first-run", "--no-default-browser-check",
+             f"--window-size={args.viewport_width},{args.viewport_height}",
+             "about:blank"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags, start_new_session=True)
+        (out_dir / "pw-session.pid").write_text(str(proc.pid), encoding="ascii")
+        deadline = time.time() + 15
+        while time.time() < deadline and not _alive():
+            time.sleep(0.3)
+        if not _alive():
+            raise PWError(f"spawned session browser did not open CDP port {port}")
+
+    browser = p.chromium.connect_over_cdp(endpoint)
+    # Reuse the spawn's default context; creating a fresh context here would
+    # get cleared again on disconnect (Playwright closes contexts IT created).
+    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    page = None
+    base = args.url.split("#")[0].rstrip("/")
+    for pg in ctx.pages:
+        if pg.url.split("#")[0].rstrip("/").startswith(base):
+            page = pg
+            break
+    fresh = page is None
+    if fresh:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    try:
+        page.set_viewport_size({"width": args.viewport_width,
+                                "height": args.viewport_height})
+    except PWError:
+        pass
+    return browser, page, fresh
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -67,18 +141,38 @@ def main() -> int:
                     help="generic interaction step, run in order AFTER the "
                          "--click/--double-click navigation; repeatable. "
                          "Forms: click:<selector>, dblclick:<selector>, "
+                         "hover:<selector>, drag:<selector>=><selector>, "
+                         "mouse:down|up|move@x,y[,steps], "
                          "fill:<selector>=><value>, type:<selector>=><value>, "
                          "press:<key>, eval:<js>, wait:<ms>. <selector> is any "
                          "Playwright selector (css, text=..., :has-text(...)), "
                          "which is what reaches buttons/inputs inside CUSTOM "
                          "(React) components that the text-based --click "
-                         "cannot hit")
+                         "cannot hit; hover/drag/click selectors accept an "
+                         "@x,y offset from the element's top-left corner")
+    ap.add_argument("--do-file", default="",
+                    help="UTF-8 file with a JSON array of --do steps. The "
+                         "robust transport for steps carrying quotes/spaces "
+                         "(JS, attribute selectors): PowerShell 5.1's native "
+                         "argv quoting corrupts some quote/space patterns, a "
+                         "file cannot be corrupted. Used by lsfdev.ps1 -Do")
+    ap.add_argument("--session-port", type=int, default=0,
+                    help="reuse (or spawn) a persistent headless Chromium on "
+                         "this CDP port instead of launching a throwaway "
+                         "browser: the page - navigation state, open form, JS "
+                         "globals - survives between invocations. 0 = off")
     ap.add_argument("--viewport-width", type=int, default=1920)
     ap.add_argument("--viewport-height", type=int, default=1080)
     ap.add_argument("--locale", default="",
                     help="browser context locale, e.g. ru-RU (affects browser-"
                          "side language negotiation)")
     args = ap.parse_args()
+
+    if args.do_file:
+        loaded = json.loads(Path(args.do_file).read_text(encoding="utf-8-sig"))
+        if isinstance(loaded, str):
+            loaded = [loaded]
+        args.do_actions = [str(s) for s in loaded] + args.do_actions
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -117,6 +211,10 @@ def main() -> int:
             "steps": [],
             "error": None,
         },
+        "session": {
+            "requested": bool(args.session_port),
+            "navigated": True,
+        },
         "artifacts": {
             "login_screenshot":    str(login_png),
             "app_screenshot":      str(app_png),
@@ -131,33 +229,53 @@ def main() -> int:
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            page = None
+            if args.session_port:
+                # Persistent-session mode: attach to the long-lived browser
+                # (spawning it on first use). NOTE: --locale has no effect
+                # here - the context already exists.
+                browser, page, _ = _acquire_session(p, args.session_port,
+                                                    args, out_dir)
+            else:
+                browser = p.chromium.launch(headless=True)
             try:
-                # 1920x1080 default: narrower viewports (e.g. 1366x900) make
-                # dense forms (calendars, wide grids) collapse into "+N more"
-                # placeholders and the screenshot looks broken when the app is
-                # fine. Override with --viewport-width/--viewport-height.
-                ctx_kwargs = {
-                    "viewport": {"width": args.viewport_width,
-                                 "height": args.viewport_height},
-                }
-                if args.locale.strip():
-                    ctx_kwargs["locale"] = args.locale.strip()
-                context = browser.new_context(**ctx_kwargs)
-                page = context.new_page()
+                if page is None:
+                    # 1920x1080 default: narrower viewports (e.g. 1366x900) make
+                    # dense forms (calendars, wide grids) collapse into "+N more"
+                    # placeholders and the screenshot looks broken when the app is
+                    # fine. Override with --viewport-width/--viewport-height.
+                    ctx_kwargs = {
+                        "viewport": {"width": args.viewport_width,
+                                     "height": args.viewport_height},
+                    }
+                    if args.locale.strip():
+                        ctx_kwargs["locale"] = args.locale.strip()
+                    context = browser.new_context(**ctx_kwargs)
+                    page = context.new_page()
                 page.on("console", lambda m: console_lines.append(f"[{m.type}] {m.text}"))
 
-                try:
-                    page.goto(args.url, wait_until="load", timeout=args.timeout)
-                except PWError as e:
-                    result["error"] = f"navigation failed: {e}"
-                    return _finish(result, console_lines, console_path)
+                # In session mode a page that is already on the target URL is
+                # continued as-is - no reload, so the open form / JS state from
+                # the previous invocation survives and -Do steps pick up where
+                # the last call left off.
+                already_there = (
+                    args.session_port
+                    and page.url.split("#")[0].rstrip("/")
+                        == args.url.split("#")[0].rstrip("/"))
+                if already_there:
+                    result["session"]["navigated"] = False
+                else:
+                    try:
+                        page.goto(args.url, wait_until="load", timeout=args.timeout)
+                    except PWError as e:
+                        result["error"] = f"navigation failed: {e}"
+                        return _finish(result, console_lines, console_path)
 
-                # Give the SPA a moment to settle before the first screenshot.
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except PWTimeout:
-                    pass
+                    # Give the SPA a moment to settle before the first screenshot.
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except PWTimeout:
+                        pass
 
                 result["title"] = page.title()
                 page.screenshot(path=str(login_png))
@@ -273,19 +391,123 @@ def main() -> int:
                 # earlier ones). A screenshot is taken after the chain either
                 # way.
                 if result["do"]["requested"]:
+                    # Last known pointer position (viewport coords). Needed to
+                    # interpolate mouse:move / drag paths ourselves: a single
+                    # CDP move with steps=N gets COALESCED into 1-2 DOM
+                    # mousemove events whenever the page's main thread is busy,
+                    # which starves drag-to-draw handlers (Gantt links etc.) of
+                    # the intermediate points they need. Dispatching each
+                    # waypoint with a small settle guarantees DOM delivery.
+                    pointer = {"x": None, "y": None}
+
+                    def _loc_point(loc, pos):
+                        box = loc.bounding_box()
+                        if not box:
+                            return None
+                        return (box["x"] + (pos["x"] if pos else box["width"] / 2),
+                                box["y"] + (pos["y"] if pos else box["height"] / 2))
+
+                    def _glide(tx: float, ty: float, steps: int = 12):
+                        sx, sy = pointer["x"], pointer["y"]
+                        if sx is None or steps <= 1:
+                            page.mouse.move(tx, ty)
+                            page.wait_for_timeout(60)
+                        else:
+                            for i in range(1, steps + 1):
+                                page.mouse.move(sx + (tx - sx) * i / steps,
+                                                sy + (ty - sy) * i / steps)
+                                page.wait_for_timeout(25)
+                        pointer["x"], pointer["y"] = tx, ty
+
                     for raw in args.do_actions:
                         step = {"action": raw, "ok": False, "detail": ""}
                         result["do"]["steps"].append(step)
                         try:
                             verb, _, rest = raw.partition(":")
                             verb = verb.strip().lower()
-                            if verb in ("click", "dblclick"):
-                                loc = page.locator(rest).first
+                            if verb in ("click", "dblclick", "hover"):
+                                sel, pos = _split_pos(rest)
+                                loc = page.locator(sel).first
+                                kw = {"timeout": 15000}
+                                if pos:
+                                    kw["position"] = pos
                                 if verb == "click":
-                                    loc.click(timeout=15000)
+                                    loc.click(**kw)
+                                elif verb == "dblclick":
+                                    loc.dblclick(**kw)
                                 else:
-                                    loc.dblclick(timeout=15000)
+                                    loc.hover(**kw)
+                                try:
+                                    pt = _loc_point(loc, pos)
+                                    if pt:
+                                        pointer["x"], pointer["y"] = pt
+                                except PWError:
+                                    pass
+                                if verb != "hover":
+                                    page.wait_for_timeout(500)
+                            elif verb == "drag":
+                                # Real mouse gesture - mousedown, intermediate
+                                # mousemoves, mouseup - which is what
+                                # drag-to-draw UIs (Gantt dependency links,
+                                # resize handles) listen for; an HTML5
+                                # drag-and-drop emulation would never reach
+                                # their mousemove handlers.
+                                if "=>" not in rest:
+                                    raise ValueError(
+                                        "drag needs 'drag:<from>=><to>' "
+                                        "(selectors, optional @x,y offsets)")
+                                src, dst = rest.split("=>", 1)
+                                ssel, spos = _split_pos(src)
+                                dsel, dpos = _split_pos(dst)
+                                sloc = page.locator(ssel).first
+                                dloc = page.locator(dsel).first
+                                dloc.scroll_into_view_if_needed(timeout=15000)
+                                skw = {"timeout": 15000}
+                                if spos:
+                                    skw["position"] = spos
+                                sloc.hover(**skw)
+                                spt = _loc_point(sloc, spos)
+                                if spt:
+                                    pointer["x"], pointer["y"] = spt
+                                page.wait_for_timeout(100)
+                                page.mouse.down()
+                                page.wait_for_timeout(100)
+                                dpt = _loc_point(dloc, dpos)
+                                if not dpt:
+                                    page.mouse.up()
+                                    raise ValueError(
+                                        f"drag target {dsel!r} has no bounding box")
+                                _glide(dpt[0], dpt[1], steps=12)
+                                page.wait_for_timeout(100)
+                                page.mouse.up()
                                 page.wait_for_timeout(500)
+                            elif verb == "mouse":
+                                # Raw primitives for fully manual gestures:
+                                # mouse:move@x,y[,steps], mouse:down[@x,y],
+                                # mouse:up[@x,y] (viewport coordinates; down/up
+                                # with @x,y move there first). Settles after
+                                # each primitive keep hand-rolled sequences
+                                # reliable (see the coalescing note above).
+                                action, _, coords = rest.partition("@")
+                                action = action.strip().lower()
+                                nums = ([c.strip() for c in coords.split(",") if c.strip()]
+                                        if coords else [])
+                                if action == "move":
+                                    if len(nums) < 2:
+                                        raise ValueError("mouse:move needs @x,y[,steps]")
+                                    steps = int(float(nums[2])) if len(nums) > 2 else 12
+                                    _glide(float(nums[0]), float(nums[1]),
+                                           steps=max(1, steps))
+                                elif action in ("down", "up"):
+                                    if len(nums) >= 2:
+                                        page.mouse.move(float(nums[0]), float(nums[1]))
+                                        pointer["x"], pointer["y"] = float(nums[0]), float(nums[1])
+                                        page.wait_for_timeout(100)
+                                    getattr(page.mouse, action)()
+                                else:
+                                    raise ValueError(
+                                        "mouse supports down / up / move@x,y[,steps]")
+                                page.wait_for_timeout(100)
                             elif verb in ("fill", "type"):
                                 # Selector/value split: prefer the unambiguous
                                 # '=>'; fall back to the LAST '=' (CSS attribute
@@ -320,8 +542,8 @@ def main() -> int:
                                 page.wait_for_timeout(int(rest.strip() or "500"))
                             else:
                                 raise ValueError(
-                                    f"unknown verb {verb!r} - use "
-                                    "click/dblclick/fill/type/press/eval/wait")
+                                    f"unknown verb {verb!r} - use click/dblclick/"
+                                    "hover/drag/mouse/fill/type/press/eval/wait")
                             step["ok"] = True
                         except (PWTimeout, PWError, ValueError) as e:
                             step["detail"] = str(e).split("\n")[0]
@@ -337,6 +559,10 @@ def main() -> int:
                 dom_path.write_text(page.content(), encoding="utf-8")
 
             finally:
+                # For a session (connect_over_cdp) browser this only
+                # DISCONNECTS - the spawned Chromium keeps running with the
+                # page intact, ready for the next invocation. A throwaway
+                # (launched) browser is actually closed.
                 browser.close()
     except PWError as e:
         result["error"] = f"playwright error: {e}"
