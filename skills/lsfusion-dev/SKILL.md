@@ -164,7 +164,7 @@ with and stay consistent within the project.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server). |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. Add `-Click "<navigator text>"` (chain with `>`) to click into a specific form and screenshot it, and `-DoubleClick "<row text>"` to then double-click a grid row and screenshot its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form>;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
@@ -174,7 +174,8 @@ its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbNa
 tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
-`-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-Url`, `-Click`,
+`-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-Url`, `-OpenScript` /
+`-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
 `-Do` (verify: generic click/hover/drag/mouse/fill/type/press/eval/wait steps
 by Playwright selector — see step 5), `-Session` / `-EndSession` (verify:
@@ -200,7 +201,7 @@ no-pipe note in step 4), so don't inflate it "just in case":
 | `start` / `restart` — routine edit→restart cycle (lightstart) | 300 s |
 | `start-server` — first start on this DB, or major-version upgrade (raise the inner `-Timeout` to 300 as well) | 600 s |
 | `verify` — first ever run (installs Playwright + Chromium, ~120 MB) | 300 s |
-| `verify` — later runs | default |
+| `verify` — later runs | default (300 s when `-OpenScript`/`-Click` hits the *first* open of a heavy form right after a restart — the lazy form build alone can take 40 s) |
 
 Rule of thumb: outer timeout ≈ the script's inner `-Timeout` (default 180 s)
 plus ~2 minutes of Maven/Tomcat overhead. Don't copy the 600 s ceiling from a
@@ -774,29 +775,69 @@ checking the unit-test output.
    and the landing screenshot already shows the navigator + forms. The
    first `verify` ever installs Playwright + Chromium (~120 MB); one-time.
 
-   **To verify a specific form, pass `-Click`** — it clicks navigator
-   entries by their visible text (chain with `>` for tab-then-entry) and
-   screenshots the opened form to `verify-click.png`, with the generous
-   first-open waits below already baked in:
+   **To verify a specific form, open it directly with `-OpenScript` — the
+   default; don't click through the navigator.** `verify` navigates the
+   headless browser to `<web>/eval/action?script=<your code>`; the platform
+   detects the interactive action in a browser navigation and routes it back
+   into the web client (302 → `/push-notification` → service worker →
+   `/main`), where the form opens exactly as if a user had opened it —
+   screenshot → `verify-open.png`. Because the payload is an ordinary action
+   script it is fully parameterizable — a named form, a form with bound
+   objects, or the edit card of one specific object:
+
+   ```
+   # a navigator form by name
+   lsfdev.ps1 verify -OpenScript "SHOW Shop.items;" -OpenExpect "Items"
+
+   # the edit card of one object, looked up by business key
+   lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i;" -OpenExpect "Coffee beans"
+
+   # ...or by internal id (grab it beforehand with api: EXPORT FROM id = Shop.Item i, ...)
+   lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHOW EDIT Shop.Item = i;"
+   ```
+
+   - **Qualify every name with its namespace** (`Shop.items`, not `items`).
+     The script compiles against *all* loaded modules — a bare name that is
+     unique in your module (`name`, `date`, …) is routinely ambiguous here.
+     Same rule as `api` scripts.
+   - `-OpenExpect "<text>"` waits for that visible text on the opened form
+     (caption, field label, a known cell value) and reports found /
+     not-found — that's your assertion; without it you just get the
+     screenshot.
+   - Non-ASCII script text (Cyrillic keys, localized captions) → UTF-8 file
+     + `-OpenScriptFile`, exactly like `api -ScriptFile` (see the UTF-8
+     pitfall in step 4).
+   - A script error (unknown form, missing namespace, typo) surfaces as the
+     server's error text in the verify output — fix and re-run; nothing to
+     screenshot-guess.
+   - `SHOW EDIT <Class> = <obj>` opens the class edit form (the one declared
+     with `EDIT <Class> OBJECT <o>`, or the auto-generated one); `SHOW
+     <form> OBJECTS <o> = <expr>` opens any form with objects bound.
+   - Verified on 6.2 and 7.0-SNAPSHOT. Needs the web client up; in devmode
+     it rides the auto-auth admin session (on a non-devmode install the
+     call is gated by `enableUI`/`enableAPI` — admin or `@@api` actions).
+
+   **To test the user's path, use `-Click` / `-DoubleClick`** — reach for
+   them when the *navigation itself* is what you're verifying (the navigator
+   entry exists, is reachable, opens the right form), or to compose with a
+   direct open (`-OpenScript` to open a list form, then `-DoubleClick` a row
+   to open its card like a user would):
 
    ```
    lsfdev.ps1 verify -Click "Master data > Items"
-   ```
-
-   **To screenshot an edit card, add `-DoubleClick "<row text>"`** — after the
-   navigator click-through it double-clicks the grid row containing that
-   visible text, opening that row's edit form, and screenshots it to
-   `verify-dblclick.png` (the same generous first-open waits apply):
-
-   ```
    lsfdev.ps1 verify -Click "Master data > Items" -DoubleClick "Coffee beans"
    ```
 
+   `-Click` clicks navigator entries by their visible text (chain with `>`
+   for tab-then-entry) → `verify-click.png`; `-DoubleClick` then
+   double-clicks the grid row containing that text and screenshots its edit
+   card → `verify-dblclick.png`.
+
    **To drive elements `-Click` cannot reach — buttons/inputs inside `CUSTOM`
    (React) components, filters, dialogs — pass `-Do`**: an ordered list of
-   generic interaction steps, run after the `-Click`/`-DoubleClick`
-   navigation, each `verb:rest` with **any Playwright selector** (css,
-   `text=...`, `button:has-text(...)`):
+   generic interaction steps, run after the `-OpenScript` open /
+   `-Click`/`-DoubleClick` navigation, each `verb:rest` with **any Playwright
+   selector** (css, `text=...`, `button:has-text(...)`):
 
    - `click:<selector>` / `dblclick:<selector>` — e.g. `click:text=Поставить`
      hits a React button by its caption;
@@ -850,7 +891,8 @@ checking the unit-test output.
    flows, assertions between steps, remote hosts — **don't fight `verify`:
    write a real Playwright script.** The lsfusion-eval skill's Part 3 ships a
    ready Python template (login, waits, and lsFusion-specific selectors
-   already handled) — start from it, not from scratch.
+   already handled) — start from it, not from scratch (the direct-open URL
+   mechanism above is documented there for hand-written scripts too).
 
    The viewport defaults to **1920×1080** — judge layout at a realistic
    size before calling it broken: on a narrow viewport dense forms

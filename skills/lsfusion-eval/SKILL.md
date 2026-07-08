@@ -651,14 +651,61 @@ matches expectations.
 ### When to write your own Playwright vs use `lsfdev.ps1 verify`
 
 The lsfusion-dev skill's `verify` command is **local-only** — it bakes the
-URL from `.lsfusion-dev/config.json`, logs in to the local dev install, and
-takes one landing-page screenshot. That's enough for "the local server
-came up". For anything else — a deployed host (lsfusion-deploy target), a
-specific form, a multi-step navigation, multiple screenshots — write a
-small Python script with Playwright directly. The full reference template
+URL from `.lsfusion-dev/config.json` and logs in to the local dev install.
+It covers the landing page, a **direct form open** (`-OpenScript
+"SHOW …;"`, parameterizable down to one object's edit card — the mechanism
+below) and navigator click-throughs (`-Click` / `-DoubleClick`). For
+anything else — a deployed host (lsfusion-deploy target), a multi-step
+navigation, filling fields, multiple screenshots — write a small Python
+script with Playwright directly. The full reference template
 is in [references/playwright-remote.py](references/playwright-remote.py);
 copy it, adapt URL / credentials / the body of `navigate_and_capture()`,
 and run.
+
+### Opening a specific form directly by URL (no navigator clicking)
+
+An interactive action called from a **browser navigation** of the web
+server's Action API opens its forms in the web client. A `page.goto()` on
+
+```
+<base>/eval/action?script=<url-encoded action script>
+```
+
+makes the platform push the action as a *notification*, 302-redirect the
+tab to `/push-notification`, and hand the action to the app through the
+service worker — the tab lands back on `/main` with the form open, exactly
+as if the user had opened it. The payload is ordinary action code, so it
+is fully parameterizable:
+
+```lsf
+SHOW Shop.items;
+FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i;
+```
+
+Rules that make it work (verified live on 6.2 and 7.0-SNAPSHOT):
+
+- **Visit `<base>/main` once first, in the same browser context** — that
+  registers the service worker which delivers the action. In a virgin
+  context a direct hit sticks on `/push-notification` (worker not yet in
+  control); one `page.reload()` of that stuck page recovers. Then
+  `page.wait_for_url("**/main*")` and wait for your form's
+  caption/selector with a generous timeout (first open builds the form).
+- **Qualify names with namespaces** (`Shop.items`, not `items`) — the
+  script compiles against *all* loaded modules, so bare names that are
+  unique in your module are routinely ambiguous.
+- URL-encode the script (`urllib.parse.quote`) — this also carries
+  non-ASCII text safely (percent-encoded UTF-8, no argv/code-page issues).
+- A script error returns a 500 page with the server's error text *instead
+  of* the redirect — if the URL never leaves `/eval/action`, read the body
+  text: it is the exact compile error.
+- Auth gates: devmode auto-auths as admin, nothing to do. On a deployed
+  install, log in first (same context), and the call is gated by
+  `enableUI` on top of the usual `enableAPI` rules — admin /
+  `System.interpreter` access for `/eval/action`, or an `@@api`-annotated
+  action via `/exec?action=...&p=...` (same redirect mechanism).
+- On the local dev install don't hand-roll this: `lsfdev.ps1 verify
+  -OpenScript "..."` (or `-OpenScriptFile`) does it all, with a screenshot
+  and an `-OpenExpect` assertion.
 
 ### Things that will cost you a debug cycle if you don't know them
 

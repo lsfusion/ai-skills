@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote, urljoin
 
 try:
     from playwright.sync_api import (
@@ -47,6 +48,10 @@ BENIGN_CONSOLE_SUBSTRINGS = (
     # Chrome refuses the Push API in incognito (headless uses an incognito-like
     # context); emitted on every run regardless of the app. https://crbug.com/41124656
     "does not support the Push API in incognito",
+    # Navigating away from the app (e.g. to the /eval/action URL of
+    # --open-script-file) triggers the SPA's beforeunload confirm, which
+    # headless Chromium blocks for lack of a user gesture. Expected.
+    "beforeunload' confirmation panel",
 )
 
 
@@ -129,6 +134,15 @@ def main() -> int:
     ap.add_argument("--password", default="")
     ap.add_argument("--timeout", type=int, default=30000,
                     help="navigation timeout in ms")
+    ap.add_argument("--open-script-file", default="",
+                    help="path to a UTF-8 file with an lsFusion action script "
+                         "(e.g. \"SHOW myForm;\"); after landing, navigate to "
+                         "<base>/eval/action?script=... - the platform routes "
+                         "the interactive action back into the web client and "
+                         "the form opens without touching the navigator")
+    ap.add_argument("--open-expect", default="",
+                    help="with --open-script-file: wait for this visible text "
+                         "(e.g. the form caption) before the screenshot")
     ap.add_argument("--click", default="",
                     help="after landing, click element(s) by visible text and "
                          "screenshot the result; chain with '>' for tab-then-"
@@ -178,6 +192,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     login_png    = out_dir / "verify-login.png"
     app_png      = out_dir / "verify-app.png"
+    open_png     = out_dir / "verify-open.png"
     click_png    = out_dir / "verify-click.png"
     dblclick_png = out_dir / "verify-dblclick.png"
     do_png       = out_dir / "verify-do.png"
@@ -185,9 +200,17 @@ def main() -> int:
     console_path = out_dir / "verify-console.txt"
 
     # Wipe previous artefacts so callers can rely on file presence.
-    for p in (login_png, app_png, click_png, dblclick_png, do_png, dom_path, console_path):
+    for p in (login_png, app_png, open_png, click_png, dblclick_png, do_png, dom_path, console_path):
         if p.exists():
             p.unlink()
+
+    open_script = ""
+    if args.open_script_file:
+        try:
+            open_script = Path(args.open_script_file).read_text(encoding="utf-8-sig").strip()
+        except OSError as e:
+            print(json.dumps({"error": f"cannot read --open-script-file: {e}"}))
+            return 2
 
     result = {
         "url": args.url,
@@ -196,6 +219,15 @@ def main() -> int:
         "login_attempted": False,
         "console_errors": 0,
         "error": None,
+        "open": {
+            "requested": bool(open_script),
+            "script": open_script,
+            "landed_url": "",
+            "reloaded": False,
+            "expect": args.open_expect.strip(),
+            "expect_found": False,
+            "error": None,
+        },
         "click": {
             "requested": bool(args.click.strip()),
             "clicked": [],
@@ -218,6 +250,7 @@ def main() -> int:
         "artifacts": {
             "login_screenshot":    str(login_png),
             "app_screenshot":      str(app_png),
+            "open_screenshot":     str(open_png),
             "click_screenshot":    str(click_png),
             "dblclick_screenshot": str(dblclick_png),
             "do_screenshot":       str(do_png),
@@ -317,6 +350,71 @@ def main() -> int:
                         result["error"] = f"login flow failed: {e}"
 
                 page.screenshot(path=str(app_png))
+
+                # Optional direct form open. Navigating the tab to
+                # <base>/eval/action?script=<SHOW ...> runs the script as an
+                # interactive action: the platform pushes a notification,
+                # 302-redirects to /push-notification, and the service worker
+                # (registered by the app page we just landed on) navigates the
+                # tab back to /main where the pending action executes and the
+                # form opens - no navigator clicking, and the script can bind
+                # objects (e.g. FOR ... DO SHOW EDIT Class = o). If the tab
+                # sticks on /push-notification (service worker not yet in
+                # control - happens in a virgin profile), one reload fixes it:
+                # the first visit activated the worker, the reloaded page is
+                # controlled.
+                if result["open"]["requested"]:
+                    base = args.url if args.url.endswith("/") else args.url + "/"
+                    eval_url = urljoin(base, "eval/action") + "?script=" + quote(open_script)
+                    try:
+                        page.goto(eval_url, wait_until="load", timeout=args.timeout)
+                        try:
+                            page.wait_for_url("**/main*", timeout=15000)
+                        except PWTimeout:
+                            if "/push-notification" in page.url:
+                                result["open"]["reloaded"] = True
+                                page.reload(wait_until="load", timeout=args.timeout)
+                                page.wait_for_url("**/main*", timeout=30000)
+                            else:
+                                # still on /eval/action - the script failed;
+                                # let the outer handler capture the error body
+                                raise
+                        # Same generous settle as the click-through: the first
+                        # open of a form after a restart is lazy and slow.
+                        try:
+                            page.wait_for_selector("text=Loading", state="detached", timeout=60000)
+                        except PWTimeout:
+                            pass
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=30000)
+                        except PWTimeout:
+                            pass
+                        page.wait_for_timeout(2500)
+                        if result["open"]["expect"]:
+                            try:
+                                page.wait_for_selector(
+                                    f"text={result['open']['expect']}", timeout=45000)
+                                result["open"]["expect_found"] = True
+                            except PWTimeout:
+                                pass
+                    except (PWTimeout, PWError) as e:
+                        if "/eval/action" in page.url:
+                            # No redirect happened: the script failed and the
+                            # response body is the server error text.
+                            body = ""
+                            try:
+                                body = page.inner_text("body")[:600]
+                            except PWError:
+                                pass
+                            result["open"]["error"] = f"script error: {body or e}"
+                        elif "/push-notification" in page.url:
+                            result["open"]["error"] = (
+                                "stuck on /push-notification even after a reload - "
+                                "the service worker did not deliver the action to the app")
+                        else:
+                            result["open"]["error"] = f"open flow failed: {e}"
+                    result["open"]["landed_url"] = page.url
+                    page.screenshot(path=str(open_png))
 
                 # Optional click-through: navigate to a specific form by the
                 # visible text of navigator entries ('>' chains tab -> entry),

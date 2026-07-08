@@ -24,6 +24,9 @@ param(
     [string]$AdminPassword = "",
     [string]$TopModule = "",
     [string]$Url = "",
+    [string]$OpenScript = "",
+    [string]$OpenScriptFile = "",
+    [string]$OpenExpect = "",
     [string]$Click = "",
     [string]$DoubleClick = "",
     [string[]]$Do = @(),
@@ -1826,6 +1829,25 @@ function Cmd-Verify {
     Info "Target : $target"
     Info "Login  : user '$($cfg.adminUser)', $(if ($cfg.adminPassword) { 'password from config' } else { 'empty password' })"
 
+    # Resolve the direct-open script (mirrors api's -Script/-ScriptFile pair:
+    # -OpenScriptFile is the robust channel for non-ASCII text). The text is
+    # always materialized to a UTF-8 file in the state dir and handed to
+    # python by path, so it never rides the argv boundary.
+    $openScriptText = ""
+    if ($OpenScriptFile) {
+        if (-not (Test-Path $OpenScriptFile)) { throw "OpenScriptFile not found: $OpenScriptFile" }
+        $openScriptText = Get-Content -Raw -Encoding UTF8 $OpenScriptFile
+    } elseif ($OpenScript) {
+        $openScriptText = $OpenScript
+    }
+    $openFileArg = ""
+    if ($openScriptText.Trim()) {
+        $openFileArg = Join-Path $StateDir "verify-open-script.lsf"
+        [IO.File]::WriteAllText($openFileArg, $openScriptText, (New-Object Text.UTF8Encoding($false)))
+        Info "Open   : $($openScriptText.Trim() -replace '\s+', ' ') (direct form open via /eval/action)"
+        if ($OpenExpect) { Info "Expect : '$OpenExpect' (text to wait for on the opened form)" }
+    }
+
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
     if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
     if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by Playwright selector)" }
@@ -1852,6 +1874,7 @@ function Cmd-Verify {
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
         "--user=$(ConvertTo-NativeArg $cfg.adminUser)" "--password=$(ConvertTo-NativeArg $cfg.adminPassword)" `
         "--click=$(ConvertTo-NativeArg $Click)" "--double-click=$(ConvertTo-NativeArg $DoubleClick)" `
+        "--open-script-file=$(ConvertTo-NativeArg $openFileArg)" "--open-expect=$(ConvertTo-NativeArg $OpenExpect)" `
         --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
         --session-port $sessionPort `
         @doArgs --timeout 30000) -join "`n"
@@ -1878,6 +1901,22 @@ function Cmd-Verify {
         $kb = [math]::Round((Get-Item $r.artifacts.app_screenshot).Length / 1KB, 1)
         $tag = if ($r.logged_in) { "authenticated UI" } else { "post-submit state" }
         Ok "App screenshot ($tag) : $($r.artifacts.app_screenshot) ($kb KB)"
+    }
+    if ($r.open -and $r.open.requested) {
+        if (Test-Path $r.artifacts.open_screenshot) {
+            $kb = [math]::Round((Get-Item $r.artifacts.open_screenshot).Length / 1KB, 1)
+            Ok "Open screenshot       : $($r.artifacts.open_screenshot) ($kb KB)"
+        }
+        if ($r.open.error) {
+            Bad "Direct form open failed: $($r.open.error)"
+        } else {
+            $tag = if ($r.open.reloaded) { " (after one /push-notification reload)" } else { "" }
+            Ok "Open script executed - landed on $($r.open.landed_url)$tag"
+            if ($r.open.expect) {
+                if ($r.open.expect_found) { Ok "Expected text '$($r.open.expect)' is visible on the opened form." }
+                else { Warn "Expected text '$($r.open.expect)' NOT found - check verify-open.png (caption may differ / form may be empty)." }
+            }
+        }
     }
     if ($r.click -and $r.click.requested) {
         if (Test-Path $r.artifacts.click_screenshot) {
@@ -2154,6 +2193,9 @@ lsfdev.ps1 - lsFusion development CLI
   status         Show running processes and ports.
   log            Print the server log tail and a verdict.
   verify         Playwright (headless Chromium) screenshot + DOM dump of the web UI.
+                 -OpenScript "SHOW <form>;" opens a form directly (no navigator
+                 clicking, parameterizable); -Click/-DoubleClick click through
+                 the navigator like a user would.
   open           Open the web UI in the default browser.
   api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
                  Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
@@ -2188,6 +2230,18 @@ Common options:
   -TomcatOpts "<args>"  Extra Tomcat JVM args (CATALINA_OPTS analog),
                         persisted at setup.
   -Url <url>            Target URL for 'verify'.
+  -OpenScript <code>    'verify' only: open a form DIRECTLY by navigating to
+                        /eval/action?script=<code> - no navigator clicking.
+                        The code is an lsFusion action script, typically
+                        SHOW <form>; or FOR <key> DO SHOW EDIT <Class> = o;
+                        (qualify names with the namespace). Output goes to
+                        verify-open.png. ASCII-safe only; for non-ASCII use
+                        -OpenScriptFile.
+  -OpenScriptFile <path> 'verify': same as -OpenScript but read from a UTF-8
+                        file (preferred for non-ASCII scripts).
+  -OpenExpect <text>    'verify': with -OpenScript, wait for this visible text
+                        (e.g. the form caption) on the opened form and report
+                        whether it appeared.
   -Click <text>         'verify' only: click navigator entry(ies) by visible
                         text before the final screenshot; chain with '>'
                         (e.g. -Click "Master data > Items"). Output goes to
