@@ -136,10 +136,12 @@ def main() -> int:
                     help="navigation timeout in ms")
     ap.add_argument("--open-script-file", default="",
                     help="path to a UTF-8 file with an lsFusion action script "
-                         "(e.g. \"SHOW myForm;\"); after landing, navigate to "
-                         "<base>/eval/action?script=... - the platform routes "
-                         "the interactive action back into the web client and "
-                         "the form opens without touching the navigator")
+                         "(e.g. \"SHOW myForm DOCKED;\" - DOCKED renders the "
+                         "form as a tab like in production); after landing, "
+                         "navigate to <base>/eval/action?script=... - the "
+                         "platform routes the interactive action back into "
+                         "the web client and the form opens without touching "
+                         "the navigator")
     ap.add_argument("--open-expect", default="",
                     help="with --open-script-file: wait for this visible text "
                          "(e.g. the form caption) before the screenshot")

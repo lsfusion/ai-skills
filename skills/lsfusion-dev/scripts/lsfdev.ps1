@@ -2193,9 +2193,9 @@ lsfdev.ps1 - lsFusion development CLI
   status         Show running processes and ports.
   log            Print the server log tail and a verdict.
   verify         Playwright (headless Chromium) screenshot + DOM dump of the web UI.
-                 -OpenScript "SHOW <form>;" opens a form directly (no navigator
-                 clicking, parameterizable); -Click/-DoubleClick click through
-                 the navigator like a user would.
+                 -OpenScript "SHOW <form> DOCKED;" opens a form directly (no
+                 navigator clicking, parameterizable); -Click/-DoubleClick
+                 click through the navigator like a user would.
   open           Open the web UI in the default browser.
   api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
                  Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
@@ -2233,10 +2233,13 @@ Common options:
   -OpenScript <code>    'verify' only: open a form DIRECTLY by navigating to
                         /eval/action?script=<code> - no navigator clicking.
                         The code is an lsFusion action script, typically
-                        SHOW <form>; or FOR <key> DO SHOW EDIT <Class> = o;
-                        (qualify names with the namespace). Output goes to
-                        verify-open.png. ASCII-safe only; for non-ASCII use
-                        -OpenScriptFile.
+                        SHOW <form> DOCKED; or
+                        FOR <key> DO SHOW EDIT <Class> = o DOCKED;
+                        (qualify names with the namespace; DOCKED renders the
+                        form as a tab like in production - without it the
+                        form opens as a small floating window). Output goes
+                        to verify-open.png. ASCII-safe only; for non-ASCII
+                        use -OpenScriptFile.
   -OpenScriptFile <path> 'verify': same as -OpenScript but read from a UTF-8
                         file (preferred for non-ASCII scripts).
   -OpenExpect <text>    'verify': with -OpenScript, wait for this visible text

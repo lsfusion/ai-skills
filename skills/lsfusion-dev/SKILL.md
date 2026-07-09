@@ -164,7 +164,7 @@ with and stay consistent within the project.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server). |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form>;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 
@@ -787,15 +787,29 @@ checking the unit-test output.
 
    ```
    # a navigator form by name
-   lsfdev.ps1 verify -OpenScript "SHOW Shop.items;" -OpenExpect "Items"
+   lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Items"
 
    # the edit card of one object, looked up by business key
-   lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i;" -OpenExpect "Coffee beans"
+   lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;" -OpenExpect "Coffee beans"
 
    # ...or by internal id (grab it beforehand with api: EXPORT FROM id = Shop.Item i, ...)
-   lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHOW EDIT Shop.Item = i;"
+   lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHOW EDIT Shop.Item = i DOCKED;"
    ```
 
+   - **Open the form in the window mode it will have in production — for
+     navigator forms and edit cards that means `DOCKED`, as in every example
+     above.** In this call context a bare `SHOW` defaults to a *floating*
+     window (synchronous → `FLOAT`), which is **not** how the user will see
+     the form: everything reachable from the navigator, and edit cards,
+     open as `DOCKED` tabs filling the forms panel. A float renders the
+     form in a small centered window, so the layout you screenshot (column
+     widths, flex fills, collapsed containers) differs from the real thing
+     — append `DOCKED` to judge the actual `DESIGN`. Use `FLOAT` (or
+     `EMBEDDED`/`POPUP`) only when the form genuinely opens that way in
+     prod — e.g. it is shown via `DIALOG` or `SHOW … FLOAT` in the code.
+     Best of all, when prod opens the form through a project action, call
+     *that action* in `-OpenScript` — the window mode (and filters,
+     session) come along for free.
    - **Qualify every name with its namespace** (`Shop.items`, not `items`).
      The script compiles against *all* loaded modules — a bare name that is
      unique in your module (`name`, `date`, …) is routinely ambiguous here.

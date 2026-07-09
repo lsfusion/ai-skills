@@ -678,11 +678,20 @@ as if the user had opened it. The payload is ordinary action code, so it
 is fully parameterizable:
 
 ```lsf
-SHOW Shop.items;
-FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i;
+SHOW Shop.items DOCKED;
+FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
 ```
 
 Rules that make it work (verified live on 6.2 and 7.0-SNAPSHOT):
+
+- **Open the form in the window mode it has in production — `DOCKED` for
+  anything reachable from the navigator and for edit cards**, as in both
+  examples. A bare `SHOW` in this call context defaults to a small
+  *floating* window (synchronous → `FLOAT`), so the rendered layout does
+  not match what the user sees; `DOCKED` opens the form as a tab filling
+  the forms panel. Keep `FLOAT` only for forms that prod itself opens as
+  dialogs (`DIALOG`, `SHOW … FLOAT`) — or simply call the project action
+  that opens the form, and the mode comes along.
 
 - **Visit `<base>/main` once first, in the same browser context** — that
   registers the service worker which delivers the action. In a virgin
