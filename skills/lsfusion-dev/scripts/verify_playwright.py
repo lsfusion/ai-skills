@@ -123,6 +123,20 @@ def _acquire_session(p, port: int, args, out_dir: Path):
                                 "height": args.viewport_height})
     except PWError:
         pass
+    # Disable the HTTP cache for as long as this invocation is attached: the
+    # persistent profile (unlike a throwaway context) has a real disk cache,
+    # and platform statics (/static/**, GWT *.cache.js) are served cacheable
+    # for a day+. Devmode app resources are no-store anyway, but this makes
+    # session runs match throwaway runs in caching semantics, so a stale
+    # asset can never masquerade as an app bug. The flag is per CDP session
+    # and drops on detach - re-applied here on every attach, which covers
+    # every window in which navigations happen.
+    try:
+        cdp = ctx.new_cdp_session(page)
+        cdp.send("Network.enable")
+        cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+    except PWError:
+        pass
     return browser, page, fresh
 
 
@@ -177,6 +191,15 @@ def main() -> int:
                          "this CDP port instead of launching a throwaway "
                          "browser: the page - navigation state, open form, JS "
                          "globals - survives between invocations. 0 = off")
+    ap.add_argument("--reload", action="store_true",
+                    help="session mode: navigate to the target URL even when "
+                         "the page is already on the app. A page load is what "
+                         "picks up JS/CSS edits in devmode (resources are "
+                         "served no-store under a content-hash ?version=, so "
+                         "an ordinary reload always fetches fresh bytes) - but "
+                         "it also boots a new server-side navigator, closing "
+                         "open forms. No-op without --session-port (a "
+                         "throwaway browser always navigates).")
     ap.add_argument("--viewport-width", type=int, default=1920)
     ap.add_argument("--viewport-height", type=int, default=1080)
     ap.add_argument("--locale", default="",
@@ -289,14 +312,31 @@ def main() -> int:
                     page = context.new_page()
                 page.on("console", lambda m: console_lines.append(f"[{m.type}] {m.text}"))
 
-                # In session mode a page that is already on the target URL is
+                # In session mode a page that is already anywhere on the app is
                 # continued as-is - no reload, so the open form / JS state from
                 # the previous invocation survives and -Do steps pick up where
-                # the last call left off.
-                already_there = (
+                # the last call left off. "On the app" means the base URL
+                # itself OR /main under it: the web client stays at the base
+                # URL after the welcome-file forward, but lands on /main after
+                # an --open-script-file run - both are the live SPA, and a
+                # goto() would boot a new server-side navigator and close every
+                # open form. Anything else (about:blank of a fresh spawn,
+                # /login, a stuck /eval/action error page, a foreign site) is
+                # not a continuable app page and is navigated away from.
+                # --reload forces the navigation (that is how JS/CSS edits are
+                # picked up; devmode serves them fresh on every page load).
+                def _on_app_page(cur: str, base: str) -> bool:
+                    cur = cur.split("#")[0]
+                    if not cur.startswith(base):
+                        return False
+                    rest = cur[len(base):].lstrip("/")
+                    return (rest == "" or rest.startswith("?")
+                            or rest.split("?")[0].rstrip("/") == "main")
+
+                already_there = bool(
                     args.session_port
-                    and page.url.split("#")[0].rstrip("/")
-                        == args.url.split("#")[0].rstrip("/"))
+                    and not args.reload
+                    and _on_app_page(page.url, args.url.split("#")[0].rstrip("/")))
                 if already_there:
                     result["session"]["navigated"] = False
                 else:

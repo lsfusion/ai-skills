@@ -152,6 +152,15 @@ option that takes a path. Quoting forward-slash paths (`"C:/Work/proj"`) is
 fine too and avoids the issue entirely — pick whichever style you started
 with and stay consistent within the project.
 
+**Pass `-ProjectDir` on EVERY call — don't rely on the current directory.**
+Without `-ProjectDir` the script uses the shell's cwd, and tool shells reset
+their cwd between calls, so a bare `lsfdev.ps1 verify` that worked after a
+`cd` earlier can later look at the wrong directory. The symptom is
+*"Project is not set up: no .lsfusion-dev\config.json under '\<dir\>'"* on a
+project that IS set up (the message names the directory it inspected — check
+it first). This is purely path resolution: it is not caused by server state,
+a running `verify -Session` browser, or anything else that happened before.
+
 | Command | What it does |
 |---|---|
 | `check` | Detect Java, PostgreSQL, Python, git, and Maven; report versions and what is missing. |
@@ -178,9 +187,10 @@ tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
 `-Do` (verify: generic click/hover/drag/mouse/fill/type/press/eval/wait steps
-by Playwright selector — see step 5), `-Session` / `-EndSession` (verify:
-persistent browser between calls), `-ScriptFile`, `-Timeout`. Run the script
-with no command to print full usage.
+by Playwright selector — see step 5), `-Session` / `-Reload` / `-EndSession`
+(verify: persistent browser between calls; `-Reload` forces a page reload in
+it), `-ScriptFile`, `-Timeout`. Run the script with no command to print full
+usage.
 
 If port `8080` is taken (e.g. another Tomcat), pass `setup -WebPort <free port>`
 — the skill rewrites Tomcat's `server.xml` accordingly, and every later command
@@ -682,20 +692,25 @@ See the lsfusion-eval skill's "Syntax-checking `.lsf` without a restart"
 for the phase table and the technique; `lsfdev.ps1 api -Script "…"`
 drives it.
 
-**Web resources (JS / CSS / images) need NO restart in devmode — just
-hard-reload the browser.** Files under `src/main/resources/**` that the
-browser fetches — `CUSTOM`-component `.js`/`.css` registered via
-`onWebClientInit`, icons, web assets — are served live from source: in
-devmode the running server re-reads them from `src/main/resources` on each
-request (and re-stages them into `target/classes`) at page load. So after
-editing such a file, **do not `restart`** — just reload the page, bypassing
-the browser cache (Ctrl/Cmd+Shift+R, or a fresh headless context in
-Playwright, which has no cache). Verified: a `.css` edit shows up on the
-next hard reload with the server untouched. A `restart` is only needed when
-you also changed the **`.lsf`** side (e.g. the `CUSTOM 'name'` declaration,
-new form properties/actions the JS calls, the `onWebClientInit` registration
-itself) — that's schema. Pure JS/CSS iteration is a sub-second reload loop,
-not a 30 s restart loop.
+**Web resources (JS / CSS / images) need NO restart in devmode — any page
+load picks them up; browser cache is NOT a factor.** Files under
+`src/main/resources/**` that the browser fetches — `CUSTOM`-component
+`.js`/`.css` registered via `onWebClientInit`, icons, web assets — are served
+live from source: on every page load the devmode server re-reads them from
+`src/main/resources` and emits them under a content-hash URL
+(`/file/dev/...?version=<hash of the bytes>`) with `Cache-Control: no-store`,
+so the browser cannot hold a stale copy (verified: after a `.css` edit an
+ordinary reload — no hard-reload, no cache bypass — served the new bytes
+under a new `?version=`, server untouched). So after editing such a file,
+**do not `restart` — reload the page**: a default `verify` starts a fresh
+browser (always a reload); a `verify -Session` deliberately does NOT reload
+the live page — pass `-Reload`, or re-run your `-OpenScript` (it re-navigates
+anyway; see step 5). If an edit "doesn't apply", the page was not reloaded —
+don't chase cache theories and don't restart the server. A `restart` is only
+needed when you also changed the **`.lsf`** side (e.g. the `CUSTOM 'name'`
+declaration, new form properties/actions the JS calls, the `onWebClientInit`
+registration itself) — that's schema. Pure JS/CSS iteration is a sub-second
+reload loop, not a 30 s restart loop.
 
 **Report templates (`.jrxml`) — NO restart in devmode; iterate via
 `target/classes`.** Like JS/CSS web resources, JasperReports templates are
@@ -891,12 +906,23 @@ checking the unit-test output.
    first form open) again. With `-Session` the skill keeps one persistent
    headless browser per project (detached Chromium on a derived CDP port) and
    **continues the same live page on the next call** — navigation state, the
-   open form, even your `eval:` JS globals survive. So: navigate once
-   (`verify -Session -Click "Расписание"`), then iterate cheaply
-   (`verify -Session -Do "drag:..."`, look at `verify-do.png`, adjust, run
-   again). The session ends with `verify -EndSession`, and `stop`/`restart`
-   close it too (a page from before a schema restart would be stale).
-   `-Locale` has no effect on an already-running session.
+   open form, even your `eval:` JS globals survive. While the page is anywhere
+   on the app (the base URL or `/main`, where `-OpenScript` lands) a session
+   call **never reloads or re-navigates it implicitly**. So: navigate once
+   (`verify -Session -OpenScript "SHOW ...;"` or `-Click "Расписание"`), then
+   iterate cheaply (`verify -Session -Do "drag:..."`, look at `verify-do.png`,
+   adjust, run again). Two consequences of "the page lives on":
+   - **Edited JS/CSS are not picked up** until the page reloads (they are
+     fresh on *every* load — see the web-resources note in step 4 — but an
+     un-reloaded page keeps the code it already runs). Pass `-Reload` to
+     force a fresh page, or simply re-run the `-OpenScript` call — it
+     re-navigates, so one call both reloads the code and reopens the form.
+   - Any reload/navigation **resets the app to its default state** (the web
+     client boots a new server-side navigator, closing open forms) — that is
+     why `-Reload` is explicit and never implied.
+   The session ends with `verify -EndSession`, and `stop`/`restart` close it
+   too (a page from before a schema restart would be stale). `-Locale` has no
+   effect on an already-running session.
 
    Captions and row text are locale/data-dependent — if a click misses, read
    the actual text off `verify-app.png` / `verify-click.png` first and retry

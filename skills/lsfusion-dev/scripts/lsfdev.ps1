@@ -32,6 +32,7 @@ param(
     [string[]]$Do = @(),
     [switch]$Session,
     [switch]$EndSession,
+    [switch]$Reload,
     [int]$CdpPort = 0,
     [int]$ViewportWidth = 1920,
     [int]$ViewportHeight = 1080,
@@ -94,7 +95,7 @@ function Read-FileText([string]$path) {
     if (-not (Test-Path $path)) { return "" }
     try {
         $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-        $sr = New-Object IO.StreamReader($fs)
+        $sr = New-Object IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
         $t = $sr.ReadToEnd()
         $sr.Dispose(); $fs.Dispose()
         return $t
@@ -115,7 +116,7 @@ function Tail-Text([string]$text, [int]$n) {
 function Read-SettingsPort($key) {
     foreach ($sf in @((Join-Path $ProjectDir "conf\settings.properties"), (Join-Path $ProjectDir "settings.properties"))) {
         if (Test-Path $sf) {
-            foreach ($line in (Get-Content $sf)) {
+            foreach ($line in (Get-Content $sf -Encoding UTF8)) {
                 if ($line -match "^\s*$([regex]::Escape($key))\s*=\s*(\d+)\s*$") { return [int]$Matches[1] }
             }
         }
@@ -126,7 +127,7 @@ function Read-SettingsPort($key) {
 # Read a string-valued key from a .properties file ($null if file/key absent).
 function Get-SettingsValue([string]$file, [string]$key) {
     if (-not (Test-Path $file)) { return $null }
-    foreach ($line in (Get-Content $file)) {
+    foreach ($line in (Get-Content $file -Encoding UTF8)) {
         if ($line -match "^\s*$([regex]::Escape($key))\s*=\s*(.*?)\s*$") { return $Matches[1] }
     }
     return $null
@@ -162,7 +163,7 @@ function Write-PropertiesFile([string]$file, [string[]]$lines) {
 # Preserves every other line (and creates the file if missing).
 function Set-SettingsProperty([string]$file, [string]$key, [string]$value) {
     $lines = @()
-    if (Test-Path $file) { $lines = @(Get-Content $file) }
+    if (Test-Path $file) { $lines = @(Get-Content $file -Encoding UTF8) }
     $pattern = "^\s*$([regex]::Escape($key))\s*="
     $replaced = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -191,7 +192,7 @@ function Apply-SettingsOverride([string]$file, [string]$key, [string]$value, [bo
 
 function Load-Config {
     if (Test-Path $ConfigPath) {
-        $c = (Get-Content $ConfigPath -Raw | ConvertFrom-Json)
+        $c = (Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json)
         # settings.properties is the source of truth for the lsFusion-side ports
         # (rmi.port / http.port / webSocket.port), exactly like db.*. Reading them
         # back here means they survive a wiped .lsfusion-dev/ or a hand-edit of
@@ -221,7 +222,17 @@ function Load-Config {
 function Get-ConfigOrFail {
     $c = Load-Config
     if (-not $c) {
-        throw "Project is not set up. Run:  lsfdev.ps1 setup -DbPassword <password>"
+        # Name the directory that was actually inspected: in practice this
+        # error is almost never a missing setup - it is a missing -ProjectDir
+        # (the shell's cwd resets between tool calls, so a bare call from the
+        # wrong directory looks at the wrong .lsfusion-dev). Blaming setup
+        # here sent agents down false trails (once even blamed on a live
+        # verify -Session, which cannot cause this).
+        $cwdNote = if ($ScriptBound.ContainsKey('ProjectDir')) { "" }
+                   else { " (-ProjectDir not passed, so the current directory was used - it resets between tool calls; always pass -ProjectDir explicitly)" }
+        throw ("Project is not set up: no .lsfusion-dev\config.json under '$ProjectDir'$cwdNote. " +
+               "If this project IS set up, the path is simply wrong - re-run with -ProjectDir <project root>. " +
+               "Only a genuinely new project needs:  lsfdev.ps1 setup -DbPassword <password>")
     }
     return $c
 }
@@ -285,7 +296,7 @@ function Get-PomPlatformVersion([string]$projectDir) {
     $pom = Join-Path $projectDir "pom.xml"
     if (-not (Test-Path $pom)) { return $null }
     try {
-        $xml = [xml](Get-Content $pom -Raw)
+        $xml = [xml](Get-Content $pom -Raw -Encoding UTF8)
         # PowerShell's XML adapter exposes child elements by local name even
         # under pom's default namespace, so dotted access works directly.
         $v = $null
@@ -369,7 +380,7 @@ function Get-OwnPids {
     foreach ($pf in @($ServerPid, $TomcatPid)) {
         if (Test-Path $pf) {
             $v = 0
-            if (([int]::TryParse((Get-Content $pf -Raw).Trim(), [ref]$v)) -and $v) { $own += $v }
+            if (([int]::TryParse((Get-Content $pf -Raw -Encoding UTF8).Trim(), [ref]$v)) -and $v) { $own += $v }
         }
     }
     return $own
@@ -699,7 +710,7 @@ function Add-Opens([int]$major) {
 function Stop-Tracked([string]$pidFile, [int[]]$ports, [string]$label) {
     $killed = $false
     if (Test-Path $pidFile) {
-        $procId = 0; [int]::TryParse((Get-Content $pidFile -Raw).Trim(), [ref]$procId) | Out-Null
+        $procId = 0; [int]::TryParse((Get-Content $pidFile -Raw -Encoding UTF8).Trim(), [ref]$procId) | Out-Null
         if (Process-Alive $procId) {
             Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
             $killed = $true
@@ -739,7 +750,7 @@ function Patch-TomcatPorts($tomcatHome, $webPort, $shutdownPort) {
     # regardless of the port currently in the file (idempotent re-runs).
     $serverXml = Join-Path $tomcatHome "conf\server.xml"
     if (-not (Test-Path $serverXml)) { Warn "server.xml not found - Tomcat ports left at defaults."; return }
-    $xml = Get-Content $serverXml -Raw
+    $xml = Get-Content $serverXml -Raw -Encoding UTF8
     $xml = [regex]::Replace($xml, '(<Server\s+port=")\d+("\s+shutdown="SHUTDOWN")', ('${1}' + $shutdownPort + '${2}'))
     $xml = [regex]::Replace($xml, '(<Connector\s+port=")\d+("\s+protocol="HTTP/1\.1")', ('${1}' + $webPort + '${2}'))
     Set-Content -Path $serverXml -Value $xml -Encoding UTF8
@@ -1200,7 +1211,7 @@ function Cmd-Setup {
         # in Maven mode (never read) and only confuses - drop it, but only if we
         # generated it (carries our marker); never touch a hand-written root file.
         $rootSettings = Join-Path $ProjectDir "settings.properties"
-        if ((Test-Path $rootSettings) -and ((Get-Content $rootSettings -Raw) -match 'generated by lsfdev\.ps1')) {
+        if ((Test-Path $rootSettings) -and ((Get-Content $rootSettings -Raw -Encoding UTF8) -match 'generated by lsfdev\.ps1')) {
             Remove-Item $rootSettings -Force -ErrorAction SilentlyContinue
             Info "Removed stale project-root settings.properties (ignored in Maven mode)."
         }
@@ -1297,7 +1308,7 @@ $portLines$topLine
     # --- .gitignore ---
     $gi = Join-Path $ProjectDir ".gitignore"
     $giText = ""
-    if (Test-Path $gi) { $giText = Get-Content $gi -Raw }
+    if (Test-Path $gi) { $giText = Get-Content $gi -Raw -Encoding UTF8 }
     if ($giText -notmatch '(?m)^\.lsfusion-dev/?\s*$') {
         Add-Content -Path $gi -Value ".lsfusion-dev/"
         Ok "Added .lsfusion-dev/ to .gitignore."
@@ -1410,7 +1421,7 @@ function Cmd-StartServer {
         } else {
             Info "Reusing cached Maven classpath (pom.xml unchanged)."
         }
-        $mavenCp = (Get-Content $cpFile -Raw).Trim()
+        $mavenCp = (Get-Content $cpFile -Raw -Encoding UTF8).Trim()
         $depCount = (@($mavenCp -split ';' | Where-Object { $_.Trim() })).Count
         $cpParts = @("target\classes")
         foreach ($extra in @("src\main\resources", "src\main\lsfusion")) {
@@ -1728,7 +1739,7 @@ function Cmd-Status {
     else { Bad "PostgreSQL    : not listening on 5432" }
 
     $sPid = 0
-    if (Test-Path $ServerPid) { [int]::TryParse((Get-Content $ServerPid -Raw).Trim(), [ref]$sPid) | Out-Null }
+    if (Test-Path $ServerPid) { [int]::TryParse((Get-Content $ServerPid -Raw -Encoding UTF8).Trim(), [ref]$sPid) | Out-Null }
     if ((Process-Alive $sPid) -and (Test-PortOpen $rmi)) { Ok "App server    : running (PID $sPid, RMI $rmi, API $http, WebSocket $ws$(if (-not (Test-PortOpen $ws)) { ' [NOT BOUND - port clash? see runtime.md]' }))" }
     elseif (Test-PortOpen $rmi) { Warn "App server    : something is on RMI port $rmi (PID file stale)" }
     else { Info "App server    : stopped" }
@@ -1754,7 +1765,7 @@ function Cmd-Status {
     }
 
     $tPid = 0
-    if (Test-Path $TomcatPid) { [int]::TryParse((Get-Content $TomcatPid -Raw).Trim(), [ref]$tPid) | Out-Null }
+    if (Test-Path $TomcatPid) { [int]::TryParse((Get-Content $TomcatPid -Raw -Encoding UTF8).Trim(), [ref]$tPid) | Out-Null }
     if ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Ok "Web client    : running (PID $tPid, $(Get-WebUrl $cfg))" }
     elseif (Test-PortOpen $web) { Warn "Web client    : something is on web port $web (PID file stale)" }
     else { Info "Web client    : stopped" }
@@ -1803,6 +1814,9 @@ function Cmd-Verify {
         $sessionPort = if ($CdpPort) { $CdpPort } else { 40000 + ($cfg.webPort % 20000) }
         Info "Session: persistent browser on CDP port $sessionPort - page state survives between verify calls (end with 'verify -EndSession'; stop/restart also close it)."
         if ($Locale) { Warn "-Locale is ignored in session mode (the browser context already exists)." }
+        if ($Reload) { Info "Reload : forced page reload - fresh JS/CSS, app reset to default state (open forms close; reopen via -OpenScript)." }
+    } elseif ($Reload) {
+        Info "-Reload has no effect without -Session (a fresh browser always loads the page anew)."
     }
 
     $py = Find-Python
@@ -1871,13 +1885,15 @@ function Cmd-Verify {
         [IO.File]::WriteAllText($doFile, (ConvertTo-Json -InputObject $doSteps -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
         $doArgs = @("--do-file=$doFile")
     }
+    $reloadArgs = @()
+    if ($Reload) { $reloadArgs = @("--reload") }
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
         "--user=$(ConvertTo-NativeArg $cfg.adminUser)" "--password=$(ConvertTo-NativeArg $cfg.adminPassword)" `
         "--click=$(ConvertTo-NativeArg $Click)" "--double-click=$(ConvertTo-NativeArg $DoubleClick)" `
         "--open-script-file=$(ConvertTo-NativeArg $openFileArg)" "--open-expect=$(ConvertTo-NativeArg $OpenExpect)" `
         --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
         --session-port $sessionPort `
-        @doArgs --timeout 30000) -join "`n"
+        @reloadArgs @doArgs --timeout 30000) -join "`n"
     $pyExit = $LASTEXITCODE
 
     $r = $null
@@ -1890,7 +1906,10 @@ function Cmd-Verify {
 
     Write-Host ""
     if ($r.session -and $r.session.requested) {
-        Info "Session : $(if ($r.session.navigated) { 'page (re)navigated to the target URL' } else { 'continued the live page - no re-navigation, previous state intact' })"
+        $sessionNote = if ($r.session.navigated) { 'page (re)navigated to the target URL' }
+        elseif ($r.open -and $r.open.requested) { 'continued the live page, then -OpenScript re-navigated it (fresh page, fresh JS/CSS)' }
+        else { 'continued the live page - no reload, previous state (open form, JS/CSS as loaded) intact; add -Reload to pick up edited web resources' }
+        Info "Session : $sessionNote"
     }
     if ($r.title) { Info "Page title : $($r.title)" }
     if (Test-Path $r.artifacts.login_screenshot) {
@@ -2279,9 +2298,20 @@ Common options:
   -Session              'verify' only: keep a persistent headless browser
                         (per-project CDP port) so the page - navigation, open
                         form, JS state - SURVIVES between verify calls:
-                        navigate once with -Click, then iterate with -Do only.
-                        Ended by 'verify -EndSession'; stop/restart also close
-                        it. -Locale has no effect on an existing session.
+                        navigate once with -OpenScript/-Click, then iterate
+                        with -Do only. While the page is on the app it is
+                        NEVER reloaded implicitly - so edited JS/CSS are NOT
+                        picked up until -Reload (or a re-navigation such as
+                        -OpenScript). Ended by 'verify -EndSession';
+                        stop/restart also close it. -Locale has no effect on
+                        an existing session.
+  -Reload               'verify -Session' only: force a page reload before the
+                        steps - the reloaded page fetches fresh JS/CSS (devmode
+                        serves web resources no-store with a content-hash URL,
+                        so an ordinary reload is always enough) but the app
+                        resets to its default state: open forms close (reopen
+                        in the same call via -OpenScript). Without -Session
+                        every verify starts a fresh browser anyway.
   -EndSession           'verify' only: close the persistent session browser.
   -CdpPort <port>       'verify -Session' only: override the derived CDP port.
   -ViewportWidth/-ViewportHeight
