@@ -662,6 +662,19 @@ is in [references/playwright-remote.py](references/playwright-remote.py);
 copy it, adapt URL / credentials / the body of `navigate_and_capture()`,
 and run.
 
+**In-app browser instead of a script?** When the session has one (Claude
+Desktop's Browser pane, `mcp__Claude_Browser__*` tools), it can drive the
+target interactively — the direct-open URL mechanism below works there
+too, and reading the page (`get_page_text` / `read_page`) beats brittle
+text matchers. Its hard limits for deployed targets: the agent must not
+type passwords (devmode auto-auth is fine; a real login form ends the
+native path — the script logs in itself), screenshots are capped ~800 px
+wide with no region zoom (proof-grade shots for the user still come from
+Playwright), an invalid TLS cert on a staging host cannot be bypassed,
+and headless harnesses (CLI, CI, subagents) have no pane at all. Treat it
+as a convenience layer for interactive poking, not a replacement for this
+Part's script.
+
 ### Opening a specific form directly by URL (no navigator clicking)
 
 An interactive action called from a **browser navigation** of the web

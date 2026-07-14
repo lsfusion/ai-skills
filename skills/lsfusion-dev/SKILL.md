@@ -778,8 +778,16 @@ checking the unit-test output.
    which surfaces both `MESSAGE ... NOWAIT` output and the constraint text
    a canceled `APPLY` logs.
 
-3. **UI, last.** When log + API agree the build is healthy, run
-   `verify`. It drives **Playwright** (headless Chromium) to:
+3. **UI, last.** When log + API agree the build is healthy, check the
+   UI. The workhorse is `verify` — it exists in every harness, and the
+   rest of this step documents it. **If the session exposes an in-app
+   browser** (Claude Desktop's Browser pane — `mcp__Claude_Browser__*`
+   tools — or a similar browser-automation surface), do the
+   *interactive, content-level* part there instead; the split is
+   specified in **"In-app browser vs `verify`"** at the end of this
+   step. Either way the log → API → UI order stays.
+
+   `verify` drives **Playwright** (headless Chromium) to:
    - screenshot the landing page → `.lsfusion-dev/verify-login.png`,
    - **if a login form is present**, log in as `admin` (empty password by
      default) and screenshot the result → `.lsfusion-dev/verify-app.png`,
@@ -928,11 +936,13 @@ checking the unit-test output.
    the actual text off `verify-app.png` / `verify-click.png` first and retry
    with what is rendered. `-Click`/`-DoubleClick`/`-Do` cover "did it render"
    checks and single-form interactions; for anything bigger — multi-form
-   flows, assertions between steps, remote hosts — **don't fight `verify`:
-   write a real Playwright script.** The lsfusion-eval skill's Part 3 ships a
-   ready Python template (login, waits, and lsFusion-specific selectors
-   already handled) — start from it, not from scratch (the direct-open URL
-   mechanism above is documented there for hand-written scripts too).
+   flows, assertions between steps, remote hosts — **don't fight `verify`**:
+   drive the flow in the in-app browser when the session has one (see the
+   split below), or **write a real Playwright script.** The lsfusion-eval
+   skill's Part 3 ships a ready Python template (login, waits, and
+   lsFusion-specific selectors already handled) — start from it, not from
+   scratch (the direct-open URL mechanism above is documented there for
+   hand-written scripts too).
 
    The viewport defaults to **1920×1080** — judge layout at a realistic
    size before calling it broken: on a narrow viewport dense forms
@@ -960,6 +970,67 @@ checking the unit-test output.
    duration on *every* run: three such sleeps in a screenshot script is
    ~20 s of guaranteed dead time per invocation. Reserve fixed waits for
    sub-3-second UI settles (animation, focus) where no selector exists.
+
+   **In-app browser vs `verify` — the split.** Some sessions expose an
+   in-app browser as tools (Claude Desktop's Browser pane:
+   `mcp__Claude_Browser__*` — `navigate`, `computer`, `read_page`,
+   `get_page_text`, `find`, `form_input`, `read_console_messages`,
+   `read_network_requests`). When present, prefer it for **interactive,
+   content-level** checks and keep `verify` for the cases below; when
+   absent (terminal CLI, headless runs, subagents, CI), `verify` is the
+   only path. In one line: **the pane for content and behaviour,
+   `verify` for layout, gestures, and artifacts.**
+
+   What works in the pane (measured against 7.0-SNAPSHOT):
+   - **Direct form open is the same URL mechanism.** Load the app base
+     URL first (that registers the service worker), then navigate to
+     `<base>/eval/action?script=<SHOW ... DOCKED;>` (URL-encoded) — the
+     302 → `/push-notification` → service-worker → `/main` dance works
+     in the pane and the form opens exactly as with `-OpenScript`. All
+     the `-OpenScript` rules above (DOCKED, namespace-qualified names,
+     script errors returned as text) apply verbatim.
+   - **Assert by reading, not by pre-declared matchers.**
+     `get_page_text` / `read_page` return the rendered text — check the
+     caption / cell values off that instead of betting an `-OpenExpect`
+     string. This kills locale and lookalike-character misses (real
+     case: Latin `-OpenExpect "KH0001"` reported not-found while the
+     grid showed Cyrillic «КН0001»).
+   - Clicks, fills, and key presses (`computer` + `find` +
+     `form_input`) cover `-Click`/`-DoubleClick` and most `-Do` steps —
+     with JSON parameters, so none of the PowerShell argv/UTF-8
+     pitfalls.
+   - `read_console_messages` shows the same errors `verify-console.txt`
+     counts; `read_network_requests` adds the HTTP layer `verify` never
+     captures. The page also persists across your tool calls —
+     `-Session` semantics for free, with the same caveats (JS/CSS edits
+     appear only after a reload; any reload boots a new server-side
+     navigator and closes open forms).
+
+   Where the pane is NOT sufficient — use `verify` (measured):
+   - **Layout at production viewport.** Pane screenshots come back
+     ~800 px wide regardless of viewport (1920×1080 → 800×450; dense
+     grids illegible), and region zoom is unsupported. To judge
+     `DESIGN` at 1920×1080 (the "+N more" collapse problem above), use
+     `verify`'s full-resolution PNGs and Read them from disk. Shrinking
+     the pane to ≤800 px is no workaround — that changes the layout
+     under test.
+   - **Real drag gestures.** The pane's drag delivers ~2 intermediate
+     mousemoves (349 px jumps measured on a 700 px path), and multi-leg
+     gestures are inexpressible — drag-to-draw UIs (Gantt links,
+     sliders, resize handles) won't track it. Use `verify -Do
+     "drag:..."` / `mouse:` steps, which interpolate the path.
+   - **Evidence.** The pane leaves nothing on disk — no PNGs to attach,
+     no JSON verdict, nothing re-runnable. When the user needs proof or
+     a repeatable check, run `verify` even after eyeballing the pane.
+   - **Capture flake.** Right after the pane opens, screenshots can
+     time out (~30 s each) while `navigate`/`read_page`/JS run fine —
+     and interaction actions are gated on one prior successful
+     screenshot. Verify via `read_page`/`get_page_text` meanwhile, or
+     fall back to `verify`; don't fight the capture loop.
+   - **No password entry.** Typing credentials in the pane is
+     off-limits for the agent. Irrelevant in devmode (auto-auth, no
+     login form), blocking on a non-devmode target — there `verify` / a
+     Playwright script does its own login.
 
 **Verify print forms headless via PDF — don't assume.** There's no
 browser/IDE preview here, so render server-side and read the result:
