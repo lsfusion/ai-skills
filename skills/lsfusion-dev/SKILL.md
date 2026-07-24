@@ -152,6 +152,33 @@ option that takes a path. Quoting forward-slash paths (`"C:/Work/proj"`) is
 fine too and avoids the issue entirely — pick whichever style you started
 with and stay consistent within the project.
 
+**PowerShell quoting for `-Do` / `-Click` / `-Script` values: single quotes,
+always.** When a value carries double quotes, brackets or commas — attribute
+selectors (`[data-id="add item"]`), JS for `eval:`, action scripts with
+string literals — wrap it in **single quotes**:
+
+```
+... verify -Do 'click:[data-id="add item"]','fill:input[name="qty"]=>5'
+```
+
+Backslash-escaping the inner quotes (`-Do "click:[data-id=\"add\"]"`) is a
+bash habit that PowerShell does not share, and it never degrades gracefully
+(all measured): the argument **splits apart** ("A positional parameter cannot
+be found that accepts argument 'add\]'"), a `|` in the value becomes a real
+**pipe** ("The term '\)' is not recognized"), and a comma in the unquoted
+remainder aborts parsing outright ("Missing argument in parameter list").
+The backtick form `` "click:[data-id=`"add`"]" `` also works; `\"` never
+does. Three more PowerShell-isms: several `-Do` steps are **one array
+argument** — `-Do 'step1','step2'` — repeating the flag (`-Do a -Do b`)
+fails with *"parameter 'Do' is specified more than once"*; array
+parameters arrive as a real array only from an in-process call
+(`& .\lsfdev.ps1 ...`) or `powershell -Command` — **`powershell -File`
+passes `'a','b'` as one literal string** (`precheck -Files` tolerates
+that by splitting on commas; multi-step `-Do` cannot, since steps
+legitimately contain commas — use the in-process/`-Command` form); and
+for `api` scripts with string literals or non-ASCII text, skip argv
+entirely with `-ScriptFile` (same for `-OpenScriptFile`).
+
 **Pass `-ProjectDir` on EVERY call — don't rely on the current directory.**
 Without `-ProjectDir` the script uses the shell's cwd, and tool shells reset
 their cwd between calls, so a bare `lsfdev.ps1 verify` that worked after a
@@ -175,7 +202,8 @@ a running `verify -Session` browser, or anything else that happened before.
 | `log` | Print the tail of the server log and flag errors. |
 | `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
 | `open` | Open the web UI in the user's default browser. |
-| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding, and a sub-second **syntax+name check** of a `.lsf` edit before a restart — see the lsfusion-eval skill). Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
+| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
+| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"). See "run `precheck`" below. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
@@ -588,19 +616,33 @@ db.name"*). `status` shows the same at a glance as `Database: <name>
 
 **UI language.** On a host with a non-English locale the system UI
 (navigator, captions, validation messages) comes up in the **host
-language** — the server JVM inherits the OS locale. The resolution chain,
-strongest first:
+language** — the server JVM inherits the OS locale **silently** (verified
+on a pl-PL host: Polish web UI, Polish log dates, Polish system captions;
+the script-compiler `[error]` texts stay English, so errors give no hint).
+`setup`, `check` and every server start now print a warning with the fix
+when the host locale is non-English and the JVMs don't pin one. The
+resolution chain, strongest first:
 
 1. **Server JVM locale** — this is what actually governs the system
    captions. Force it with `setup -JvmArgs "-Duser.language=ru
    -Duser.country=RU"` (then `restart`).
 2. **Web-client JVM** — same flags via `setup -TomcatOpts "..."` for
-   client-side strings.
+   client-side strings (the connect/error pages come from this JVM, so
+   pin BOTH or the two halves speak different languages).
 3. **Per-user `Authentication.language`** — user-level localization;
    setting `language(u) <- 'ru'` alone does **not** re-localize the system
    captions, so don't stop there.
 4. **Browser locale** — browser-side negotiation only (`verify -Locale
    ru-RU` for matching screenshots).
+
+One thing the flags do **not** heal after the fact: system captions are
+also **persisted into the database** (Reflection tables) during the
+instance's first real use, and they keep that first language — restarts
+never rewrite them (measured: a server switched to `-Duser.language=en`
+shows an English navigator while `caption(NavigatorElement)` still answers
+Polish; even a later `-FullStart` did not rewrite). The live UI is what
+mostly matters, but if reflection-driven forms must match too, pin the
+locale **before** the first start of a fresh database.
 
 **Lightstart: leave ON.** Devmode enables `-Dlsfusion.server.lightstart=true`;
 that's the default for every `restart`. Same code loads either way — lightstart
@@ -678,19 +720,35 @@ seeding test data, running a one-off fix, ad-hoc count / lookup,
 calling an existing action with specific arguments — is **data**, not
 schema, and belongs on the running server.
 
-**Before a schema restart, syntax-check the edit via eval — it's a
-sub-second linter for the whole `.lsf` surface.** A restart is the only
-way to *load* new schema, but it's a slow way to discover a typo. The
-running server compiles an eval script in a fixed order (parse → name
-resolution → EVAL-restriction), so feeding it your new declaration tells
-you in ~0.1 s whether the **syntax and names** are clean before you pay
-the 30–60 s restart: a parse error means bad syntax, `... is not found`
-means a missing element / `REQUIRE`, and `... cannot be used in EVAL
-module` means syntax+names are fine (it just can't be loaded by eval).
-This works even for `CLASS` / `DATA … NONULL` / `WHEN` / `CONSTRAINT`.
-See the lsfusion-eval skill's "Syntax-checking `.lsf` without a restart"
-for the phase table and the technique; `lsfdev.ps1 api -Script "…"`
-drives it.
+**Before a schema restart, run `precheck` — a sub-second linter for the
+whole `.lsf` surface.** A restart is the only way to *load* new schema,
+but it's a slow way to discover a typo: a failed restart costs 26–41 s
+and reports **one name error per cycle** (parse errors do come batched).
+`precheck` feeds each file to the running server's `/eval` endpoint
+(headers stripped, line numbers preserved), which compiles it in a fixed
+order (parse → EVAL-restriction → name resolution) in ~30 ms:
+
+```
+lsfdev.ps1 precheck -ProjectDir "C:/Work/proj"                # all .lsf under src/main
+lsfdev.ps1 precheck -ProjectDir "C:/Work/proj" -Files 'src\main\lsfusion\Invoice.lsf'
+```
+
+A parse error means bad syntax; `... is not found` means a missing
+element / `REQUIRE`. One blind spot the other way: eval's throwaway
+module depends on **every** loaded module, so a name your file uses
+without the matching `REQUIRE` still resolves — an incomplete `REQUIRE`
+list surfaces only at restart. When a file carries a load-only construct (`CLASS` /
+`DATA … NONULL` / `WHEN` / `CONSTRAINT`), eval answers `... cannot be
+used in EVAL module` — precheck reports that as **syntax OK, names NOT
+checked** (measured: the restriction preempts name resolution for the
+whole script, wherever the construct sits). Two constructs crash eval's
+compiler outright — `EXTEND FORM` and `() + { }` overrides of existing
+actions — such files come back as "cannot lint: only a restart checks
+this file". Do **not** use `api` for any of this: its `/eval/action`
+endpoint wraps the script as an action body and any declaration dies
+with misleading wrapped-brace parse errors. The lsfusion-eval skill's
+"Syntax-checking `.lsf` without a restart" has the phase table and the
+raw-curl form for remote servers.
 
 **Web resources (JS / CSS / images) need NO restart in devmode — any page
 load picks them up; browser cache is NOT a factor.** Files under
@@ -932,9 +990,20 @@ checking the unit-test output.
    too (a page from before a schema restart would be stale). `-Locale` has no
    effect on an already-running session.
 
-   Captions and row text are locale/data-dependent — if a click misses, read
-   the actual text off `verify-app.png` / `verify-click.png` first and retry
-   with what is rendered. `-Click`/`-DoubleClick`/`-Do` cover "did it render"
+   **When a `-Click` misses, the output tells you why — read it before
+   theorizing.** A failed click is classified from Playwright's own log and
+   reported as one of: **not found** (no element with that visible text — the
+   output then prints the actual clickable captions harvested from the
+   failure-time page: `Clickable navigator captions: ...`, so pick from that
+   list instead of guessing); **intercepted** (element found and visible, but
+   an overlay — loading glass, sliding panel, hover popup — swallowed every
+   click; a forced click is attempted automatically and reported); or **not
+   visible** (the text exists in the DOM but is CSS-hidden, e.g. icon-only
+   navbar entries — text-based `-Click` cannot hit those, use `-Do
+   'click:<css>'` with a selector from `verify-dom.html`). Captions and row
+   text are locale/data-dependent — trust the printed caption list and
+   `verify-app.png` / `verify-click.png` over any assumption about what the
+   captions "should" be. `-Click`/`-DoubleClick`/`-Do` cover "did it render"
    checks and single-form interactions; for anything bigger — multi-form
    flows, assertions between steps, remote hosts — **don't fight `verify`**:
    drive the flow in the in-app browser when the session has one (see the

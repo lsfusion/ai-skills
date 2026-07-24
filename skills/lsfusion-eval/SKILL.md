@@ -262,7 +262,7 @@ is part of the workflow.
 | `HTTP 200`, empty body | Script compiled, name-resolved against the running schema, and ran — **nothing more**. A `MESSAGE` produces exactly this (its text is swallowed — see the gotchas), and so does a mutation whose `APPLY` was silently **canceled by a constraint**. An empty 200 is never data-level proof; write scripts that `RETURN` something. |
 | `HTTP 200`, body present | Script ended in `RETURN <expr>;` or declared an `EXPORT FROM ...` — the value/export is the body. See "Getting values back" below. |
 | `HTTP 401` | Auth issue — see the trap table above. Usually means you sent the wrong `-u` form, NOT that the password is wrong. |
-| `HTTP 500`, body with `[error]:` | The script failed one of the compile phases (see "Syntax-checking" below for the exact order). Three error shapes, in the order the server checks them: a **parse error** (`no viable alternative`, `extraneous input`, `missing X`, `mismatched input`) = bad syntax; **`... is not found`** = an unknown class/property/action (the deployed config differs from yours, or a missing REQUIRE); **`X cannot be used in EVAL module`** = a forbidden construct whose syntax+names are actually fine (see below). Genuine type mismatches (`... types don't match`, `should have integral class`) surface only when the value is realized — note INTEGER+STRING is **not** one (it coerces). Only the first error is reported. |
+| `HTTP 500`, body with `[error]:` | The script failed one of the compile phases (see "Syntax-checking" below for the exact order). Three error shapes, in the order the server checks them: a **parse error** (`no viable alternative`, `extraneous input`, `missing X`, `mismatched input`) = bad syntax; **`X cannot be used in EVAL module`** = a forbidden construct whose **syntax** is fine (this check preempts name resolution — see below); **`... is not found`** = an unknown class/property/action (the deployed config differs from yours, or a missing REQUIRE), reported only for scripts free of forbidden constructs. Genuine type mismatches (`... types don't match`, `should have integral class`) surface only when the value is realized — note INTEGER+STRING is **not** one (it coerces). **Parse** errors come batched (every statement's, in one response); **name** errors surface one per call — the body then ends with `Subsequent errors (if any) could not be found.` |
 | `HTTP 404` | Endpoint not in this build (no `Eval` module REQUIREd, or wrong path). |
 
 The canonical "is this name in the running schema?" check against
@@ -284,27 +284,31 @@ exactly which phase failed (verified live on 7.0-SNAPSHOT):
 
 | Phase (in order) | Catches | Error shape in the body |
 |---|---|---|
-| 1. Parse (grammar) | malformed syntax in **anything**, including forbidden constructs | `no viable alternative` / `extraneous input` / `missing X` / `mismatched input` / `required (...)+ loop` |
-| 2. Name resolution | unknown class / property / action, missing `REQUIRE` — incl. names used inside `FORM` and event conditions | `property or action '<name>' is not found` |
-| 3. EVAL restriction | a construct eval can't load (see below) — reached **only** once syntax + names are clean | `<X> statement / option cannot be used in EVAL module` |
+| 1. Parse (grammar) | malformed syntax in **anything**, including forbidden constructs — the whole file, errors batched | `no viable alternative` / `extraneous input` / `missing X` / `mismatched input` / `required (...)+ loop` |
+| 2. EVAL restriction | a construct eval can't load (see below). Fires **before** name resolution regardless of statement order — measured: a name error on line 1 goes unreported when a `CLASS` sits on line 2 | `<X> statement / option cannot be used in EVAL module` |
+| 3. Name resolution | unknown class / property / action, missing `REQUIRE` — incl. names used inside `FORM` and event conditions. Reached only when phase 2 found nothing | `property or action '<name>' is not found` |
 | 4. Type realization | genuine type mismatches — but only when the value is actually used (lazy on unused declarations; INTEGER+STRING coerces, not an error) | `... types don't match` / `should have integral class` |
 
-Because phase 1 runs first and phase 2 second, you can throw **any**
-declaration at eval and read the result by three outcomes:
+You can throw **any** declaration at eval and read the result by three
+outcomes:
 
 - **parse error** → a real syntax bug in your code. Fix it.
 - **`... is not found`** → a referenced element doesn't exist (typo, or a
-  `REQUIRE` you haven't added).
-- **`... cannot be used in EVAL module`** → treat as **PASS**: the
-  construct's syntax and names are clean; eval just won't load it. It will
-  load on the next real restart.
+  `REQUIRE` you haven't added). Only reported for scripts with **no**
+  load-only constructs (see the previous row).
+- **`... cannot be used in EVAL module`** → the construct's (and the whole
+  file's) **syntax** is clean; eval won't load it, and — because this check
+  preempts name resolution — the script's **names were NOT checked**. A
+  syntax-PASS, not a names-PASS.
 
-So `CLASS`, persistent `DATA` (`NONULL` / `MATERIALIZED` / `INDEXED`),
-`WHEN`, `CONSTRAINT`, aggregations etc. are all syntax+name checkable — a
-typo in them yields a parse error, a clean one yields "cannot be used".
-Plain calc properties, session `DATA`, and whole `FORM` declarations are
-loadable, so they get checked all the way through (a `FORM` even
-name-resolves the properties in its `PROPERTIES` block).
+So a typo in `CLASS`, persistent `DATA` (`NONULL` / `MATERIALIZED` /
+`INDEXED`), `WHEN`, `CONSTRAINT` etc. still yields a parse error, and a
+clean one yields "cannot be used". Plain calc properties, session `DATA`,
+and whole `FORM` declarations are loadable, so a script containing only
+those gets checked all the way through names (a `FORM` even name-resolves
+the properties in its `PROPERTIES` block). To get name coverage for a
+mixed edit, send the loadable statements separately from the load-only
+ones.
 
 ```bash
 # wrap the edit as eval statements (statements mode needs a run action).
@@ -314,19 +318,48 @@ curl -sS -X POST -H 'Content-Type: application/x-www-form-urlencoded; charset=UT
 profit (Order o) = revenue(o) - cost(o);   // your new property
 run() { }
 " http://localhost:7651/eval
-# devmode: no -u.  lsfdev.ps1 api works too (it prints the 500 body).
+# devmode: no -u.
 ```
+
+The endpoint matters: this must hit **`/eval`** (statements mode). The
+`/eval/action` endpoint — what `lsfdev.ps1 api` calls — wraps the body as
+an **action**, so any declaration fails with misleading wrapped-brace
+parse errors (`missing '}' at 'CLASS'`, `no viable alternative at input
+'='` at shifted columns) regardless of whether the code is fine. For a
+local lsfdev project don't hand-roll the curl at all: **`lsfdev.ps1
+precheck -Files 'src\main\lsfusion\My.lsf'`** does exactly this per file —
+strips the `MODULE`/`REQUIRE` header (a full module posted verbatim dies
+with `missing EOF at 'MODULE'`) while preserving line numbers, appends the
+`run() {}`, and words each verdict by what was actually proven (syntax
+everywhere; names only where eval reached them). A file that declares its
+own `run()` is **skipped with a warning** instead of linted — `/eval`
+executes `run()`, and a linter must not run project actions (the skip
+alone does not fail the command; only real FAILs exit nonzero).
 
 Limits — eval is a linter, **not** the loader: it does not validate the
 load-time semantics specific to forbidden constructs (constraint logic,
 whether `MATERIALIZED` is legal on that property shape, aggregation
-well-formedness beyond grammar), only one error is reported per call (fix
-and re-run), and one statement's error masks later ones. For a whole new
-module in one pass, temporarily strip the load-only options
-(`NONULL`/`MATERIALIZED`/`INDEXED`) so the `DATA`/calc/form surface checks
-cleanly, and probe each `CLASS`/`WHEN`/`CONSTRAINT` separately. Actually
-loading the schema still requires the restart — this just catches the typos
-first, cheaply.
+well-formedness beyond grammar), and it cannot judge `REQUIRE`
+completeness — the throwaway module depends on **every** loaded module,
+so names resolve even when the real module's `REQUIRE` list would not
+reach them (that failure surfaces only on restart). Parse errors come
+batched, but **name errors surface one per call** (fix and re-run), any
+load-only construct suppresses name checking for the whole script (see
+the phase table), and
+two real-module constructs **crash eval's compiler outright** instead of
+producing the polite restriction error — measured on 7.0-SNAPSHOT:
+`EXTEND FORM` (`RuntimeException NF COLLECTION RESTARTED`) and `() + { }`
+overrides of existing actions (`ClassCastException ... NFList`). A file
+containing those can't be linted past the offending statement — the
+restart is the only check for it (`precheck` reports such files as
+"cannot lint" rather than failing them). For a whole new module in one
+pass, temporarily strip the load-only options
+(`NONULL`/`MATERIALIZED`/`INDEXED`) so the `DATA`/calc/form surface
+checks cleanly, and probe each `CLASS`/`WHEN`/`CONSTRAINT` separately.
+Actually loading the schema still requires the restart — this just
+catches the typos first, cheaply. (For comparison, measured on
+7.0-SNAPSHOT: ~30 ms per precheck call vs a 26–41 s failed-restart cycle
+that reports a single name error.)
 
 ### Getting values back
 

@@ -66,6 +66,75 @@ def _split_pos(spec: str):
     return spec.strip(), None
 
 
+def _classify_click_error(msg: str):
+    """Classify a failed Playwright click from its timeout message.
+
+    The message embeds the whole actionability call log, which distinguishes
+    three very different situations that used to be reported identically:
+    the text matched nothing ('not_found'), the element was found but another
+    element swallowed the pointer ('intercepted' — loading glass, sliding
+    panel, hover popup), or the element exists with its text CSS-hidden
+    ('not_visible' — e.g. an icon-only navbar entry, whose caption lives in
+    textContent but not on screen). Returns (reason, blocked_by) where
+    blocked_by is the intercepting element's printed form when known."""
+    if "locator resolved to" not in msg:
+        return "not_found", ""
+    if "intercepts pointer events" in msg:
+        hits = re.findall(r"-\s+(<.+>)\s+intercepts pointer events", msg)
+        return "intercepted", (hits[-1] if hits else "")
+    if "element is not visible" in msg:
+        return "not_visible", ""
+    return "actionability", ""
+
+
+# Captions an agent can actually target with --click, harvested from the live
+# page the moment a click fails. A caption counts as clickable-by-text only
+# if the node a text locator would resolve — the INNERMOST element carrying
+# the caption — has a real on-screen box: icon-only navbar entries keep the
+# caption in the DOM inside a zero-sized/hidden div (measured: 'Administration'
+# in the system navbar), so get_by_text() resolves them and the click then
+# dies on "element is not visible". Listing those under icon_only explains
+# that failure instead of leaving it a mystery.
+_NAV_CAPTIONS_JS = """
+() => {
+  const acc = {visible: [], icon_only: []};
+  for (const a of document.querySelectorAll('a.navbar-text')) {
+    const caption = (a.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!caption) continue;
+    let el = a;
+    for (const n of a.querySelectorAll('*')) {
+      if (!n.children.length &&
+          (n.textContent || '').replace(/\\s+/g, ' ').trim() === caption) {
+        el = n;
+        break;
+      }
+    }
+    const r = el.getClientRects()[0];
+    const cs = getComputedStyle(el);
+    const vis = !!r && r.width > 0.5 && r.height > 0.5 &&
+                cs.visibility !== 'hidden' && cs.display !== 'none';
+    (vis ? acc.visible : acc.icon_only).push(caption);
+  }
+  const visible = [...new Set(acc.visible)];
+  return {visible: visible,
+          icon_only: [...new Set(acc.icon_only)].filter(t => !visible.includes(t))};
+}
+"""
+
+
+def _collect_navigator(page):
+    """Visible / icon-only navigator captions from the live page ({} lists on
+    any evaluation error — never let diagnostics kill the run)."""
+    try:
+        got = page.evaluate(_NAV_CAPTIONS_JS)
+        if isinstance(got, dict):
+            return {"visible": [str(t) for t in (got.get("visible") or [])],
+                    "icon_only": [str(t) for t in (got.get("icon_only") or [])]}
+    except PWError:
+        pass
+    return {"visible": [], "icon_only": []}
+
+
 def _acquire_session(p, port: int, args, out_dir: Path):
     """Connect to (or spawn) a persistent headless Chromium on a CDP port.
 
@@ -257,11 +326,19 @@ def main() -> int:
             "requested": bool(args.click.strip()),
             "clicked": [],
             "error": None,
+            "failed_segment": "",
+            "reason": None,        # not_found | intercepted | not_visible | actionability
+            "blocked_by": "",      # intercepting element (reason == intercepted)
+            "forced": [],          # segments that needed click(force=True)
+            "available": None,     # {visible: [...], icon_only: [...]} on failure
         },
         "double_click": {
             "requested": bool(args.double_click.strip()),
             "target": "",
             "error": None,
+            "reason": None,
+            "blocked_by": "",
+            "forced": False,
         },
         "do": {
             "requested": bool(args.do_actions),
@@ -284,6 +361,10 @@ def main() -> int:
         },
     }
     console_lines: list[str] = []
+    # Set when a click/double-click failure dumps the DOM: the caption list in
+    # the report points at verify-dom.html as the FAILURE-TIME DOM, so the
+    # end-of-run dump must not clobber it with post -Do/-DoubleClick state.
+    dom_failure_dumped = False
 
     try:
         with sync_playwright() as p:
@@ -467,15 +548,62 @@ def main() -> int:
                     seg = ""
                     try:
                         for seg in segments:
-                            target = page.get_by_text(seg, exact=True).first
-                            try:
-                                target.click(timeout=15000)
-                            except (PWTimeout, PWError):
-                                # Captions are locale-dependent and may carry
-                                # counters/whitespace - retry as substring.
-                                page.get_by_text(seg, exact=False).first.click(timeout=15000)
+                            # Exact match first. Only a not_found falls back to
+                            # the substring locator (captions carry counters /
+                            # whitespace); once a locator RESOLVED an element,
+                            # classification and the force fallback stay on
+                            # that same locator — a substring retry could hit a
+                            # different element that merely contains the text.
+                            clicked = False
+                            forced = False
+                            reason, blocked_by = "", ""
+                            last_err = None
+                            for exact in (True, False):
+                                loc = page.get_by_text(seg, exact=exact).first
+                                try:
+                                    loc.click(timeout=10000)
+                                    clicked = True
+                                    break
+                                except (PWTimeout, PWError) as e:
+                                    last_err = e
+                                    reason, blocked_by = _classify_click_error(str(e))
+                                    if reason == "not_found":
+                                        continue
+                                    if reason == "intercepted":
+                                        # Element found and visible, but
+                                        # something (loading glass, sliding
+                                        # panel, hover popup) sat on top
+                                        # through the whole retry window. Last
+                                        # resort: force the click — skips the
+                                        # hit-target check only. It may be a
+                                        # no-op if the overlay really swallows
+                                        # events, so the caller is told the
+                                        # click was forced and should trust
+                                        # the screenshot, not the click report.
+                                        try:
+                                            loc.click(timeout=3000, force=True)
+                                            clicked = True
+                                            forced = True
+                                        except (PWTimeout, PWError) as e2:
+                                            last_err = e2
+                                    break
+                            if not clicked:
+                                result["click"]["failed_segment"] = seg
+                                result["click"]["reason"] = reason
+                                result["click"]["blocked_by"] = blocked_by
+                                raise last_err
+                            if forced:
+                                result["click"]["forced"].append(seg)
                             result["click"]["clicked"].append(seg)
                             page.wait_for_timeout(700)
+                            # A navigator click can fire a server round-trip
+                            # (folder select, lazy form build) whose loading
+                            # overlay would intercept the NEXT segment's click.
+                            # Give it a bounded settle before moving on.
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=3000)
+                            except PWTimeout:
+                                pass
                         # The 'Loading' overlay may be localized - treat the
                         # wait as best-effort, then settle on networkidle.
                         try:
@@ -489,6 +617,18 @@ def main() -> int:
                         page.wait_for_timeout(2500)
                     except (PWTimeout, PWError) as e:
                         result["click"]["error"] = f"click on {seg!r} failed: {e}"
+                        if result["click"]["reason"] is None:
+                            result["click"]["reason"], result["click"]["blocked_by"] = \
+                                _classify_click_error(str(e))
+                        # Failure-time captions are the ground truth for "what
+                        # CAN be clicked" - hand them to the caller so a wrong
+                        # caption guess dies here, not after a PNG round-trip.
+                        result["click"]["available"] = _collect_navigator(page)
+                        try:
+                            dom_path.write_text(page.content(), encoding="utf-8")
+                            dom_failure_dumped = True
+                        except PWError:
+                            pass
                     page.screenshot(path=str(click_png))
 
                 # Optional double-click: open a grid row's edit card by the
@@ -500,13 +640,40 @@ def main() -> int:
                 if result["double_click"]["requested"]:
                     dbl = args.double_click.strip()
                     try:
-                        target = page.get_by_text(dbl, exact=True).first
-                        try:
-                            target.dblclick(timeout=15000)
-                        except (PWTimeout, PWError):
-                            # Cell text is locale/data-dependent and may carry
-                            # surrounding whitespace - retry as a substring.
-                            page.get_by_text(dbl, exact=False).first.dblclick(timeout=15000)
+                        # Same locator discipline as the click-through: exact
+                        # first, substring only when the exact text matched
+                        # NOTHING (cell text carries surrounding whitespace),
+                        # classification and the force fallback act on the
+                        # locator that actually resolved.
+                        done = False
+                        last_err = None
+                        reason, blocked_by = "", ""
+                        for exact in (True, False):
+                            loc = page.get_by_text(dbl, exact=exact).first
+                            try:
+                                loc.dblclick(timeout=10000)
+                                done = True
+                                break
+                            except (PWTimeout, PWError) as e:
+                                last_err = e
+                                reason, blocked_by = _classify_click_error(str(e))
+                                if reason == "not_found":
+                                    continue
+                                if reason == "intercepted":
+                                    try:
+                                        loc.dblclick(timeout=3000, force=True)
+                                        done = True
+                                        result["double_click"]["forced"] = True
+                                    except (PWTimeout, PWError) as e2:
+                                        # keep the interception classification;
+                                        # the force error text alone would
+                                        # re-classify as not_found.
+                                        last_err = e2
+                                break
+                        if not done:
+                            result["double_click"]["reason"] = reason
+                            result["double_click"]["blocked_by"] = blocked_by
+                            raise last_err
                         result["double_click"]["target"] = dbl
                         page.wait_for_timeout(700)
                         try:
@@ -520,6 +687,15 @@ def main() -> int:
                         page.wait_for_timeout(2500)
                     except (PWTimeout, PWError) as e:
                         result["double_click"]["error"] = f"double-click on {dbl!r} failed: {e}"
+                        if result["double_click"]["reason"] is None:
+                            result["double_click"]["reason"], result["double_click"]["blocked_by"] = \
+                                _classify_click_error(str(e))
+                        if not dom_failure_dumped:
+                            try:
+                                dom_path.write_text(page.content(), encoding="utf-8")
+                                dom_failure_dumped = True
+                            except PWError:
+                                pass
                     page.screenshot(path=str(dblclick_png))
 
                 # Optional generic interaction steps (--do, repeatable): the
@@ -696,7 +872,8 @@ def main() -> int:
                     page.wait_for_timeout(800)
                     page.screenshot(path=str(do_png))
 
-                dom_path.write_text(page.content(), encoding="utf-8")
+                if not dom_failure_dumped:
+                    dom_path.write_text(page.content(), encoding="utf-8")
 
             finally:
                 # For a session (connect_over_cdp) browser this only

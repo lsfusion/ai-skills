@@ -41,6 +41,7 @@ param(
     [string]$TomcatOpts = "",
     [string]$Script = "",
     [string]$ScriptFile = "",
+    [string[]]$Files = @(),
     [int]$RmiPort = 7652,
     [int]$HttpPort = 7651,
     [int]$WebSocketPort = 8887,
@@ -757,6 +758,44 @@ function Patch-TomcatPorts($tomcatHome, $webPort, $shutdownPort) {
     Ok "Tomcat ports set: HTTP $webPort, shutdown $shutdownPort."
 }
 
+# One-line heads-up when the host locale would silently pick the server's
+# system-caption/message language. The JVM inherits the OS user locale, and
+# nothing pins it unless setup persisted -Duser.language via -JvmArgs /
+# -TomcatOpts. Both JVMs matter: the app server builds system captions (and
+# they additionally get persisted into Reflection tables during the
+# instance's first real use - switching the locale later does NOT rewrite
+# those), the Tomcat JVM renders the web client's own pages. Verified on a
+# pl-PL host: Polish web UI, Polish log dates and Polish system captions,
+# with no hint anywhere.
+function Show-LocaleAdvice($cfg, [switch]$Brief) {
+    $tag = [System.Globalization.CultureInfo]::CurrentCulture.Name
+    if (-not $tag) { $tag = [System.Globalization.CultureInfo]::CurrentUICulture.Name }
+    $lang = "$(($tag -split '-')[0])".ToLowerInvariant()
+    if ($lang -in @('', 'en')) { return }
+    # Token-anchored and case-sensitive: JVM flags are case-sensitive, and a
+    # -Duser.language.format=... alone would not set the base locale.
+    $jvmPinned = "$($cfg.jvmArgs)" -cmatch '(^|\s)-Duser\.language='
+    $tcPinned  = "$($cfg.tomcatOpts)" -cmatch '(^|\s)-Duser\.language='
+    if ($jvmPinned -and $tcPinned) { return }
+    # Name only the side(s) actually unpinned, and suggest only the missing
+    # flag(s) - the two JVMs are configured independently. The suggested
+    # value APPENDS to what is already stored: setup -JvmArgs replaces the
+    # whole string, so a bare suggestion would silently drop an existing
+    # -Xmx4g or similar.
+    $sides = @(); $flags = @()
+    if (-not $jvmPinned) { $sides += "app-server";          $flags += "-JvmArgs `"$(("$($cfg.jvmArgs) -Duser.language=en -Duser.country=US").Trim())`"" }
+    if (-not $tcPinned)  { $sides += "web-client (Tomcat)"; $flags += "-TomcatOpts `"$(("$($cfg.tomcatOpts) -Duser.language=en -Duser.country=US").Trim())`"" }
+    $jvmNoun = if ($sides.Count -gt 1) { "JVMs inherit" } else { "JVM inherits" }
+    Warn "Host locale is $tag - the $($sides -join ' and ') $jvmNoun it silently: system captions, messages and logs will come out in '$lang'."
+    if ($Brief) {
+        Info "Pin it with: setup $($flags -join ' ') (any language tag works; details in 'check')."
+        return
+    }
+    Info "If that is not what you want, pin the language once (en shown; any tag works):"
+    Info "  setup $($flags -join ' ')   then restart."
+    Info "System captions also get persisted into the database (Reflection tables) during the instance's first real use, and changing the locale later does NOT rewrite them - pin the locale before the first start if those matter."
+}
+
 # --------------------------------------------------------------- commands ---
 
 function Cmd-Check {
@@ -814,6 +853,7 @@ function Cmd-Check {
     $cfg = Load-Config
     if ($cfg) {
         Ok "Project is set up (lsFusion $($cfg.version), config in .lsfusion-dev/)."
+        Show-LocaleAdvice $cfg
         if ((Test-MavenProject $ProjectDir) -and (Find-Maven)) {
             Ok "Maven project: lsfusion-server comes from Maven dependencies (no local jar needed)."
         } else {
@@ -999,6 +1039,7 @@ function Cmd-Setup {
     }
     Save-Config $cfg
     Ok "Config written (lsFusion $($cfg.version), Tomcat $($cfg.tomcatVersion))."
+    Show-LocaleAdvice $cfg
 
     # Port preflight up front - BEFORE the ~400 MB of downloads - so a conflict
     # is reported immediately instead of after a long fetch. Covers every port
@@ -1545,6 +1586,7 @@ function Cmd-StartServer {
         $extraJvm = @("$($cfg.jvmArgs)" -split '\s+' | Where-Object { $_ })
         Info "Extra JVM args: $($extraJvm -join ' ')"
     }
+    Show-LocaleAdvice $cfg -Brief
     $jvmArgs = @() + (Add-Opens $java.Major) + $devArgs + $dbArgs + @(
         "-Xmx2g", "-Dfile.encoding=UTF-8") + $extraJvm + @(
         # Ownership marker for stop/restart: lets Stop-Tracked tell this
@@ -1615,6 +1657,7 @@ function Cmd-StartServer {
 function Cmd-StartWeb {
     Head "Start web client (Tomcat)"
     $cfg = Get-ConfigOrFail
+    Show-LocaleAdvice $cfg -Brief
     $java = Find-Java
     if (-not $java) { throw "Java not found." }
     $tomcatHome = Join-Path $StateDir "tomcat"
@@ -1943,10 +1986,43 @@ function Cmd-Verify {
             Ok "Click screenshot      : $($r.artifacts.click_screenshot) ($kb KB)"
         }
         if ($r.click.error) {
-            Warn "Click-through failed after [$($r.click.clicked -join ' > ')]: $($r.click.error)"
-            Warn "Captions are locale-dependent - check verify-app.png for the actual navigator text."
+            # First line only: the rest of the Playwright message is the
+            # actionability call log, which the classification below already
+            # summarizes (the full text stays in the JSON on stdout).
+            Warn "Click-through failed after [$($r.click.clicked -join ' > ')]: $(@($r.click.error -split "`r?`n")[0])"
+            $seg = if ($r.click.failed_segment) { $r.click.failed_segment } else { $Click }
+            switch ("$($r.click.reason)") {
+                'not_found' {
+                    Warn "No element with visible text '$seg' - the caption is simply different (captions are locale/data-dependent)."
+                }
+                'intercepted' {
+                    Warn "Element '$seg' WAS found and visible, but another element intercepted every click: $($r.click.blocked_by)"
+                    Warn "That is a loading overlay / sliding panel / hover popup on top - even a forced click did not land. Check verify-click.png for what was covering it; retry, or reach the target with -Do 'click:<css selector>'."
+                }
+                'not_visible' {
+                    Warn "Element '$seg' exists in the DOM but its text is not visible (icon-only navigator entry or a collapsed panel) - text-based -Click cannot hit it. Click it via -Do 'click:<css selector>' (e.g. by lsfusion-container attribute from verify-dom.html)."
+                }
+                default {
+                    # Unclassified actionability failure - the truncated first
+                    # line is not enough here, so show Playwright's full log.
+                    Warn "The element was found but never became clickable. Full Playwright log:"
+                    @($r.click.error -split "`r?`n") | ForEach-Object { Write-Host "    $_" }
+                }
+            }
+            if ($r.click.available) {
+                if ($r.click.available.visible.Count) {
+                    Info "Clickable navigator captions on this page: $($r.click.available.visible -join ' | ')"
+                }
+                if ($r.click.available.icon_only.Count) {
+                    Info "Icon-only entries (text hidden - NOT clickable by text): $($r.click.available.icon_only -join ' | ')"
+                }
+                Info "(Full failure-time DOM: verify-dom.html)"
+            }
         } elseif ($r.click.clicked.Count) {
             Ok "Clicked through: $($r.click.clicked -join ' > ')"
+        }
+        if ($r.click.forced.Count) {
+            Warn "Segment(s) [$($r.click.forced -join ', ')] needed a FORCED click (an overlay was intercepting; hit-target check bypassed) - trust verify-click.png over this report for what actually opened."
         }
     }
     if ($r.double_click -and $r.double_click.requested) {
@@ -1955,10 +2031,18 @@ function Cmd-Verify {
             Ok "Double-click screenshot : $($r.artifacts.dblclick_screenshot) ($kb KB)"
         }
         if ($r.double_click.error) {
-            Warn "Double-click failed: $($r.double_click.error)"
-            Warn "Row text is locale/data-dependent - check verify-click.png for the actual grid text."
+            Warn "Double-click failed: $(@($r.double_click.error -split "`r?`n")[0])"
+            switch ("$($r.double_click.reason)") {
+                'not_found'   { Warn "No cell with visible text '$DoubleClick' - row text is locale/data-dependent; check verify-dblclick.png for the actual grid text." }
+                'intercepted' { Warn "Row found, but clicks were intercepted by: $($r.double_click.blocked_by) - likely a loading overlay; check verify-dblclick.png and retry." }
+                'not_visible' { Warn "The matched text exists but is not visible (hidden column / virtualized row?) - check verify-dblclick.png; scroll or filter first via -Do." }
+                default       { Warn "Row found but never became clickable - check verify-dblclick.png." }
+            }
         } elseif ($r.double_click.target) {
             Ok "Double-clicked row '$($r.double_click.target)' - edit card in verify-dblclick.png"
+        }
+        if ($r.double_click.forced) {
+            Warn "The double-click needed FORCE (an overlay was intercepting; hit-target check bypassed) - trust verify-dblclick.png for what actually opened."
         }
     }
     if ($r.do -and $r.do.requested) {
@@ -1985,6 +2069,378 @@ function Cmd-Verify {
         Warn "Browser console reported $($r.console_errors) error(s) - see $($r.artifacts.console)."
     }
     if ($r.error) { Bad "Playwright reported: $($r.error)" }
+}
+
+# Basic-auth headers for the /eval* endpoints. The header is attached ONLY
+# when a non-empty password is configured: devmode lets a no-header request
+# through as the anonymous user on every platform build, while Basic auth
+# with an empty password was observed rejected by at least one snapshot-era
+# build (see the fuller rationale in Cmd-Api).
+function Get-EvalAuthHeaders($cfg) {
+    $apiUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
+    $apiPass = if ($ScriptBound.ContainsKey("AdminPassword")) { $AdminPassword } else { $cfg.adminPassword }
+    $headers = @{}
+    if ($apiPass) {
+        $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($apiUser):$($apiPass)"))
+        $headers["Authorization"] = "Basic $auth"
+    }
+    return $headers
+}
+
+# The error-response body of a failed Invoke-WebRequest - for a 500 it carries
+# the server's actual parse/name/type error, which is the whole diagnosis.
+# PS 5.1: the cmdlet usually stashes the body in ErrorDetails; the raw stream
+# is a fallback (rewound first - the cmdlet may have read it already).
+function Get-ErrorResponseBody($err) {
+    if ($err.ErrorDetails -and $err.ErrorDetails.Message) { return $err.ErrorDetails.Message }
+    $errResp = $err.Exception.Response
+    if ($errResp) {
+        try {
+            $stream = $errResp.GetResponseStream()
+            if ($stream -and $stream.CanSeek) { $stream.Position = 0 }
+            if ($stream) {
+                $sr = New-Object IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                return $sr.ReadToEnd()
+            }
+        } catch { }
+    }
+    return $null
+}
+
+# Comment-blanked shadow of .lsf text: every character inside a // or /* */
+# comment becomes a space (line breaks kept), all other text - string
+# literals included - stays put, so positions match the original. One
+# lexical pass, not two regex passes: with regexes, a '/*' sitting inside a
+# line comment would open a phantom block that swallows real code. String
+# literals are tracked too ('...' with backslash escapes), so comment
+# openers inside strings don't blank anything.
+function Get-CommentBlankedShadow([string]$text) {
+    $chars = $text.ToCharArray()
+    $n = $chars.Length
+    $state = 'code'
+    for ($i = 0; $i -lt $n; $i++) {
+        $c = $chars[$i]
+        if ($state -eq 'code') {
+            if ($c -eq "'") { $state = 'str' }
+            elseif ($c -eq '/' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '/') {
+                $state = 'line'; $chars[$i] = ' '; $chars[$i + 1] = ' '; $i++
+            }
+            elseif ($c -eq '/' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '*') {
+                $state = 'block'; $chars[$i] = ' '; $chars[$i + 1] = ' '; $i++
+            }
+        } elseif ($state -eq 'str') {
+            if ($c -eq '\') { $i++ }
+            elseif ($c -eq "'") { $state = 'code' }
+        } elseif ($state -eq 'line') {
+            if ($c -eq "`n" -or $c -eq "`r") { $state = 'code' }
+            else { $chars[$i] = ' ' }
+        } else {  # block
+            if ($c -eq '*' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '/') {
+                $chars[$i] = ' '; $chars[$i + 1] = ' '; $i++; $state = 'code'
+            } elseif ($c -ne "`r" -and $c -ne "`n") {
+                $chars[$i] = ' '
+            }
+        }
+    }
+    return -join $chars
+}
+
+# Blank out top-level module-header statements (MODULE / REQUIRE / NAMESPACE /
+# PRIORITY): eval compiles the text as a throwaway module that already depends
+# on every loaded module, so headers are both forbidden ("missing EOF at
+# 'MODULE'") and unnecessary. Every replaced character becomes a space, so the
+# LINE:COL positions in eval's errors still match the original file. Header
+# extents are located on the comment-blanked shadow, so a ';' inside a
+# comment cannot cut a REQUIRE list short and leave residue behind.
+function Strip-ModuleHeader([string]$text) {
+    $shadow = Get-CommentBlankedShadow $text
+    $chars = $text.ToCharArray()
+    $blanked = @{}
+    foreach ($m in [regex]::Matches($shadow, '(?m)^[ \t]*(MODULE|REQUIRE|NAMESPACE|PRIORITY)\b[^;]*;')) {
+        # Blank only a WELL-FORMED header, and only the FIRST of each kind. A
+        # malformed one (say, a REQUIRE missing its ';') makes [^;]*; swallow
+        # the next declaration too, and a duplicate header is itself illegal -
+        # blanking either would false-PASS a file the restart rejects. Left in
+        # place they fail the eval parse loudly (the precheck FAIL branch
+        # explains that hint). Full ORDER validation is deliberately not
+        # attempted: a mis-remembered ordering rule here would produce false
+        # FAILs, which cost more trust than the rare uncaught misorder.
+        $kw = $m.Groups[1].Value
+        if ($blanked.ContainsKey($kw)) { continue }
+        $ident = '[A-Za-z_][A-Za-z0-9_]*'
+        $bodyPattern = if ($kw -eq 'REQUIRE' -or $kw -eq 'PRIORITY') { "$ident(\s*,\s*$ident)*" } else { $ident }
+        if ($m.Value -notmatch "^\s*$kw\s+$bodyPattern\s*;\s*$") { continue }
+        $blanked[$kw] = $true
+        for ($i = $m.Index; $i -lt $m.Index + $m.Length; $i++) {
+            if ($chars[$i] -ne [char]"`r" -and $chars[$i] -ne [char]"`n") { $chars[$i] = [char]' ' }
+        }
+    }
+    return -join $chars
+}
+
+# Uri.EscapeDataString on .NET Framework (PS 5.1) throws on inputs longer
+# than ~65,519 characters - escape big scripts in slices. Escaping is
+# per-character, so any split point is safe except the middle of a surrogate
+# pair, which the slicer steps over.
+function ConvertTo-EscapedData([string]$s) {
+    $chunk = 60000
+    if ($s.Length -le $chunk) { return [uri]::EscapeDataString($s) }
+    $sb = New-Object System.Text.StringBuilder
+    $i = 0
+    while ($i -lt $s.Length) {
+        $len = [Math]::Min($chunk, $s.Length - $i)
+        if (($i + $len) -lt $s.Length -and [char]::IsHighSurrogate($s[$i + $len - 1])) { $len++ }
+        $null = $sb.Append([uri]::EscapeDataString($s.Substring($i, $len)))
+        $i += $len
+    }
+    return $sb.ToString()
+}
+
+function Cmd-Precheck {
+    Head "Pre-check .lsf via eval (syntax + names, no restart)"
+    $cfg = Get-ConfigOrFail
+
+    # Resolve the file set: explicit -Files (absolute or project-relative),
+    # else every .lsf under the same roots start-server puts on the classpath.
+    $targets = @()
+    if ($Files.Count) {
+        # powershell.exe -File hands "-Files 'a','b'" over as ONE literal
+        # string - split elements on commas so both invocation styles work
+        # (an .lsf path with a comma in it is not a case worth supporting).
+        foreach ($f in @($Files | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            $p = if ([IO.Path]::IsPathRooted($f)) { $f } else { Join-Path $ProjectDir $f }
+            if (-not (Test-Path $p)) { throw "File not found: $p" }
+            $targets += (Resolve-Path $p).Path
+        }
+    } else {
+        $srcRoots = @(@("src\main\lsfusion", "src\main\resources") |
+            ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ })
+        if ($srcRoots.Count) {
+            $targets = @($srcRoots | ForEach-Object {
+                    Get-ChildItem $_ -Recurse -Filter *.lsf -ErrorAction SilentlyContinue
+                } | ForEach-Object { $_.FullName })
+        } else {
+            $targets = @(Get-ChildItem $ProjectDir -File -Filter *.lsf -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName })
+        }
+    }
+    if (-not $targets.Count) { throw "No .lsf files to check. Pass them explicitly: precheck -Files 'src\main\lsfusion\MyModule.lsf'" }
+
+    # The check IS a compile on the running server - without one there is
+    # nothing to ask. (This also means names resolve against what that server
+    # has LOADED: a REQUIRE added in this same edit session is fine - eval
+    # depends on every loaded module - but a brand-new module's names exist
+    # only after its first successful restart.)
+    if (-not (Test-PortOpen $cfg.httpPort)) {
+        throw "Nothing is listening on the Action API port $($cfg.httpPort). precheck compiles against the RUNNING dev server - start it first: lsfdev.ps1 start-server"
+    }
+    # An open port only proves SOMETHING listens. If it is not this project's
+    # tracked server (parallel-session port drift, a manually started
+    # instance), name checks reflect whatever schema THAT server loaded -
+    # worth a warning, not a refusal (a manually started server is a
+    # legitimate target, exactly as it is for 'api').
+    $ownerOk = $false
+    if (Test-Path $ServerPid) {
+        $sPid = 0
+        if ([int]::TryParse((Get-Content $ServerPid -Raw -Encoding UTF8).Trim(), [ref]$sPid) -and (Process-Alive $sPid)) {
+            $ownCmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$sPid" -ErrorAction SilentlyContinue).CommandLine
+            if ($ownCmd -and $ownCmd.IndexOf("-Dlsfdev.project=$ProjectDir", [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                # The marked PID must also actually OWN the port - an alive
+                # tracked server plus a foreign listener is still foreign.
+                $ownerOk = ($sPid -in @(Get-PortPids $cfg.httpPort))
+            }
+        }
+    }
+    if (-not $ownerOk) {
+        Warn "The listener on port $($cfg.httpPort) is not this project's tracked dev server (started by hand, or another session?) - name results reflect THAT server's loaded schema."
+    }
+
+    $headers = Get-EvalAuthHeaders $cfg
+    Info "POST http://localhost:$($cfg.httpPort)/eval (statements mode), $($targets.Count) file(s)."
+    Info "Verifies syntax everywhere and names where eval reaches them (~30 ms/file); loading the schema still requires a restart."
+    Write-Host ""
+    # Top-level names declared anywhere in THIS selection (column-0
+    # declarations and CLASSes, harvested off the comment-blanked shadow).
+    # eval checks files one at a time, so file B legitimately cannot see file
+    # A's new declaration - a not-found on such a name is a cross-file
+    # reference, reported as inconclusive rather than FAIL.
+    # Ordinal dictionary, NOT a PS hashtable: hashtable keys are
+    # case-insensitive, and lsFusion identifiers are not - CLASS 'NewProp'
+    # must not swallow a genuine error on 'newProp'.
+    # Ownership maps each identifier to the SET of full paths declaring it -
+    # overloads legitimately live in several files, and a single-owner map
+    # would let the last writer shadow the others (a same-name declaration in
+    # the current file must not hide a cross-file overload). Full paths, not
+    # leaves: two selected files can share a basename; the leaf is display-only.
+    $declaredHere = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]' ([System.StringComparer]::Ordinal)
+    foreach ($t in $targets) {
+        try {
+            $sh = Get-CommentBlankedShadow ([IO.File]::ReadAllText($t))
+            # Column-0 property/action declarations, plus keyworded top-level
+            # declarations whose names travel cross-file: classes, forms,
+            # groups, windows, tables, metacodes.
+            $declMatches = @([regex]::Matches($sh, "(?m)^([a-z][A-Za-z0-9_]*)\s*(?:'(?:[^'\\]|\\.)*'\s*)?(?:\(|=)")) +
+                           @([regex]::Matches($sh, '(?m)^(?:CLASS|FORM|GROUP|WINDOW|TABLE|META)\s+([A-Za-z_][A-Za-z0-9_]*)'))
+            foreach ($dm in $declMatches) {
+                $nm = $dm.Groups[1].Value
+                if (-not $declaredHere.ContainsKey($nm)) {
+                    $declaredHere[$nm] = New-Object 'System.Collections.Generic.List[string]'
+                }
+                if (-not $declaredHere[$nm].Contains($t)) { $declaredHere[$nm].Add($t) }
+            }
+        } catch { }
+    }
+    $failCount = 0
+    $skipCount = 0
+    foreach ($t in $targets) {
+        $leaf = Split-Path $t -Leaf
+        try {
+            $raw = [IO.File]::ReadAllText($t)
+            # /eval EXECUTES the script's run() action. Project modules never
+            # declare one, but hand-written eval probes do - running their
+            # body from a linter could mutate data, so such files are skipped
+            # outright rather than linted. Matched against the comment-blanked
+            # shadow, so a run() mentioned in a comment doesn't skip the file.
+            # The pattern covers every declaration shape - run() {}, run {},
+            # run 'Caption' {}, run 'Caption'() {} (all verified to execute
+            # via /eval), plus property/override forms (run() = ..., += - a
+            # same-name property would only produce a confusing "already
+            # defined" against the appended stub). A call site (run();) or a
+            # longer name (runTotals) does not match.
+            $fileShadow = Get-CommentBlankedShadow $raw
+            if ($fileShadow -cmatch '(?m)^[ \t]*run(?![A-Za-z0-9_])\s*(?:''(?:[^''\\]|\\.)*''\s*)?(?:\([^)]*\)\s*)?(?:\{|\+?=)') {
+                $skipCount++
+                Warn "$leaf - skipped: it declares run(), and /eval EXECUTES run() - a linter must not run project actions. Rename the action (or lint the file without it)."
+                continue
+            }
+            # Every .lsf module must open with a MODULE header - the restart
+            # loader rejects a file without one, and header-stripping cannot
+            # flag what is absent. Checked on the shadow (a leading license
+            # comment is already blank there).
+            if ($fileShadow -cnotmatch '^\s*MODULE\s+[A-Za-z_][A-Za-z0-9_]*\s*;') {
+                $failCount++
+                Bad "$leaf - FAIL: no valid leading 'MODULE <Name>;' header - the restart loader requires one (precheck strips headers, it cannot invent a missing one)."
+                continue
+            }
+            # NAMESPACE / PRIORITY steer how ambiguous names resolve; they are
+            # stripped for the check, so a clean name pass can still resolve
+            # differently at restart - the verdict carries that caveat.
+            $nsCaveat = ""
+            if ($fileShadow -cmatch '(?m)^[ \t]*(NAMESPACE|PRIORITY)\b') {
+                $nsCaveat = " (NAMESPACE/PRIORITY stripped for the check - ambiguous names can resolve differently at restart)"
+            }
+            $scriptText = (Strip-ModuleHeader $raw) + "`r`nrun() {}"
+            # Transport: small scripts ride the %XX query parameter (decodes
+            # as UTF-8 on every platform build - same reason as Cmd-Api), but
+            # System.Uri and the server's request line cap out around 64 KB,
+            # so bigger payloads go as a form body with an explicit UTF-8
+            # charset. Decided on the ENCODED length - escaping expands up to
+            # 9x (Cyrillic chars become %XX%XX). (6.x-era builds decoded the
+            # body in the platform charset, but they cannot take a >64 KB URI
+            # either - there is no better channel for a big file on them.)
+            $enc = ConvertTo-EscapedData $scriptText
+            $uri = "http://localhost:$($cfg.httpPort)/eval"
+            if ($enc.Length -le 60000) {
+                $null = Invoke-WebRequest -Uri "$uri`?script=$enc" `
+                    -Method Post -Headers $headers -UseBasicParsing -TimeoutSec 30
+            } else {
+                $null = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
+                    -ContentType "application/x-www-form-urlencoded; charset=UTF-8" `
+                    -Body ([Text.Encoding]::UTF8.GetBytes("script=$enc")) -UseBasicParsing -TimeoutSec 60
+            }
+            Ok "$leaf - PASS (eval compiled and loaded it clean)$nsCaveat"
+        } catch {
+            $body = Get-ErrorResponseBody $_
+            if (-not $body) {
+                # No HTTP error body: an IO problem, a connection drop, or a
+                # non-HTTP failure - report it per file and keep going.
+                $failCount++
+                Bad "$leaf - precheck error: $($_.Exception.Message)"
+                continue
+            }
+            # Compiler verdicts live in HTTP 500 bodies only. Anything else
+            # (401 auth, 404 no Eval module / wrong path, 413 ...) is an
+            # endpoint problem, not a statement about the file.
+            $status = 0
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($status -ne 0 -and $status -ne 500) {
+                $failCount++
+                Bad "$leaf - HTTP $status from the endpoint (auth / wrong path / a build without the Eval module?) - not a verdict on the file: $(@($body -split "`r?`n" | Where-Object { $_.Trim() })[0])"
+                continue
+            }
+            # Some real-module constructs crash eval's compiler outright with
+            # an internal 500 + Java stack instead of the polite restriction
+            # error - measured on 7.0-SNAPSHOT with EXTEND FORM ("NF
+            # COLLECTION RESTARTED") and '() + {' action overrides
+            # (ClassCastException). Says nothing about the file's validity.
+            if ($body -match 'RemoteInternalException|Internal Server Error:\s*java\.') {
+                $skipCount++
+                $first = "$(@($body -split "`r?`n" | Where-Object { $_.Trim() })[0])".Trim()
+                if ($first.Length -gt 160) { $first = $first.Substring(0, 160) + " ..." }
+                Warn "$leaf - cannot lint: eval's compiler crashed on a construct it does not support (typically EXTEND FORM or a '() + { }' override of an existing action). Only a restart checks this file."
+                Info "    ($first)"
+                continue
+            }
+            # Strip the "[error]:" preambles and the "Subsequent errors" note;
+            # rebrand eval's throwaway module name (UNIQUEnNSNAME) to the file
+            # so positions read naturally. Line:col match the original file -
+            # Strip-ModuleHeader blanks headers in place instead of removing.
+            $meat = @($body -split "`r?`n" | Where-Object { $_.Trim() } |
+                Where-Object { $_ -notmatch '^\s*\[error\]:\s*$' -and $_ -notmatch '^Subsequent errors' } |
+                ForEach-Object { ($_ -replace 'UNIQUE\d+NSNAME', ($leaf -replace '\.lsf$', '')).Trim() })
+            $evalOnly = @($meat | Where-Object { $_ -match 'cannot be used in EVAL module' })
+            if ($meat.Count -and ($evalOnly.Count -eq $meat.Count)) {
+                # Load-only construct (CLASS, persistent DATA options, WHEN,
+                # CONSTRAINT...). The restriction fires BEFORE name resolution
+                # (measured: a name error on line 1 goes unreported when a
+                # CLASS sits on line 2), so this outcome proves the syntax of
+                # the whole file and nothing about its names.
+                $where = if ($evalOnly[0] -match ':(\d+):\d+') { " at line $($Matches[1])" } else { "" }
+                Ok "$leaf - syntax OK (whole file). Names NOT checked: a load-only construct$where stops eval before name resolution - names in this file surface only on restart."
+            } else {
+                # A not-found on a name that another file of THIS selection
+                # declares is a cross-file reference eval cannot see, not a
+                # real error - inconclusive, the restart is the actual check.
+                $crossRefs = @()
+                foreach ($line in $meat) {
+                    # Any not-found kind counts: the server words them as
+                    # "property or action 'x[...]' is not found", "class 'X'
+                    # is not found", etc. - capture the bare identifier.
+                    if ($line -cmatch "'([A-Za-z_][A-Za-z0-9_]*)[^']*' is not found") {
+                        $nm = $Matches[1]
+                        if ($declaredHere.ContainsKey($nm)) {
+                            $others = @($declaredHere[$nm] | Where-Object { $_ -ne $t })
+                            if ($others.Count) {
+                                $names = @($others | ForEach-Object { Split-Path $_ -Leaf } | Select-Object -Unique)
+                                $crossRefs += "$nm (declared in $($names -join ', '))"
+                            }
+                        }
+                    }
+                }
+                if ($crossRefs.Count) {
+                    $skipCount++
+                    Warn "$leaf - inconclusive: uses $($crossRefs -join ', ') - eval checks files one at a time, so a name declared in another file of this same selection cannot resolve here. Cross-file references are checked by the restart."
+                } else {
+                    $failCount++
+                    Bad "$leaf - FAIL:"
+                    $meat | ForEach-Object { Write-Host "    $_" }
+                    if (@($meat | Where-Object { $_ -cmatch "'(MODULE|REQUIRE|NAMESPACE|PRIORITY)'" }).Count) {
+                        Info "    (a malformed or duplicated MODULE/REQUIRE/NAMESPACE/PRIORITY header was deliberately left in the text - headers are stripped only when well-formed and unique; fix the header itself, e.g. its terminating ';')"
+                    }
+                }
+            }
+        }
+    }
+    Write-Host ""
+    if ($failCount) {
+        Bad "$failCount of $($targets.Count) file(s) failed the pre-check."
+        Info "Name errors surface ONE per call (parse errors come all at once) - fix, re-run precheck until clean, THEN restart."
+        exit 1
+    } elseif ($skipCount) {
+        Warn "$skipCount of $($targets.Count) file(s) skipped (reasons above), the rest pass - the restart is the only check for the skipped ones."
+    } else {
+        Ok "All $($targets.Count) file(s) pass. This proves syntax (+ names where eval reached them) - the schema itself still loads on restart."
+    }
 }
 
 function Cmd-Api {
@@ -2015,13 +2471,9 @@ function Cmd-Api {
     # configured (admin password rotated, or a real account set up).
     # An explicitly-passed -AdminUser/-AdminPassword on the 'api' call
     # overrides whatever setup stored in config.json.
-    $apiUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
-    $apiPass = if ($ScriptBound.ContainsKey("AdminPassword")) { $AdminPassword } else { $cfg.adminPassword }
-    $headers = @{}
-    if ($apiPass) {
-        $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($apiUser):$($apiPass)"))
-        $headers["Authorization"] = "Basic $auth"
-        Info "Authenticating as '$apiUser' (password configured)."
+    $headers = Get-EvalAuthHeaders $cfg
+    if ($headers.Count) {
+        Info "Authenticating with Basic auth (password configured)."
     } else {
         Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent (the form that works on every platform build)."
     }
@@ -2031,8 +2483,14 @@ function Cmd-Api {
     # 7.0-SNAPSHOT decodes a POST form body as UTF-8 too, but 6.x-era builds
     # used the platform default charset there and corrupted non-ASCII to '?' -
     # the query parameter is the channel that behaves the same everywhere.)
-    $enc = [uri]::EscapeDataString($scriptText)
-    $uri = "http://localhost:$($cfg.httpPort)/eval/action?script=$enc"
+    # Exception: System.Uri and the server's request line cap out around
+    # 64 KB, so an oversized ENCODED script falls back to a UTF-8 form body -
+    # on a 6.x-era build a giant non-ASCII script may then land mangled, but
+    # the query channel would not carry it at all.
+    $enc = ConvertTo-EscapedData $scriptText
+    $useBody = ($enc.Length -gt 60000)
+    $uri = if ($useBody) { "http://localhost:$($cfg.httpPort)/eval/action" }
+           else { "http://localhost:$($cfg.httpPort)/eval/action?script=$enc" }
     # Do NOT echo the encoded URI: EscapeDataString turns every non-ASCII char
     # into %XX%XX (a Cyrillic seed script inflates ~9x into kilobytes of %D0..
     # noise in the transcript). Print the endpoint, the source, and a short
@@ -2052,8 +2510,14 @@ function Cmd-Api {
     if (Test-Path $ServerOut) { $logLenBefore = (Get-Item $ServerOut).Length }
 
     try {
-        $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
-            -UseBasicParsing -TimeoutSec 30
+        if ($useBody) {
+            $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
+                -ContentType "application/x-www-form-urlencoded; charset=UTF-8" `
+                -Body ([Text.Encoding]::UTF8.GetBytes("script=$enc")) -UseBasicParsing -TimeoutSec 60
+        } else {
+            $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
+                -UseBasicParsing -TimeoutSec 30
+        }
         Ok "HTTP $($resp.StatusCode)"
         # Decode the response body explicitly as UTF-8 so non-ASCII output
         # (e.g. EXPORT FROM with Cyrillic values) prints correctly.
@@ -2080,22 +2544,9 @@ function Cmd-Api {
         $statusTag = ""
         if ($errResp) { try { $statusTag = " (HTTP $([int]$errResp.StatusCode))" } catch { } }
         Bad "API call failed$($statusTag): $($_.Exception.Message)"
-        # Print the error response body - for a 500 it carries the actual
-        # parse/type error from the server, which is the whole diagnosis.
-        # PS 5.1: the cmdlet usually stashes the body in ErrorDetails; the
-        # raw stream is a fallback (rewind it - the cmdlet may have read it).
-        $errBody = $null
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
-        elseif ($errResp) {
-            try {
-                $stream = $errResp.GetResponseStream()
-                if ($stream -and $stream.CanSeek) { $stream.Position = 0 }
-                if ($stream) {
-                    $sr = New-Object IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-                    $errBody = $sr.ReadToEnd()
-                }
-            } catch { }
-        }
+        # The 500 body carries the actual parse/type error from the server -
+        # the whole diagnosis.
+        $errBody = Get-ErrorResponseBody $_
         if ($errBody) { Write-Host $errBody }
         else { Info "(the server sent no error body)" }
     }
@@ -2218,6 +2669,17 @@ lsfdev.ps1 - lsFusion development CLI
   open           Open the web UI in the default browser.
   api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
                  Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
+                 ACTION code only - to lint declarations use precheck.
+  precheck       Sub-second syntax + name check of .lsf files against the
+                 RUNNING dev server, before paying for a restart (which
+                 reports name errors one at a time). -Files 'a.lsf','b.lsf'
+                 (project-relative or absolute); default: every .lsf under
+                 src/main. Strips MODULE/REQUIRE headers, posts to /eval.
+                 Verdicts say what was proven: files with load-only
+                 constructs (CLASS/WHEN/...) get syntax-only coverage, and
+                 EXTEND FORM / '() + { }' files can't be linted at all.
+                 REQUIRE completeness is never checked (eval sees every
+                 loaded module) - a missing REQUIRE surfaces only at restart.
   versions       List lsFusion versions on download.lsfusion.org and aliases.
 
 Common options:
@@ -2321,6 +2783,15 @@ Common options:
   -Script <code>        Inline lsFusion action code for 'api' (ASCII-safe only).
   -ScriptFile <path>    UTF-8 file with lsFusion action code for 'api'. Preferred
                         for non-ASCII scripts (read from disk, never via argv).
+  -Files <p1>[,<p2>]    'precheck' only: .lsf files to lint (project-relative
+                        or absolute). Default: every .lsf under src/main.
+  PowerShell quoting    Wrap -Do/-Click/-Script values that contain double
+                        quotes, brackets or commas in SINGLE quotes:
+                        -Do 'click:[data-id="add"]'. Backslash-escaping
+                        (\") splits the argument apart, and a comma in the
+                        unquoted remainder aborts parsing ("Missing argument
+                        in parameter list"). Several -Do steps = ONE array
+                        argument: -Do 'step1','step2' (repeating -Do fails).
   -GitUrl <url>         Repository URL for 'clone'.
   -Target <dir>         Destination directory for 'clone' (default: subfolder named from the URL).
   -Branch <name>        Branch to check out for 'clone' (default: the repo's default branch).
@@ -2367,6 +2838,7 @@ try {
         "verify"       { Cmd-Verify }
         "open"         { Cmd-Open }
         "api"          { Cmd-Api }
+        "precheck"     { Cmd-Precheck }
         "versions"     { Cmd-Versions }
         default        { Cmd-Help }
     }
