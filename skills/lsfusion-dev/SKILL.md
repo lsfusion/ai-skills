@@ -192,7 +192,7 @@ a running `verify -Session` browser, or anything else that happened before.
 |---|---|
 | `check` | Detect Java, PostgreSQL, Python, git, and Maven; report versions and what is missing. |
 | `versions` | List the lsFusion versions on the download server and the alias mappings. |
-| `setup` | Fetch the server jar, client war, and Tomcat into `.lsfusion-dev/` (only what's missing / version-changed — see note); write config + `settings.properties`. Safe to re-run anytime. |
+| `setup` | Fetch the server jar, client war, and Tomcat into `.lsfusion-dev/` (only what's missing / version-changed, plus the war on `-RefreshWar` — see note); write config + `settings.properties`. Safe to re-run anytime. |
 | `start-server` | Start the application server, tail the log, and report a verdict (started / failed / inconclusive). |
 | `start-web` | Start Tomcat with the web client; wait until the UI responds. |
 | `start` | `start-server` then `start-web`. |
@@ -250,10 +250,12 @@ first-start invocation into routine restarts — recalibrate per call.
 
 **`setup` downloads are version-driven, not `-Force`-driven.** Re-running
 `setup` (with or without `-Force`) only fetches an artifact that is **missing**
-or whose **platform version changed**:
+or whose **platform version changed** — the single exception being the
+explicit `-RefreshWar` switch (war only, same version; see below):
 
 - **Server jar** and **client war** are versioned with the platform — refetched
-  on a fresh setup or a `-Version` bump, otherwise kept.
+  on a fresh setup or a `-Version` bump, otherwise kept (the war also on
+  `-RefreshWar`).
 - **Tomcat** is the servlet container, independent of the lsFusion version — a
   new client war runs on the existing Tomcat — so it's fetched **only when
   missing**, never on a war update. (To switch Tomcat builds, delete
@@ -483,8 +485,8 @@ what the download server currently publishes. Always run `lsfdev.ps1 versions`
 to see how `7`, `stable`, `dev`, major-number aliases, and concrete tags
 resolve right now, before locking in a non-default choice. To switch later,
 re-run setup with the new alias and `-Force`; the skill removes the stale
-server jar and clears the init marker so the next start does a full schema
-sync.
+server jar and clears the init marker so the next start is a full one (fresh
+stats and Reflection sync for the new platform's module set).
 
 ### 3. Write the `.lsf` code
 
@@ -670,8 +672,10 @@ erroring. That is the one debugging case where `-FullStart` IS the fix: after
 adding actions referenced by canonical name, run **one** `restart -FullStart`,
 then return to lightstart. Otherwise don't propose `-FullStart` as a debugging
 step — it's not a fix for "Property not found", schema drift, or compile
-errors. Lightstart is **forced OFF** only on the very first launch on a fresh
-DB and when `-FullStart` is passed. Detail and rationale: see
+errors. Lightstart is **forced OFF** when the init marker is absent or was
+auto-invalidated (first launch, platform version switch, the configured DB
+had to be re-created, `db.name` repointed) and when `-FullStart` is passed.
+Detail and rationale: see
 [references/runtime.md](references/runtime.md#lightstart).
 
 **Polling, not waiting.** A typical lightstart restart is 30 s – 1 min; a

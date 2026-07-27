@@ -534,10 +534,12 @@ function New-DbName([string]$projectDir) {
 }
 
 # True if $name can serve as a Tomcat war/context name: URL-path-safe chars
-# only, and not one of the stock Tomcat webapps (deploying manager.war over
-# the stock manager/ dir is undefined behavior).
+# only (lowercase - -cmatch, because PowerShell -match would wave through an
+# expert -DbName like 'Foo' that the docs promise falls back to ROOT), and
+# not one of the stock Tomcat webapps (deploying manager.war over the stock
+# manager/ dir is undefined behavior).
 function Test-ContextSafe([string]$name) {
-    return ($name -match '^[a-z][a-z0-9_]{0,29}$') -and ($name -notin @('root', 'docs', 'examples', 'manager'))
+    return ($name -cmatch '^[a-z][a-z0-9_]{0,29}$') -and ($name -notin @('root', 'docs', 'examples', 'manager'))
 }
 
 # The Tomcat context name for this project. db.name IS the app id, so the war
@@ -586,10 +588,14 @@ function Get-ZipBuildDate([string]$path) {
 # The server jar actually in use: the Maven-resolved platform server artifact
 # (from the cached dependency classpath) in a Maven project, else the
 # lsfusion-server-<ver>.jar that setup downloaded. $null when not resolvable
-# yet (e.g. Maven mode before the first start-server).
+# yet (e.g. Maven mode before the first start-server). The Maven branch is
+# gated on the SAME condition Cmd-StartServer uses to pick the launch mode
+# (pom.xml present AND mvn on PATH) - a leftover maven-classpath.txt from a
+# past Maven-mode run must not shadow the jar the fallback mode actually
+# launches.
 function Get-ResolvedServerJar($cfg) {
     $cpFile = Join-Path $StateDir "maven-classpath.txt"
-    if (Test-Path $cpFile) {
+    if ((Test-Path $cpFile) -and (Test-MavenProject $ProjectDir) -and (Find-Maven)) {
         try {
             foreach ($e in ((Get-Content $cpFile -Raw -Encoding UTF8).Trim() -split ';')) {
                 $e = $e.Trim()
@@ -614,14 +620,19 @@ function Get-ResolvedServerJar($cfg) {
 # does not break on every build, hence warn, not fail.
 function Test-WarServerBuildDrift($cfg) {
     $warPath = Join-Path $StateDir "tomcat\webapps\$(Get-AppContext $cfg).war"
+    $jarPath = Get-ResolvedServerJar $cfg
     $warDate = Get-ZipBuildDate $warPath
-    $jarDate = Get-ZipBuildDate (Get-ResolvedServerJar $cfg)
+    $jarDate = Get-ZipBuildDate $jarPath
     if (-not ($warDate -and $jarDate)) { return }
     if ([Math]::Abs(($jarDate - $warDate).TotalHours) -le 24) { return }
     Warn "Client war and server jar are from different platform builds: war built $($warDate.ToString('yyyy-MM-dd HH:mm')), server jar built $($jarDate.ToString('yyyy-MM-dd HH:mm'))."
     Warn "Mismatched $($cfg.version) builds can break RMI serialization - every form open then fails with 'invalid stream header'."
     if ($jarDate -gt $warDate) {
         Warn "The server is newer: refresh the war with 'setup -RefreshWar' (re-downloads lsfusion-client-$($cfg.version).war at the current build)."
+    } elseif ($jarPath -eq (Join-Path $StateDir "lsfusion-server-$($cfg.version).jar")) {
+        # The stale server jar is the skill's own download (non-Maven mode) -
+        # a mvn command would be useless here.
+        Warn "The war is newer: refresh the downloaded server jar - delete '$jarPath' and re-run setup (it refetches missing artifacts)."
     } else {
         Warn "The war is newer: update the Maven-resolved server to the current snapshot (mvn -U -DskipTests compile, then restart)."
     }
@@ -729,29 +740,83 @@ function Test-DbBinding($cfg, [int]$serverPid) {
 function Ensure-Database($cfg) {
     # native psql/createdb may write to stderr; keep redirects non-terminating.
     $ErrorActionPreference = 'SilentlyContinue'
+    # Freshness signal for Sync-InitMarker: $true when the database was NOT
+    # there and had to be (re)created - lightstart must not run against it
+    # (no Reflection rows, no stats). Stays $false when psql is unavailable
+    # or the pre-check failed (unknown is not evidence of freshness).
+    $script:DbKnownFresh = $false
     $psql = Find-Psql
     if (-not $psql) {
         Info "psql not found - lsFusion will attempt to create the database itself."
         return
     }
     $hp = Get-PgHostPort $cfg
+    # Probe THROUGH Invoke-PgQuery: it targets the maintenance DB (-d
+    # postgres - a bare psql would try a database named after db.user) and
+    # returns $null when psql itself failed (bad exit code / no connection).
+    # A broken probe must NOT look like a missing database: claiming
+    # freshness on it would clear the init marker and force a full start on
+    # every restart for as long as psql is unreachable.
+    $exists = Invoke-PgQuery $cfg "SELECT 1 FROM pg_database WHERE datname='$($cfg.dbName -replace "'", "''")'"
+    if ($null -eq $exists) {
+        Warn "Database pre-check skipped (psql probe failed) - lsFusion will attempt creation on startup."
+        return
+    }
+    if ("$exists".Trim() -eq "1") {
+        Info "Database '$($cfg.dbName)' already exists."
+        return
+    }
+    # A successful probe found no row: the DB is missing, so whatever ends up
+    # under this name is fresh either way - created here, or by lsFusion at
+    # startup after a failed createdb.
+    $script:DbKnownFresh = $true
     $old = $env:PGPASSWORD
     $env:PGPASSWORD = $cfg.dbPassword
     try {
-        $exists = (& $psql -U $cfg.dbUser -h $hp.Host -p $hp.Port -tAc "SELECT 1 FROM pg_database WHERE datname='$($cfg.dbName -replace "'", "''")'" 2>$null)
-        if ("$exists".Trim() -eq "1") {
-            Info "Database '$($cfg.dbName)' already exists."
-        } else {
-            $createdb = Join-Path (Split-Path $psql -Parent) "createdb.exe"
-            if (-not (Test-Path $createdb)) { $createdb = "createdb" }
-            & $createdb -U $cfg.dbUser -h $hp.Host -p $hp.Port $cfg.dbName 2>$null
-            if ($LASTEXITCODE -eq 0) { Ok "Created database '$($cfg.dbName)'." }
-            else { Warn "Could not create database (lsFusion will try on startup)." }
-        }
+        $createdb = Join-Path (Split-Path $psql -Parent) "createdb.exe"
+        if (-not (Test-Path $createdb)) { $createdb = "createdb" }
+        & $createdb -U $cfg.dbUser -h $hp.Host -p $hp.Port $cfg.dbName 2>$null
+        if ($LASTEXITCODE -eq 0) { Ok "Created database '$($cfg.dbName)'." }
+        else { Warn "Could not create database (lsFusion will try on startup)." }
     } catch {
-        Warn "Database pre-check skipped: $_"
+        Warn "Database creation attempt failed: $_"
     } finally {
         $env:PGPASSWORD = $old
+    }
+}
+
+# Lightstart must never run against a database the init marker does not
+# actually certify. The marker's CONTENT is the db.name it was written for
+# (empty on legacy installs). Clear it - forcing the next start to be a full
+# one - when the database was just found missing and (re)created (external
+# drop, wiped cluster), or when db.name now points at a different database
+# than the marker certifies. Call right after Ensure-Database. Residual gap:
+# a database dropped AND re-created externally between runs (never observed
+# missing by us) keeps the marker - the flag cannot see that; use
+# 'restart -FullStart' after restoring a database by hand.
+function Sync-InitMarker($cfg) {
+    $marker = Join-Path $StateDir "server-initialized.flag"
+    if (-not (Test-Path $marker)) { return }
+    $reason = $null
+    if ($script:DbKnownFresh) {
+        $reason = "database '$($cfg.dbName)' had to be created"
+    } else {
+        # ReadAllText mirrors the WriteAllText below (UTF-8, BOM tolerated),
+        # where PS 5.1 Get-Content would decode a BOM-less file as ANSI and
+        # mangle a non-ASCII db.name into a perpetual false repoint. -cne
+        # because PostgreSQL database names are case-sensitive. An EMPTY
+        # marker (legacy installs, or unreadable) is adopted as matching on
+        # purpose: it was fully trusted before content existed, and failing
+        # it would surprise every existing install with a full start.
+        $initializedFor = ""
+        try { $initializedFor = ("" + [IO.File]::ReadAllText($marker)).Trim().TrimStart([char]0xFEFF) } catch { }
+        if ($initializedFor -and ($initializedFor -cne "$($cfg.dbName)")) {
+            $reason = "db.name repointed ('$initializedFor' -> '$($cfg.dbName)')"
+        }
+    }
+    if ($reason) {
+        Remove-Item $marker -Force -ErrorAction SilentlyContinue
+        Info "Init marker cleared ($reason) - next start will be a full one (initial schema, stats and Reflection sync)."
     }
 }
 
@@ -1127,14 +1192,14 @@ function Cmd-Setup {
     Test-PortPreflight $preflight | Out-Null
 
     # When the platform version changes, drop the init marker so the next
-    # start does a full schema sync (major versions diverge enough that light
-    # start would be unsafe), and clear out any stale server jar to save disk.
+    # start is a full one (fresh stats recalculation and Reflection sync for
+    # the new platform's module set), and clear stale server jars to save disk.
     $platformVersionChanged = ($existing -and $existing.version -and ($existing.version -ne $cfg.version))
     if ($platformVersionChanged) {
         $marker = Join-Path $StateDir "server-initialized.flag"
         if (Test-Path $marker) {
             Remove-Item $marker -Force -ErrorAction SilentlyContinue
-            Info "Version changed ($($existing.version) -> $($cfg.version)) - next start will be a full schema sync."
+            Info "Version changed ($($existing.version) -> $($cfg.version)) - next start will be a full one (fresh stats + Reflection sync)."
         }
     }
     Get-ChildItem $StateDir -Filter "lsfusion-server-*.jar" -ErrorAction SilentlyContinue |
@@ -1244,9 +1309,20 @@ function Cmd-Setup {
             $staleWars = @(Get-ChildItem $webapps -Filter *.war -File -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -ne $warName })
         }
+        $deferredStaleWars = @()
         foreach ($sw in $staleWars) {
             $oldCtx = [IO.Path]::GetFileNameWithoutExtension($sw.Name)
-            if ((-not $platformVersionChanged) -and (-not $RefreshWar) -and (-not (Test-Path $warPath))) {
+            # Under a pure -RefreshWar the old-name war is the only deployable
+            # copy until the refresh download has SUCCEEDED - a rename/AppId
+            # switch combined with -RefreshWar must not consume it up front
+            # (a failed download would leave the old context's settings
+            # pointing at a war that no longer exists under that name). Defer
+            # the cleanup to just after the successful deploy below.
+            if ($RefreshWar -and (-not $platformVersionChanged)) {
+                $deferredStaleWars += $sw
+                continue
+            }
+            if ((-not $platformVersionChanged) -and (-not (Test-Path $warPath))) {
                 Move-Item $sw.FullName $warPath -Force
                 Info "Redeployed $($sw.Name) as $warName (same war, new web context $ctxDisplay)."
             } else {
@@ -1266,10 +1342,19 @@ function Cmd-Setup {
             Remove-Item $warPath -Force -ErrorAction SilentlyContinue
             Move-Item $warTmp $warPath -Force
             Ok "Web client war deployed as $warName - web context $ctxDisplay (lsFusion $($cfg.version))."
+            # The refresh succeeded - now the deferred stale deployments are
+            # safe to drop (see the -RefreshWar deferral above).
+            foreach ($sw in $deferredStaleWars) {
+                $oldCtx = [IO.Path]::GetFileNameWithoutExtension($sw.Name)
+                Remove-Item $sw.FullName -Force -ErrorAction SilentlyContinue
+                Remove-Item (Join-Path $webapps $oldCtx) -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item (Join-Path $tomcatHome "conf\Catalina\localhost\$oldCtx.xml") -Force -ErrorAction SilentlyContinue
+            }
             # Immediate verdict on -SNAPSHOT build drift (silent when aligned or
             # when the server jar is not resolvable yet - Maven mode before the
             # first start-server). A -RefreshWar that still warns here means the
-            # SERVER side is the stale one (mvn -U).
+            # SERVER side is the stale one; the warning names the remedy for
+            # the jar's actual source (mvn -U vs delete + re-setup).
             Test-WarServerBuildDrift $cfg
         } else {
             Ok "Web client war up to date ($warName, web context $ctxDisplay, lsFusion $($cfg.version)) - not re-downloading."
@@ -1433,6 +1518,7 @@ $portLines$topLine
     }
 
     Ensure-Database $cfg
+    Sync-InitMarker $cfg
     Write-Host ""
     if ($NoWeb) {
         Ok "App id / database '$($cfg.dbName)' (no web client: -NoWeb)."
@@ -1469,6 +1555,7 @@ function Cmd-StartServer {
 
     Stop-Tracked $ServerPid @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort) "Previous application server"
     Ensure-Database $cfg
+    Sync-InitMarker $cfg
 
     # settings.properties can live at the project root (scaffolded / non-Maven
     # projects) OR in conf/ (Maven projects, where the JVM reads conf/settings.properties
@@ -1611,9 +1698,13 @@ function Cmd-StartServer {
     }
 
     # Development JVM options. devmode is always on for local development.
-    # lightstart makes restarts much faster but is unsafe on the first launch
-    # and after data-model changes (the DB schema must be fully synced), so it
-    # is skipped on the first launch and whenever -FullStart is passed.
+    # lightstart makes restarts much faster; schema sync and business logic
+    # still run under it. What it skips is the Reflection metadata sync and
+    # the user-side prefs reload (runtime.md#lightstart), so it is dropped on
+    # the first launch (fresh DB gets the full initial sync in one go) and
+    # whenever -FullStart is passed (the fix when actions referenced by
+    # canonical name - scheduler tasks etc. - were added since the last full
+    # start).
     $initMarker = Join-Path $StateDir "server-initialized.flag"
     $firstStart = -not (Test-Path $initMarker)
     $lightStart = (-not $firstStart) -and (-not $FullStart)
@@ -1632,7 +1723,7 @@ function Cmd-StartServer {
         Info "Dev mode ON, light start ON (fast restart)."
     } else {
         $reason = if ($firstStart) { "first launch" } else { "-FullStart requested" }
-        Info "Dev mode ON, light start OFF ($reason - full schema sync)."
+        Info "Dev mode ON, light start OFF ($reason - full start incl. Reflection/prefs sync)."
     }
     # db.* ALSO go on the command line as -D system properties, mirroring the
     # values just resolved from settings.properties. The file stays the source
@@ -1700,7 +1791,6 @@ function Cmd-StartServer {
     $tailOut = Tail-Text (Read-FileText $ServerOut) $Lines
     $tailErr = Tail-Text (Read-FileText $ServerErr) 30
     if ($verdict -eq "started") {
-        New-Item -ItemType File -Force -Path $initMarker | Out-Null
         Ok "Application server started (RMI $($cfg.rmiPort), Action API $($cfg.httpPort), WebSocket $($cfg.webSocketPort))."
         # Trust, but verify: confirm which database this JVM is REALLY on.
         # settings.properties and the -Ddb.* launch args should make a mismatch
@@ -1714,6 +1804,16 @@ function Cmd-StartServer {
                 Info "Anything written now lands in the wrong database. Stop the server, inspect conf/settings.properties (encoding / first line - see runtime.md, 'silently ignores db.name') and the -Ddb.name in .lsfusion-dev/launch-cmd.txt, then restart."
             }
             default   { Info "(actual DB binding not verified: $($bind.detail). The -Ddb.name launch argument still pins the name at the strongest resolution layer.)" }
+        }
+        # Certify initialization ONLY when the run did not provably land on a
+        # wrong database: on a mismatch the configured DB got no sync at all,
+        # so writing "$($cfg.dbName)" would make the NEXT (corrected) start a
+        # light one against an uninitialized database. An existing marker is
+        # left untouched - a mismatch run changes nothing about what an
+        # earlier run initialized. Content = the db.name this install
+        # initialized; Sync-InitMarker compares it (BOM-less on purpose).
+        if ($bind.state -ne 'mismatch') {
+            [IO.File]::WriteAllText($initMarker, "$($cfg.dbName)")
         }
     } elseif ($verdict -eq "failed") {
         Bad "Application server process exited during startup. Last log lines:"
@@ -2882,11 +2982,13 @@ Common options:
                         NOT re-download binaries - downloads are version-driven);
                         clone: allow a non-empty target dir.
   -NoWeb                Skip the web client (server + Action API only).
-  -FullStart            Disable light start (full schema sync) for this run.
-                        Also the fix when code added since the last full start
-                        must be visible in the Reflection tables (scheduler
-                        tasks pick actions via actionCanonicalName) - one full
-                        restart, then back to light starts.
+  -FullStart            Disable light start for this run (a full start also
+                        re-syncs the Reflection tables and user-side prefs;
+                        schema sync runs either way). The fix when code added
+                        since the last full start must be visible in the
+                        Reflection tables (scheduler tasks pick actions via
+                        actionCanonicalName) - one full restart, then back to
+                        light starts.
   -RefreshWar           setup only: re-download the client war at the SAME
                         version (current -SNAPSHOT build). The fix when the war
                         and the server jar drift apart across snapshot builds

@@ -101,8 +101,9 @@ back") fits `/eval/action` — you write one line of action code that sends
 the answer back in the response body, the server runs it, you read the
 value (the status code alone only proves the script compiled). **The
 value-returning statement depends on the platform major version**: `RETURN
-<expr>;` exists on **7.0+ only** — on 6.x (including the current `stable` =
-6.2 that the lsfusion-dev skill installs by default) it is a **parse
+<expr>;` exists on **7.0+ only** — on 6.x (what the `stable` alias currently
+resolves to; the lsfusion-dev no-flag default is the `7` alias, with a Maven
+project's pom version winning over it) it is a **parse
 error** (`extraneous input ... expecting ';'`); the 6.x equivalent is
 `EXPORT FROM res = <expr>;`, which works on every version. Check the
 target's version first (`Current version:` in the server log) and pick the

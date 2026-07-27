@@ -20,7 +20,10 @@ configuration, or when you need to change ports/versions.
     ├── server.out.log / server.err.log
     ├── tomcat.out.log
     ├── server.pid / tomcat.pid
-    ├── server-initialized.flag   marker; light start is used once it exists
+    ├── server-initialized.flag   marker (content: the db.name it certifies);
+    │                             light start is used once it exists. Cleared
+    │                             on version switch, when the DB had to be
+    │                             (re)created, or when db.name is repointed
     ├── verify_playwright.py      helper re-copied from the skill on each verify
     │                             (plugin skill dirs aren't visible to python.exe)
     ├── verify-login.png          Playwright screenshot of the login page
@@ -155,20 +158,28 @@ production deploy keeps the defaults (`true`) so destructive schema
 changes need an explicit override in its own `settings.properties`.
 
 `-Dlsfusion.server.lightstart=true` skips parts of startup for a much faster
-restart, but it must not be used until the database schema is fully built and
-in sync. The skill enables light start by default and drops it only:
+restart. Schema sync and business logic are **not** among the skipped parts —
+a light start still syncs the database structure; what it skips is the
+Reflection metadata sync and user-side prefs reload (see
+[Lightstart](#lightstart)). The skill enables light start by default and
+drops it only:
 
 - on the **first launch** — detected via the `.lsfusion-dev/server-initialized.flag`
-  marker, which is created after the first successful start; and
-- when **`-FullStart`** is passed — use this after significant data-model
-  changes (new or removed classes, changed property types, anything affecting
-  the database structure): `lsfdev.ps1 restart -FullStart`.
+  marker, which is created after the first successful start (a fresh DB gets
+  its initial schema, stats and Reflection rows in one full pass). The marker
+  certifies a specific database: it is cleared automatically on a platform
+  version switch, when the configured database was found **missing** and had
+  to be (re)created, or when `db.name` is repointed at a different database —
+  each of those makes the next start a full one. (A database dropped and
+  re-created *externally* between runs — never observed missing by the
+  skill — is the one case the marker can't see: run `restart -FullStart`
+  after restoring a DB by hand.) And
+- when **`-FullStart`** is passed: `lsfdev.ps1 restart -FullStart`.
 
-If a light-start restart behaves oddly after a data-model change, redo it with
-`-FullStart` to force a full schema sync. One `-FullStart` is also **required**
-after adding actions/properties that are referenced **by canonical name**
-(scheduler tasks, `actionCanonicalName()`) — lightstart skips the Reflection
-sync those lookups read from; see [Lightstart](#lightstart).
+One `-FullStart` is **required** after adding actions/properties that are
+referenced **by canonical name** (scheduler tasks, `actionCanonicalName()`) —
+lightstart skips the Reflection sync those lookups read from; see
+[Lightstart](#lightstart).
 
 **Web server** (`start-web`): Tomcat is started by invoking its
 `org.apache.catalina.startup.Bootstrap` directly (so the skill owns the PID).
@@ -209,8 +220,14 @@ Extra **JVM flags** are not settings.properties keys — pass them once via
 and are appended after the built-in defaults on every start, so a user
 `-Xmx` overrides the default `-Xmx2g`.
 
-To change ports, edit both `settings.properties` and
-`.lsfusion-dev/config.json` so the skill and the server agree.
+To change ports: `stop` first, then re-run `setup` with the port flags
+(`-RmiPort` / `-HttpPort` / `-WebSocketPort` / `-WebPort` / `-ShutdownPort`)
+— setup rewrites `settings.properties` **and** Tomcat's `server.xml`
+together. The app-server ports (`rmi.port` / `http.port` / `webSocket.port`)
+can alternatively be hand-edited in `conf/settings.properties` (the server
+reads that file natively; `config.json` is only a cache) — but the web and
+shutdown ports live in Tomcat's `server.xml`, which only `setup` rewrites,
+so hand-editing settings alone cannot move them.
 
 ## Java versions
 
@@ -231,10 +248,10 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | `error parsing`, `syntax error`, `expecting ...` | An `.lsf` syntax error. Read the file/line in the message, fix it with `lsfusion_retrieve_docs`, then `restart`. |
 | `module ... not found` | A `REQUIRE`d module name is wrong or missing. Check module names. |
 | `InaccessibleObjectException` / `module does not "opens"` | JDK module access. The skill already adds common `--add-opens`; add the exact failing one to the `Add-Opens` function in `lsfdev.ps1`, or use JDK 11. |
-| `Address already in use` / port `7652`/`8080` busy | Another process holds the port. `lsfdev.ps1 stop`, or change the port in config + settings. |
+| `Address already in use` / port `7652`/`8080` busy | Another process holds the port. `lsfdev.ps1 stop`; if the port is held by a foreign process, `setup -RmiPort <free>` / `-WebPort <free>` (setup rewrites `settings.properties` and Tomcat's `server.xml` together), then `start`. |
 | `BindException` from `WebSocketServer` in stderr, server otherwise starts | Another instance holds `webSocket.port` (default `8887`). Non-fatal but WebSocket features silently break — set a per-instance `webSocket.port` (`setup -WebSocketPort <free> -Force`) and restart. |
 | Web UI loads but shows a connection error | The application server is not running or not on `7652`. Check `lsfdev.ps1 status` and the server log. |
-| **Every** form open fails with `invalid stream header` (or `StreamCorruptedException` / `InvalidClassException`), web UI otherwise loads | The client war and the server jar come from **different builds** of the same `-SNAPSHOT` version — RMI serialization mismatch. Typical in Maven projects: Maven updated the server snapshot, the war stayed from an older `setup`. `status` / `start-web` print both build dates and which side is stale. Fix: `setup -RefreshWar` (server newer) or `mvn -U -DskipTests compile` + `restart` (war newer). |
+| **Every** form open fails with `invalid stream header` (or `StreamCorruptedException` / `InvalidClassException`), web UI otherwise loads | The client war and the server jar come from **different builds** of the same `-SNAPSHOT` version — RMI serialization mismatch. Typical in Maven projects: Maven updated the server snapshot, the war stayed from an older `setup`. `status` / `start-web` print both build dates and the remedy for the stale side: server newer → `setup -RefreshWar`; war newer → `mvn -U -DskipTests compile` + `restart` (Maven-resolved server), or delete `.lsfusion-dev/lsfusion-server-<ver>.jar` and re-run `setup` (skill-downloaded server). |
 | Scheduler task saved with an **empty action**; `actionCanonicalName('My.action[]')` returns NULL for an action that exists in code | Lightstart skipped the Reflection sync, so actions added since the last full start have no `Reflection.Action` row — the lookup silently returns NULL. Run **one** `restart -FullStart`, then re-create/re-pick the action (see [Lightstart](#lightstart)). |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
@@ -244,21 +261,22 @@ access, installing JDK 11 or 17 is the most reliable fix.
 
 `setup -Version` accepts:
 
-- **`stable`** / **`latest`** (the default) — the highest non-SNAPSHOT,
-  non-beta release.
+- **`stable`** / **`latest`** — the highest non-SNAPSHOT, non-beta release.
 - **`dev`** / **`snapshot`** — the latest SNAPSHOT release.
 - A **major-number alias** (e.g. `6`, `7`) — the latest release in that
-  major line. What that resolves to depends on what the download server
-  currently has; major lines can be stable or SNAPSHOT-only.
+  major line; **`7` is the default** when no `-Version` is passed (in a
+  Maven project the pom's platform version wins over the default instead).
+  What an alias resolves to depends on what the download server currently
+  has; major lines can be stable or SNAPSHOT-only.
 - An **exact tag** (e.g. `6.2`, `7.0-SNAPSHOT`) — used verbatim.
 
 `lsfdev.ps1 versions` queries <https://download.lsfusion.org/java/> and prints
 what is actually available right now together with how each alias resolves.
 
 When you switch versions, `setup` removes the previous server jar, clears the
-`server-initialized.flag` so the next start does a full schema sync (schema
-between majors differs enough that light start is unsafe), and stores the
-resolved tag back into `config.json`. The war is re-downloaded by the version
+`server-initialized.flag` so the next start is a **full** one (fresh stats
+recalculation and a Reflection sync for the new platform's module set), and
+stores the resolved tag back into `config.json`. The war is re-downloaded by the version
 switch itself (it is versioned with the platform — no `-Force` involved);
 Tomcat is version-independent and is kept (delete `.lsfusion-dev/tomcat` to
 force a reinstall). To re-fetch the war at the **same** `-SNAPSHOT` version
@@ -273,8 +291,9 @@ the current latest.
 ## Lightstart {#lightstart}
 
 Devmode adds `-Dlsfusion.server.lightstart=true` to the JVM args. With it on,
-a typical restart finishes in **30 s – 1 min**; without it (`-FullStart` or
-the very first launch on a fresh DB), the platform re-syncs the whole logic
+a typical restart finishes in **30 s – 1 min**; without it (the init marker
+absent or invalidated — first launch, version switch, re-created DB, `db.name`
+repoint — or an explicit `-FullStart`), the platform re-syncs the whole logic
 graph into the database, which can finish quickly with healthy stats but can
 also drag on for several minutes if a query plan goes sideways.
 
@@ -315,11 +334,13 @@ schema changes (a new `DATA` property, a new class). lsFusion handles these
 incrementally with lightstart on, and the logic on the server is identical
 to what a full start would load.
 
-**When lightstart is forced OFF.** Two cases only: (1) the very first launch
-on a fresh DB — no prior state to be incremental from; (2) the user
-explicitly passes `-FullStart`. The skill does not silently decide for you
-that a change is "significant enough" to require `-FullStart`; that call
-belongs to the user.
+**When lightstart is forced OFF.** When the init marker is absent or was
+invalidated — first launch on a fresh DB, a platform version switch, the
+configured database found missing and re-created, a `db.name` repoint — and
+when the user explicitly passes
+`-FullStart`. Beyond those automatic cases the skill does not silently decide
+for you that a change is "significant enough" to require `-FullStart`; that
+call belongs to the user.
 
 **Don't propose `-FullStart` as a debugging step** for logic / schema /
 startup problems. Not a fix for "Property not found", schema drift, count
