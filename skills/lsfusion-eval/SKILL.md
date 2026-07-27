@@ -366,7 +366,10 @@ that reports a single name error.)
 `MESSAGE` is useless over the Action API: its text is swallowed entirely —
 not in the response body, and (for a plain `MESSAGE`) not even in the server
 log; only `MESSAGE ... NOWAIT` leaves a `Server message:` line in the log.
-Don't put `MESSAGE` in API scripts at all. Two ways to actually read a value:
+Without `NOWAIT` the text is visible **nowhere at all** — no log-tailing
+trick (including `lsfdev.ps1 api`'s own `Server message:` capture) can
+recover it. Don't put `MESSAGE` in API scripts at all. Two ways to actually
+read a value:
 
 **1. `RETURN <expr>;` (platform 7.0+ only) — the action's return value
 becomes the response body.** Simplest path for a scalar (a count, a name, a

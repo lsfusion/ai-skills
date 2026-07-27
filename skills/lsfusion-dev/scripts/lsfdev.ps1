@@ -54,7 +54,8 @@ param(
     [string]$Branch = "",
     [switch]$Force,
     [switch]$NoWeb,
-    [switch]$FullStart
+    [switch]$FullStart,
+    [switch]$RefreshWar
 )
 
 $ErrorActionPreference = "Stop"
@@ -558,6 +559,72 @@ function Get-WebUrl($cfg) {
     $ctx = Get-AppContext $cfg
     if ($ctx -eq "ROOT") { return "http://localhost:$($cfg.webPort)/" }
     return "http://localhost:$($cfg.webPort)/$ctx/"
+}
+
+# --- war <-> server build drift (SNAPSHOT versions) --------------------------
+# Neither artifact carries a version stamp in its manifest, but the zip entry
+# timestamps preserve the BUILD time - comparable across the two delivery
+# channels (the war downloaded from download.lsfusion.org, the server jar
+# resolved by Maven into the local repository or downloaded by setup).
+# Returns the newest entry's timestamp, or $null when absent/unreadable.
+function Get-ZipBuildDate([string]$path) {
+    if (-not ($path -and (Test-Path $path))) { return $null }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
+        try {
+            $max = $null
+            foreach ($e in $zip.Entries) {
+                $t = $e.LastWriteTime.DateTime
+                if ((-not $max) -or ($t -gt $max)) { $max = $t }
+            }
+            return $max
+        } finally { $zip.Dispose() }
+    } catch { return $null }
+}
+
+# The server jar actually in use: the Maven-resolved platform server artifact
+# (from the cached dependency classpath) in a Maven project, else the
+# lsfusion-server-<ver>.jar that setup downloaded. $null when not resolvable
+# yet (e.g. Maven mode before the first start-server).
+function Get-ResolvedServerJar($cfg) {
+    $cpFile = Join-Path $StateDir "maven-classpath.txt"
+    if (Test-Path $cpFile) {
+        try {
+            foreach ($e in ((Get-Content $cpFile -Raw -Encoding UTF8).Trim() -split ';')) {
+                $e = $e.Trim()
+                if ($e -match '[\\/]lsfusion[\\/]platform[\\/]server[\\/].*\.jar$' -and (Test-Path $e)) { return $e }
+            }
+        } catch { }
+    }
+    $jar = Join-Path $StateDir "lsfusion-server-$($cfg.version).jar"
+    if (Test-Path $jar) { return $jar }
+    return $null
+}
+
+# Warn when the deployed client war and the server jar come from different
+# platform builds. The web client talks RMI to the app server with plain Java
+# serialization, so mismatched builds of the same -SNAPSHOT version can fail
+# on EVERY form open with "invalid stream header" (StreamCorruptedException /
+# InvalidClassException). This drifts naturally in Maven projects: Maven
+# re-resolves the -SNAPSHOT server over time (pom change, -U, snapshot update
+# policy, a local platform build), while the war - downloaded by the skill,
+# not Maven - stays whatever setup fetched. Same-build war+jar carry entry
+# stamps minutes apart; >24 h apart means different builds. Serialization
+# does not break on every build, hence warn, not fail.
+function Test-WarServerBuildDrift($cfg) {
+    $warPath = Join-Path $StateDir "tomcat\webapps\$(Get-AppContext $cfg).war"
+    $warDate = Get-ZipBuildDate $warPath
+    $jarDate = Get-ZipBuildDate (Get-ResolvedServerJar $cfg)
+    if (-not ($warDate -and $jarDate)) { return }
+    if ([Math]::Abs(($jarDate - $warDate).TotalHours) -le 24) { return }
+    Warn "Client war and server jar are from different platform builds: war built $($warDate.ToString('yyyy-MM-dd HH:mm')), server jar built $($jarDate.ToString('yyyy-MM-dd HH:mm'))."
+    Warn "Mismatched $($cfg.version) builds can break RMI serialization - every form open then fails with 'invalid stream header'."
+    if ($jarDate -gt $warDate) {
+        Warn "The server is newer: refresh the war with 'setup -RefreshWar' (re-downloads lsfusion-client-$($cfg.version).war at the current build)."
+    } else {
+        Warn "The war is newer: update the Maven-resolved server to the current snapshot (mvn -U -DskipTests compile, then restart)."
+    }
 }
 
 # psql is the skill's window into "which database is REALLY in use". It is
@@ -1123,7 +1190,11 @@ function Cmd-Setup {
         #    different Tomcat build, delete .lsfusion-dev/tomcat and re-run setup.
         #  - the client war IS versioned with the platform, so we refetch it only
         #    when the platform version changed or the war is absent (a rename
-        #    from a previous deployment name counts as present - see below).
+        #    from a previous deployment name counts as present - see below), or
+        #    when -RefreshWar explicitly asks for the current build of the SAME
+        #    version: the escape hatch for -SNAPSHOT war<->server build drift
+        #    (Maven updates the server, the war stays - see
+        #    Test-WarServerBuildDrift).
         $needTomcat = -not (Test-Path (Join-Path $tomcatHome "bin\bootstrap.jar"))
         # Any *.war in webapps under another name is a previous lsfdev
         # deployment (stock Tomcat ships only exploded dirs, never wars): an
@@ -1138,7 +1209,7 @@ function Cmd-Setup {
         # is running fails ("bootstrap.jar is used by another process", or the
         # locked exploded directory). Stop a running Tomcat first whenever we
         # are about to touch any of them.
-        if ($needTomcat -or $staleWarsPre -or (-not (Test-Path $warPath)) -or $platformVersionChanged) {
+        if ($needTomcat -or $staleWarsPre -or (-not (Test-Path $warPath)) -or $platformVersionChanged -or $RefreshWar) {
             Stop-Tracked $TomcatPid @($cfg.webPort) "Running Tomcat (stopping before update)"
         }
 
@@ -1175,7 +1246,7 @@ function Cmd-Setup {
         }
         foreach ($sw in $staleWars) {
             $oldCtx = [IO.Path]::GetFileNameWithoutExtension($sw.Name)
-            if ((-not $platformVersionChanged) -and (-not (Test-Path $warPath))) {
+            if ((-not $platformVersionChanged) -and (-not $RefreshWar) -and (-not (Test-Path $warPath))) {
                 Move-Item $sw.FullName $warPath -Force
                 Info "Redeployed $($sw.Name) as $warName (same war, new web context $ctxDisplay)."
             } else {
@@ -1184,7 +1255,7 @@ function Cmd-Setup {
             Remove-Item (Join-Path $webapps $oldCtx) -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item (Join-Path $tomcatHome "conf\Catalina\localhost\$oldCtx.xml") -Force -ErrorAction SilentlyContinue
         }
-        $needWar = (-not (Test-Path $warPath)) -or $platformVersionChanged
+        $needWar = (-not (Test-Path $warPath)) -or $platformVersionChanged -or $RefreshWar
 
         # Deploy the client war as <db.name>.war. The ~250 MB war is downloaded
         # to a temp file and *moved* into place, so a separate copy is never kept.
@@ -1195,8 +1266,14 @@ function Cmd-Setup {
             Remove-Item $warPath -Force -ErrorAction SilentlyContinue
             Move-Item $warTmp $warPath -Force
             Ok "Web client war deployed as $warName - web context $ctxDisplay (lsFusion $($cfg.version))."
+            # Immediate verdict on -SNAPSHOT build drift (silent when aligned or
+            # when the server jar is not resolvable yet - Maven mode before the
+            # first start-server). A -RefreshWar that still warns here means the
+            # SERVER side is the stale one (mvn -U).
+            Test-WarServerBuildDrift $cfg
         } else {
             Ok "Web client war up to date ($warName, web context $ctxDisplay, lsFusion $($cfg.version)) - not re-downloading."
+            Test-WarServerBuildDrift $cfg
         }
 
         $rootDir = Join-Path $webapps "ROOT"
@@ -1664,6 +1741,7 @@ function Cmd-StartWeb {
     if (-not (Test-Path (Join-Path $tomcatHome "bin\bootstrap.jar"))) {
         throw "Tomcat is not installed. Run setup (without -NoWeb)."
     }
+    Test-WarServerBuildDrift $cfg
     Stop-Tracked $TomcatPid @($cfg.webPort) "Previous Tomcat"
 
     # Preflight Tomcat's ports now that our own instance is stopped. The shutdown
@@ -1812,6 +1890,9 @@ function Cmd-Status {
     if ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Ok "Web client    : running (PID $tPid, $(Get-WebUrl $cfg))" }
     elseif (Test-PortOpen $web) { Warn "Web client    : something is on web port $web (PID file stale)" }
     else { Info "Web client    : stopped" }
+
+    # Silent when war/server build dates agree (the healthy case).
+    Test-WarServerBuildDrift $cfg
 }
 
 function Cmd-Log {
@@ -2532,7 +2613,9 @@ function Cmd-Api {
                 "APPLY; IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');"
             }
             Info "(empty response body - normal for actions without RETURN/EXPORT, but carries no proof either:"
-            Info " a plain MESSAGE is not returned over HTTP, and a constraint-canceled APPLY still answers 200."
+            Info " a plain MESSAGE (no NOWAIT) is visible NOWHERE over HTTP - not here and not in the server"
+            Info " log, so the log tail below cannot surface it either; only MESSAGE ... NOWAIT leaves a log"
+            Info " line. A constraint-canceled APPLY still answers 200."
             Info " Also: EXPORT must be at the TOP LEVEL - its result is a session-local property, so inside"
             Info " NEWSESSION{} it is discarded with the session and never reaches the HTTP response (RETURN is"
             Info " fine inside NEWSESSION - it propagates up the stack - but an /eval/action script already runs"
@@ -2795,9 +2878,21 @@ Common options:
   -GitUrl <url>         Repository URL for 'clone'.
   -Target <dir>         Destination directory for 'clone' (default: subfolder named from the URL).
   -Branch <name>        Branch to check out for 'clone' (default: the repo's default branch).
-  -Force                Re-download / overwrite on setup; allow clone into a non-empty dir.
+  -Force                setup: regenerate config + settings.properties (does
+                        NOT re-download binaries - downloads are version-driven);
+                        clone: allow a non-empty target dir.
   -NoWeb                Skip the web client (server + Action API only).
   -FullStart            Disable light start (full schema sync) for this run.
+                        Also the fix when code added since the last full start
+                        must be visible in the Reflection tables (scheduler
+                        tasks pick actions via actionCanonicalName) - one full
+                        restart, then back to light starts.
+  -RefreshWar           setup only: re-download the client war at the SAME
+                        version (current -SNAPSHOT build). The fix when the war
+                        and the server jar drift apart across snapshot builds
+                        (Maven updated the server, the war stayed) and forms
+                        fail with 'invalid stream header'; start-web/status
+                        warn when they detect that drift.
 "@
 }
 

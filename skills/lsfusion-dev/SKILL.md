@@ -211,7 +211,9 @@ its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbNa
 tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
-`-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-Url`, `-OpenScript` /
+`-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-RefreshWar` (setup:
+re-download the client war at the same version — the `-SNAPSHOT`
+war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
 `-Do` (verify: generic click/hover/drag/mouse/fill/type/press/eval/wait steps
@@ -236,6 +238,7 @@ no-pipe note in step 4), so don't inflate it "just in case":
 | `check` / `status` / `log` / `versions` / `api` / `open` | default (120 s) |
 | `setup` — first run (downloads ~400 MB) | 600 s |
 | `setup` — re-run (ports, DB, settings tweaks) | default |
+| `setup -RefreshWar` (re-downloads the ~250 MB war) | 600 s |
 | `start` / `restart` — routine edit→restart cycle (lightstart) | 300 s |
 | `start-server` — first start on this DB, or major-version upgrade (raise the inner `-Timeout` to 300 as well) | 600 s |
 | `verify` — first ever run (installs Playwright + Chromium, ~120 MB) | 300 s |
@@ -261,6 +264,16 @@ binaries (delete the file to force a refetch). Before replacing Tomcat or the
 war, `setup` **stops a running Tomcat first**, so an update can't fail on a
 locked `bootstrap.jar` / exploded `ROOT`. Net effect: re-running `setup` to
 tweak ports, DB, or settings is cheap and won't touch the ~400 MB of binaries.
+
+The one refetch case that DOES arise on an unchanged version: **`-SNAPSHOT`
+build drift in Maven projects**. Maven re-resolves the server jar over time
+(pom change, `mvn -U`, snapshot update policy) while the war stays whatever
+`setup` downloaded; war and server from different snapshot builds can break
+RMI serialization, and **every form open fails with `invalid stream
+header`**. `start-web` / `status` / `setup` compare the two build dates
+(zip entry stamps) and warn, naming the stale side; **`setup -RefreshWar`**
+re-downloads the war at the same version (current snapshot build). Details:
+[references/runtime.md](references/runtime.md).
 
 ### Running several servers / configs at once
 
@@ -646,11 +659,19 @@ locale **before** the first start of a fresh database.
 
 **Lightstart: leave ON.** Devmode enables `-Dlsfusion.server.lightstart=true`;
 that's the default for every `restart`. Same code loads either way — lightstart
-only skips reloading user-side DB-stored UI prefs (table-view layout,
-security policy) and is **forced OFF** in two cases only: the very first
-launch on a fresh DB, and when the user explicitly passes `-FullStart`.
-Don't propose `-FullStart` as a debugging step — it's not a fix for "Property
-not found", schema drift, or compile errors. Detail and rationale: see
+skips reloading user-side DB-stored UI prefs (table-view layout, security
+policy) **and the Reflection metadata sync**: `Reflection.Action` /
+`Reflection.Property` rows are not synchronized under lightstart, so anything
+that references logic **by canonical name** (scheduler tasks — the platform
+resolves the picked action via `actionCanonicalName()` — or reflection-driven
+admin forms) **silently gets NULL** for actions/properties added since the
+last full start; a scheduler task then saves with an empty action instead of
+erroring. That is the one debugging case where `-FullStart` IS the fix: after
+adding actions referenced by canonical name, run **one** `restart -FullStart`,
+then return to lightstart. Otherwise don't propose `-FullStart` as a debugging
+step — it's not a fix for "Property not found", schema drift, or compile
+errors. Lightstart is **forced OFF** only on the very first launch on a fresh
+DB and when `-FullStart` is passed. Detail and rationale: see
 [references/runtime.md](references/runtime.md#lightstart).
 
 **Polling, not waiting.** A typical lightstart restart is 30 s – 1 min; a
@@ -825,16 +846,20 @@ checking the unit-test output.
    **Reading values back and confirming mutations has sharp edges — the
    canonical recipes are in the lsfusion-eval skill** ("Getting values
    back", "Chaining and verifying"). In short: `RETURN <expr>;` is 7.0+
-   only (a parse error on 6.x — use `EXPORT FROM res = <expr>;` there),
-   `MESSAGE` is swallowed over HTTP, and a constraint-canceled `APPLY`
+   only (a parse error on 6.x — use `EXPORT FROM res = <expr>;` there), a
+   plain `MESSAGE` is visible **nowhere** over HTTP (not in the response
+   and not in the server log — only `MESSAGE ... NOWAIT` leaves a
+   `Server message:` log line), and a constraint-canceled `APPLY`
    returns the **same empty 200 as success** — so end every mutation script
    with a top-level self-check (no `NEWSESSION` wrapper), e.g.
    `APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');`.
    The `api` command adds two safety nets of its own: it prints a
    version-appropriate hint whenever the body comes back empty, and it
    tails the server log for `Server message:` lines after every call —
-   which surfaces both `MESSAGE ... NOWAIT` output and the constraint text
-   a canceled `APPLY` logs.
+   which surfaces `MESSAGE ... NOWAIT` output and the constraint text a
+   canceled `APPLY` logs, but **cannot rescue a plain `MESSAGE`** (no
+   `NOWAIT` → no log line → nothing to tail; use `RETURN`/`EXPORT` for
+   anything you need to read back).
 
 3. **UI, last.** When log + API agree the build is healthy, check the
    UI. The workhorse is `verify` — it exists in every harness, and the

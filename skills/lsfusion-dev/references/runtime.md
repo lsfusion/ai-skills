@@ -59,6 +59,20 @@ through two paths and bail out with *"module 'X' has already been added"*.
   a resource directory should drop those entries from their pom to keep
   the classpath single-rooted.)
 
+  One drift trap is built into this split: with a **`-SNAPSHOT`** platform
+  version Maven re-resolves the server jar over time (a pom change, `mvn -U`,
+  the snapshot update policy, a local platform build), while the client war
+  — downloaded by the skill, not Maven — stays whatever `setup` fetched. The
+  web client talks RMI to the server with plain Java serialization, so a war
+  and a server from **different snapshot builds** of the same version can
+  fail on **every** form open with `invalid stream header`. Neither artifact
+  stamps its manifest, but zip entry dates carry the build time —
+  `start-web`, `status`, and `setup` compare the two and **warn when they
+  are >24 h apart**, naming which side is stale. Fix: `setup -RefreshWar`
+  re-downloads the war at the same version (current snapshot build) when
+  the server is newer; `mvn -U -DskipTests compile` + `restart` updates the
+  server when the war is newer. See the troubleshooting row below.
+
 - **Maven project but Maven not on `PATH`**, or **bare Maven layout with
   no `pom.xml`** — the skill stages the build itself. On every
   `start-server` it wipes `target/classes/`, copies
@@ -151,7 +165,10 @@ in sync. The skill enables light start by default and drops it only:
   the database structure): `lsfdev.ps1 restart -FullStart`.
 
 If a light-start restart behaves oddly after a data-model change, redo it with
-`-FullStart` to force a full schema sync.
+`-FullStart` to force a full schema sync. One `-FullStart` is also **required**
+after adding actions/properties that are referenced **by canonical name**
+(scheduler tasks, `actionCanonicalName()`) — lightstart skips the Reflection
+sync those lookups read from; see [Lightstart](#lightstart).
 
 **Web server** (`start-web`): Tomcat is started by invoking its
 `org.apache.catalina.startup.Bootstrap` directly (so the skill owns the PID).
@@ -217,6 +234,8 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | `Address already in use` / port `7652`/`8080` busy | Another process holds the port. `lsfdev.ps1 stop`, or change the port in config + settings. |
 | `BindException` from `WebSocketServer` in stderr, server otherwise starts | Another instance holds `webSocket.port` (default `8887`). Non-fatal but WebSocket features silently break — set a per-instance `webSocket.port` (`setup -WebSocketPort <free> -Force`) and restart. |
 | Web UI loads but shows a connection error | The application server is not running or not on `7652`. Check `lsfdev.ps1 status` and the server log. |
+| **Every** form open fails with `invalid stream header` (or `StreamCorruptedException` / `InvalidClassException`), web UI otherwise loads | The client war and the server jar come from **different builds** of the same `-SNAPSHOT` version — RMI serialization mismatch. Typical in Maven projects: Maven updated the server snapshot, the war stayed from an older `setup`. `status` / `start-web` print both build dates and which side is stale. Fix: `setup -RefreshWar` (server newer) or `mvn -U -DskipTests compile` + `restart` (war newer). |
+| Scheduler task saved with an **empty action**; `actionCanonicalName('My.action[]')` returns NULL for an action that exists in code | Lightstart skipped the Reflection sync, so actions added since the last full start have no `Reflection.Action` row — the lookup silently returns NULL. Run **one** `restart -FullStart`, then re-create/re-pick the action (see [Lightstart](#lightstart)). |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
 | `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong (or, on some snapshot-era builds, empty) credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
@@ -239,8 +258,12 @@ what is actually available right now together with how each alias resolves.
 When you switch versions, `setup` removes the previous server jar, clears the
 `server-initialized.flag` so the next start does a full schema sync (schema
 between majors differs enough that light start is unsafe), and stores the
-resolved tag back into `config.json`. Pass `-Force` if you also need Tomcat
-or the war re-downloaded.
+resolved tag back into `config.json`. The war is re-downloaded by the version
+switch itself (it is versioned with the platform — no `-Force` involved);
+Tomcat is version-independent and is kept (delete `.lsfusion-dev/tomcat` to
+force a reinstall). To re-fetch the war at the **same** `-SNAPSHOT` version
+(current build), pass `setup -RefreshWar`; `-Force` never re-downloads
+binaries.
 
 Once a version is in `config.json`, later `setup` runs reuse it verbatim — the
 resolved version is sticky, so the platform never gets upgraded silently. Pass
@@ -258,10 +281,33 @@ also drag on for several minutes if a query plan goes sideways.
 **What lightstart does NOT affect.** Server startup correctness, schema sync,
 business logic, name resolution, the success or failure of a build. If
 `start-server` fails or a property won't resolve, **turning lightstart off
-will not help** — the same code runs either way. Lightstart only skips
-reloading a narrow class of user-facing configuration: form-table view
-settings, security policies, and similar admin-side preferences stored in
-the DB. Most of the time you neither notice nor care.
+will not help** — the same code runs either way.
+
+**What lightstart DOES skip.** Two classes of DB-stored state, both refreshed
+only on a full start:
+
+- **user-side UI/admin preferences** — form-table view settings,
+  security-policy reload and similar. Usually you neither notice nor care.
+- **the Reflection metadata sync** — the rows in the system `Reflection`
+  tables that describe the loaded code (`Reflection.Property` /
+  `Reflection.Action` objects, navigator elements, forms; only the *table*
+  metadata still syncs under lightstart). Anything that looks logic up **by
+  canonical name through those tables** — scheduler tasks (the platform
+  resolves the picked action via `actionCanonicalName()`),
+  `propertyCanonicalName()` in code, reflection-driven admin forms, per-
+  action security-policy setup — does **not** see actions/properties added
+  or renamed since the last full start. The failure is **silent**:
+  `actionCanonicalName('MyModule.myAction[]')` simply returns NULL, so e.g.
+  a scheduler task saves with an **empty action** instead of erroring.
+
+**The one case where `-FullStart` IS the fix.** Added (or renamed) an action
+or property that something references **by canonical name** — a scheduler
+job, `actionCanonicalName()` / `propertyCanonicalName()`, the Reflection /
+security-policy admin forms? Run **one** `restart -FullStart` to sync the
+Reflection tables, then go back to lightstart restarts. A full start
+reliably re-syncs even when the code did not change since the last light
+restart: the light/full flag is folded into the source hash the sync is
+keyed on.
 
 **When the skill leaves lightstart ON.** Everything routine: code edits,
 adding or modifying modules, changing properties / forms / actions, small
@@ -277,6 +323,7 @@ belongs to the user.
 
 **Don't propose `-FullStart` as a debugging step** for logic / schema /
 startup problems. Not a fix for "Property not found", schema drift, count
-mismatches, or compile errors — same code runs either way. Suggest
-`-FullStart` only when the user explicitly cares about the user-facing
-settings that lightstart skips (table-view layout, security-policy reload).
+mismatches, or compile errors — same code runs either way. The legitimate
+`-FullStart` suggestions are exactly two: the canonical-name / Reflection
+case above, and the user explicitly caring about the user-facing settings
+lightstart skips (table-view layout, security-policy reload).
