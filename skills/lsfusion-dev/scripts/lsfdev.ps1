@@ -2347,19 +2347,23 @@ function Get-LsfMaskedText([string]$text, [bool]$blankComments, [bool]$blankStri
         }
         # --- inline Java code literals <{ ... }> ----------------------------
         # CODE_LITERAL is a single token ending at the FIRST '}>' (ANTLR's
-        # nongreedy .*). Its content is Java: double-quoted strings, Java
-        # comments, braces - and even the words META/END - may appear and
-        # must not leak into string/comment tracking or structural counts.
+        # nongreedy .*). Its content is Java and is blanked in EVERY mode,
+        # not just $blankStrings: shadow consumers regex the COMMENT shadow
+        # too (run()-declaration safety skip, the declaredHere name harvest),
+        # and visible Java would feed them phantoms - a 'run() {}' inside a
+        # Java comment would false-trigger the skip, a 'ghost() = ...' line
+        # would fake a cross-file declaration and downgrade a real name
+        # error to inconclusive. Positions still match (spaces).
         if ($c -eq '<' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '{') {
-            if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+            $chars[$i] = ' '; $chars[$i + 1] = ' '
             $i += 2
             while ($i -lt $n) {
                 if ($chars[$i] -eq '}' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '>') {
-                    if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+                    $chars[$i] = ' '; $chars[$i + 1] = ' '
                     $i += 2
                     break
                 }
-                if ($blankStrings -and $chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
+                if ($chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
                 $i++
             }
             continue
@@ -2690,10 +2694,13 @@ function Cmd-Precheck {
             # run 'Caption' {}, run 'Caption'() {} (all verified to execute
             # via /eval), plus property/override forms (run() = ..., += - a
             # same-name property would only produce a confusing "already
-            # defined" against the appended stub). A call site (run();) or a
-            # longer name (runTotals) does not match.
+            # defined" against the appended stub) and INTERNAL bodies
+            # (run() INTERNAL <{...}>; / INTERNAL 'class' - the body form
+            # doesn't matter, /eval runs whatever run() is; skipping is the
+            # safe direction even if eval would refuse INTERNAL). A call
+            # site (run();) or a longer name (runTotals) does not match.
             $fileShadow = Get-CommentBlankedShadow $raw
-            if ($fileShadow -cmatch '(?m)^[ \t]*run(?![A-Za-z0-9_])\s*(?:''(?:[^''\\]|\\.)*''\s*)?(?:\([^)]*\)\s*)?(?:\{|\+?=)') {
+            if ($fileShadow -cmatch '(?m)^[ \t]*run(?![A-Za-z0-9_])\s*(?:''(?:[^''\\]|\\.)*''\s*)?(?:\([^)]*\)\s*)?(?:\{|\+?=|INTERNAL\b)') {
                 $skipCount++
                 Warn "$leaf - skipped: it declares run(), and /eval EXECUTES run() - a linter must not run project actions. Rename the action (or lint the file without it)."
                 continue
