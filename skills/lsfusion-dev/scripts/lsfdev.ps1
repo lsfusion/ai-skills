@@ -2455,8 +2455,9 @@ function Get-LsfMaskedText([string]$text, [bool]$blankComments, [bool]$blankStri
     return -join $chars
 }
 
-# Comment-blanked shadow: comments become spaces, all other text - string
-# literals included - stays put (eval error positions must match the file).
+# Comment-blanked shadow: comments become spaces; string literals stay put
+# (eval error positions must match the file). CODE_LITERAL <{...}> is the
+# one non-comment token also blanked - in every mode, see Get-LsfMaskedText.
 function Get-CommentBlankedShadow([string]$text) {
     return Get-LsfMaskedText $text $true $false
 }
