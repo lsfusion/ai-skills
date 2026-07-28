@@ -66,6 +66,135 @@ def _split_pos(spec: str):
     return spec.strip(), None
 
 
+def _resolve_visible(page, sel: str, timeout_ms: int = 15000):
+    """Resolve a --do selector to its first VISIBLE match.
+
+    ``locator(sel).first`` acts on the first match in DOM order, hidden or
+    not — and the lsFusion web client keeps full duplicate toolbars/forms in
+    the DOM for every docked-but-inactive tab, so a selector like
+    ``button:has-text("Save")`` routinely matches an invisible copy first
+    and the click times out with no hint. This helper polls until some match
+    is visible and returns ``(locator, note)`` where note says when
+    duplicates were skipped (``"3 matched, using first visible (#2)"``).
+    Raises ValueError with the diagnosis when matches exist but every one is
+    hidden, or when nothing matches at all.
+    """
+    loc = page.locator(sel)
+    deadline = time.time() + timeout_ms / 1000
+    n = 0
+    while True:
+        try:
+            n = loc.count()
+        except PWError:
+            n = 0  # malformed selectors raise later, on the action itself
+        for i in range(min(n, 50)):
+            nth = loc.nth(i)
+            try:
+                if nth.is_visible():
+                    note = ""
+                    if n > 1:
+                        note = f"{n} matched, using first visible (#{i + 1})"
+                    return nth, note
+            except PWError:
+                pass
+        if time.time() >= deadline:
+            break
+        page.wait_for_timeout(250)
+    if n:
+        raise ValueError(
+            f"{sel!r} matched {n} element(s) but none is visible - likely "
+            "hidden duplicates (e.g. toolbars/forms of other docked tabs "
+            "kept in the DOM); scope the selector (append :visible, or "
+            "prefix a container) or close the other tabs")
+    raise ValueError(f"{sel!r} matched nothing within {timeout_ms} ms")
+
+
+def _any_visible(loc, cap: int = 20) -> bool:
+    """True when at least one of the locator's matches is visible."""
+    try:
+        n = loc.count()
+    except PWError:
+        return False
+    for i in range(min(n, cap)):
+        try:
+            if loc.nth(i).is_visible():
+                return True
+        except PWError:
+            pass
+    return False
+
+
+# --open-expect fallback: text inside <input>/<textarea>/<select> is an
+# element VALUE, not a text node, so text locators never see it — a healthy
+# settings form full of inputs used to report "NOT found" on the very value
+# it displayed. Checks visible form controls' values (and the selected
+# option's label) for a case-insensitive substring match.
+_INPUT_VALUE_JS = """
+(needle) => {
+  const n = (needle || '').toLowerCase();
+  const vis = el => { const r = el.getClientRects()[0];
+                      return !!r && r.width > 0.5 && r.height > 0.5; };
+  for (const el of document.querySelectorAll('input, textarea, select')) {
+    if (!vis(el)) continue;
+    let v = '' + (el.value == null ? '' : el.value);
+    if (el.tagName === 'SELECT' && el.selectedOptions && el.selectedOptions.length)
+      v = v + ' ' + (el.selectedOptions[0].label || '');
+    if (v.toLowerCase().includes(n)) return true;
+  }
+  return false;
+}
+"""
+
+
+def _wait_expect(page, expect: str, timeout_ms: int = 45000) -> str:
+    """Wait for --open-expect text as visible text OR a visible input's
+    value. Returns 'text' / 'input-value' / '' (not found)."""
+    deadline = time.time() + timeout_ms / 1000
+    while True:
+        if _any_visible(page.get_by_text(expect)):
+            return "text"
+        try:
+            if page.evaluate(_INPUT_VALUE_JS, expect):
+                return "input-value"
+        except PWError:
+            pass
+        if time.time() >= deadline:
+            return ""
+        page.wait_for_timeout(800)
+
+
+# edit:<caption>=><value> target lookup. The platform's own wiring makes the
+# caption → cell hop exact: every panel caption is a .panel-property-label
+# whose for= attribute is the id of its value cell
+# (PropertyPanelRenderer.initCaption sets both). Whitespace-normalized exact
+# match first, then substring; visible labels only.
+_PANEL_CELL_JS = """
+(caption) => {
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+  const target = norm(caption);
+  const vis = el => { const r = el.getClientRects()[0];
+                      return !!r && r.width > 0.5 && r.height > 0.5; };
+  const labels = [...document.querySelectorAll('.panel-property-label')].filter(vis);
+  const hit = labels.find(l => norm(l.textContent) === target)
+           || labels.find(l => norm(l.textContent).includes(target));
+  if (!hit) return null;
+  const id = hit.getAttribute('for');
+  return id ? document.getElementById(id) : null;
+}
+"""
+
+# Failure-time diagnostics for edit:: the captions that CAN be targeted.
+_PANEL_CAPTIONS_JS = """
+() => {
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+  const vis = el => { const r = el.getClientRects()[0];
+                      return !!r && r.width > 0.5 && r.height > 0.5; };
+  return [...new Set([...document.querySelectorAll('.panel-property-label')]
+      .filter(vis).map(l => norm(l.textContent)).filter(Boolean))];
+}
+"""
+
+
 def _classify_click_error(msg: str):
     """Classify a failed Playwright click from its timeout message.
 
@@ -226,8 +355,10 @@ def main() -> int:
                          "the web client and the form opens without touching "
                          "the navigator")
     ap.add_argument("--open-expect", default="",
-                    help="with --open-script-file: wait for this visible text "
-                         "(e.g. the form caption) before the screenshot")
+                    help="with --open-script-file: wait for this text before "
+                         "the screenshot - matched as visible text OR as a "
+                         "visible input's value (form fields hold text in "
+                         "the value attribute, not in a text node)")
     ap.add_argument("--click", default="",
                     help="after landing, click element(s) by visible text and "
                          "screenshot the result; chain with '>' for tab-then-"
@@ -243,11 +374,15 @@ def main() -> int:
                          "hover:<selector>, drag:<selector>=><selector>, "
                          "mouse:down|up|move@x,y[,steps], "
                          "fill:<selector>=><value>, type:<selector>=><value>, "
+                         "edit:<panel caption or selector>=><value> (lsFusion "
+                         "in-place editor: dblclick the cell, type, Enter), "
                          "press:<key>, eval:<js>, wait:<ms>. <selector> is any "
                          "Playwright selector (css, text=..., :has-text(...)), "
                          "which is what reaches buttons/inputs inside CUSTOM "
                          "(React) components that the text-based --click "
-                         "cannot hit; hover/drag/click selectors accept an "
+                         "cannot hit; selectors resolve to the first VISIBLE "
+                         "match (hidden docked-tab duplicates are skipped and "
+                         "reported); hover/drag/click selectors accept an "
                          "@x,y offset from the element's top-left corner")
     ap.add_argument("--do-file", default="",
                     help="UTF-8 file with a JSON array of --do steps. The "
@@ -320,6 +455,7 @@ def main() -> int:
             "reloaded": False,
             "expect": args.open_expect.strip(),
             "expect_found": False,
+            "expect_where": "",   # text | input-value
             "error": None,
         },
         "click": {
@@ -514,12 +650,13 @@ def main() -> int:
                             pass
                         page.wait_for_timeout(2500)
                         if result["open"]["expect"]:
-                            try:
-                                page.wait_for_selector(
-                                    f"text={result['open']['expect']}", timeout=45000)
-                                result["open"]["expect_found"] = True
-                            except PWTimeout:
-                                pass
+                            # Visible text first, input VALUES as a fallback:
+                            # "15" sitting in a settings-form field is an
+                            # input value, not a text node, and must not
+                            # report NOT-found on a healthy form.
+                            where = _wait_expect(page, result["open"]["expect"])
+                            result["open"]["expect_found"] = bool(where)
+                            result["open"]["expect_where"] = where
                     except (PWTimeout, PWError) as e:
                         if "/eval/action" in page.url:
                             # No redirect happened: the script failed and the
@@ -743,7 +880,9 @@ def main() -> int:
                             verb = verb.strip().lower()
                             if verb in ("click", "dblclick", "hover"):
                                 sel, pos = _split_pos(rest)
-                                loc = page.locator(sel).first
+                                loc, note = _resolve_visible(page, sel)
+                                if note:
+                                    step["detail"] = note
                                 kw = {"timeout": 15000}
                                 if pos:
                                     kw["position"] = pos
@@ -775,8 +914,11 @@ def main() -> int:
                                 src, dst = rest.split("=>", 1)
                                 ssel, spos = _split_pos(src)
                                 dsel, dpos = _split_pos(dst)
-                                sloc = page.locator(ssel).first
-                                dloc = page.locator(dsel).first
+                                sloc, snote = _resolve_visible(page, ssel)
+                                dloc, dnote = _resolve_visible(page, dsel)
+                                notes = [x for x in (snote, dnote) if x]
+                                if notes:
+                                    step["detail"] = "; ".join(notes)
                                 dloc.scroll_into_view_if_needed(timeout=15000)
                                 skw = {"timeout": 15000}
                                 if spos:
@@ -837,7 +979,9 @@ def main() -> int:
                                     raise ValueError(
                                         "no selector in fill/type step - use "
                                         "fill:<selector>=><value>")
-                                loc = page.locator(sel).first
+                                loc, note = _resolve_visible(page, sel)
+                                if note:
+                                    step["detail"] = note
                                 if verb == "fill":
                                     loc.fill(value)
                                 else:
@@ -848,6 +992,91 @@ def main() -> int:
                                         loc.press_sequentially(value, delay=30)
                                     else:  # older Playwright
                                         loc.type(value, delay=30)
+                            elif verb == "edit":
+                                # Platform-level in-place edit:
+                                #   edit:<panel caption>=><value>
+                                # (or a Playwright selector of the cell). The
+                                # lsFusion in-place editor has NO <input> until
+                                # the cell is focused, so fill:/type: cannot
+                                # reach it and a blind dblclick@x,y is
+                                # viewport-fragile. Recipe: find the value cell
+                                # (caption → its label's for= id, the
+                                # platform's own wiring), dblclick to open the
+                                # editor, select-all, type, Enter.
+                                if "=>" not in rest:
+                                    raise ValueError(
+                                        "edit needs 'edit:<caption or "
+                                        "selector>=><value>'")
+                                tgt, _, value = rest.partition("=>")
+                                tgt = tgt.strip()
+                                if not tgt:
+                                    raise ValueError(
+                                        "no caption/selector in edit step - "
+                                        "use edit:<caption>=><value>")
+                                cell = None
+                                try:
+                                    h = page.evaluate_handle(_PANEL_CELL_JS, tgt)
+                                    cell = h.as_element()
+                                except PWError:
+                                    cell = None
+                                if cell is None:
+                                    # Not a known panel caption - try it as a
+                                    # selector (grid cells, custom components).
+                                    try:
+                                        cell, note = _resolve_visible(
+                                            page, tgt, timeout_ms=3000)
+                                        if note:
+                                            step["detail"] = note
+                                    except (PWError, ValueError):
+                                        caps = []
+                                        try:
+                                            caps = page.evaluate(_PANEL_CAPTIONS_JS)
+                                        except PWError:
+                                            pass
+                                        raise ValueError(
+                                            f"no panel cell with caption {tgt!r} "
+                                            "(and it does not resolve as a "
+                                            "selector). Editable panel captions "
+                                            "on this page: "
+                                            + (", ".join(caps) if caps else "(none)"))
+                                else:
+                                    try:
+                                        cell.scroll_into_view_if_needed(timeout=5000)
+                                    except PWError:
+                                        pass
+                                # Open the editor; one retry - right after a
+                                # form open the first dblclick can land while
+                                # the cell is still wiring up.
+                                editor = None
+                                for attempt in range(2):
+                                    cell.dblclick(timeout=15000)
+                                    page.wait_for_timeout(400)
+                                    editor = page.evaluate(
+                                        "() => { const a = document.activeElement;"
+                                        " if (!a) return null;"
+                                        " const t = a.tagName.toLowerCase();"
+                                        " if (t === 'input' || t === 'textarea'"
+                                        "     || t === 'select' || a.isContentEditable)"
+                                        "   return t;"
+                                        " return null; }")
+                                    if editor:
+                                        break
+                                    page.wait_for_timeout(800)
+                                if not editor:
+                                    raise ValueError(
+                                        "double-click did not open an in-place "
+                                        "editor (read-only cell? an action "
+                                        "property? wrong cell?) - nothing was "
+                                        "typed")
+                                if editor in ("input", "textarea"):
+                                    page.keyboard.press("Control+a")
+                                page.keyboard.type(value, delay=30)
+                                page.keyboard.press("Enter")
+                                page.wait_for_timeout(400)
+                                prev = step["detail"]
+                                step["detail"] = (
+                                    (prev + "; " if prev else "")
+                                    + f"edited via <{editor}> in-place editor")
                             elif verb == "press":
                                 page.keyboard.press(rest.strip())
                             elif verb == "eval":
@@ -859,7 +1088,7 @@ def main() -> int:
                             else:
                                 raise ValueError(
                                     f"unknown verb {verb!r} - use click/dblclick/"
-                                    "hover/drag/mouse/fill/type/press/eval/wait")
+                                    "hover/drag/mouse/fill/type/edit/press/eval/wait")
                             step["ok"] = True
                         except (PWTimeout, PWError, ValueError) as e:
                             step["detail"] = str(e).split("\n")[0]

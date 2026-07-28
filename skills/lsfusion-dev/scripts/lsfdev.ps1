@@ -995,6 +995,10 @@ function Cmd-Check {
     } else {
         Info "Project not set up yet. Next step: lsfdev.ps1 setup -AppId <short id> -DbPassword <password>"
     }
+    if ($script:StableShimPath) {
+        Write-Host ""
+        Ok "Stable CLI path (survives plugin updates - remember THIS one, never the versioned plugin-cache path): $script:StableShimPath"
+    }
 }
 
 function Cmd-Setup {
@@ -1526,6 +1530,9 @@ $portLines$topLine
         Ok "App id '$($cfg.dbName)' - database '$($cfg.dbName)', web context $(Get-WebUrl $cfg)"
     }
     Ok "Setup complete. Put your .lsf modules in $ProjectDir, then run: lsfdev.ps1 start"
+    if ($script:StableShimPath) {
+        Ok "Stable CLI path (survives plugin updates - remember THIS one, never the versioned plugin-cache path): $script:StableShimPath"
+    }
 }
 
 function Cmd-StartServer {
@@ -2088,7 +2095,7 @@ function Cmd-Verify {
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
     if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
-    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by Playwright selector)" }
+    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/dblclick/hover/drag/mouse/fill/type/edit/press/eval/wait by Playwright selector; first VISIBLE match)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
     # Use --name=value form so an empty password is preserved through
@@ -2156,8 +2163,14 @@ function Cmd-Verify {
             $tag = if ($r.open.reloaded) { " (after one /push-notification reload)" } else { "" }
             Ok "Open script executed - landed on $($r.open.landed_url)$tag"
             if ($r.open.expect) {
-                if ($r.open.expect_found) { Ok "Expected text '$($r.open.expect)' is visible on the opened form." }
-                else { Warn "Expected text '$($r.open.expect)' NOT found - check verify-open.png (caption may differ / form may be empty)." }
+                if ($r.open.expect_found) {
+                    if ("$($r.open.expect_where)" -eq 'input-value') {
+                        Ok "Expected text '$($r.open.expect)' found - as the VALUE of a visible input (a form field shows it; it is not a text node)."
+                    } else {
+                        Ok "Expected text '$($r.open.expect)' is visible on the opened form."
+                    }
+                }
+                else { Warn "Expected text '$($r.open.expect)' NOT found - neither as visible text nor as any visible input's value. Check verify-open.png (caption may differ / form may be empty)." }
             }
         }
     }
@@ -2324,6 +2337,88 @@ function Get-CommentBlankedShadow([string]$text) {
         }
     }
     return -join $chars
+}
+
+# String-blanked version of a comment-blanked shadow: every character inside a
+# '...' literal (quotes included) becomes a space. The comment shadow keeps
+# string contents on purpose (positions must match the file for eval errors);
+# structural scans (bracket balance, META/END counting, statement extents)
+# must NOT see a '(' or an END living inside a caption string, so they run on
+# this second-pass shadow instead.
+function Get-StructuralShadow([string]$shadow) {
+    $chars = $shadow.ToCharArray()
+    $n = $chars.Length
+    $inStr = $false
+    for ($i = 0; $i -lt $n; $i++) {
+        $c = $chars[$i]
+        if (-not $inStr) {
+            if ($c -eq "'") { $inStr = $true; $chars[$i] = ' ' }
+        } else {
+            if ($c -eq '\') {
+                $chars[$i] = ' '
+                if (($i + 1) -lt $n -and $chars[$i + 1] -ne "`r" -and $chars[$i + 1] -ne "`n") { $chars[$i + 1] = ' '; $i++ }
+            }
+            elseif ($c -eq "'") { $inStr = $false; $chars[$i] = ' ' }
+            elseif ($c -ne "`r" -and $c -ne "`n") { $chars[$i] = ' ' }
+        }
+    }
+    return -join $chars
+}
+
+# Blank every statement that starts at $startPattern and ends at the first ';'
+# sitting at bracket depth 0 relative to the match start. Depth-aware because
+# @-instantiation arguments and EXTEND FORM event blocks legitimately carry
+# ';' inside (...) / {... }. A statement with no such terminator (unbalanced
+# file) is left in place - callers treat leftovers conservatively.
+function Remove-DepthStatements([string]$s, [string]$startPattern) {
+    $sb = New-Object System.Text.StringBuilder $s
+    foreach ($m in [regex]::Matches($s, $startPattern)) {
+        $depth = 0
+        for ($i = $m.Index; $i -lt $s.Length; $i++) {
+            $c = $s[$i]
+            if ($c -eq '(' -or $c -eq '{' -or $c -eq '[') { $depth++ }
+            elseif ($c -eq ')' -or $c -eq '}' -or $c -eq ']') { $depth-- }
+            elseif ($c -eq ';' -and $depth -le 0) {
+                for ($j = $m.Index; $j -le $i; $j++) {
+                    if ($sb[$j] -ne "`r" -and $sb[$j] -ne "`n") { $sb[$j] = ' ' }
+                }
+                break
+            }
+        }
+    }
+    return $sb.ToString()
+}
+
+# How much of a file can /eval actually check. Works on the STRUCTURAL shadow.
+# Blanks module headers, META...END definition blocks, @-instantiation
+# statements and EXTEND FORM statements; whatever remains is the surface eval
+# genuinely compiles. Residual=$false + any construct flag => a "restart-only"
+# file (the main-file shape that used to burn a cycle: all META + EXTEND FORM,
+# where precheck could catch neither ambiguity nor a constraint error).
+# Deliberately conservative: nested METAs / inline @usages / DESIGN leave
+# residue, and the file then just takes the normal eval path.
+function Get-EvalCoverage([string]$structShadow) {
+    $s = $structShadow
+    $metaOpen  = [regex]::Matches($s, '(?m)^[ \t]*META\b').Count
+    $metaEnd   = [regex]::Matches($s, '(?m)^[ \t]*END\b').Count
+    $hasExtend = [regex]::IsMatch($s, '(?m)^[ \t]*EXTEND\s+FORM\b')
+    $hasUsage  = [regex]::IsMatch($s, '(?m)^[ \t]*@[A-Za-z_]')
+    # Headers out first (structural variant: every occurrence, no
+    # well-formedness gate - this is coverage math, not eval input).
+    $s = [regex]::Replace($s, '(?m)^[ \t]*(MODULE|REQUIRE|NAMESPACE|PRIORITY)\b[^;]*;', ' ')
+    # META bodies: non-greedy to the first line-start END (flat definitions;
+    # nested ones leave residue - conservative).
+    $s = [regex]::Replace($s, '(?ms)^[ \t]*META\b.*?^[ \t]*END\b[ \t]*;?', ' ')
+    $s = Remove-DepthStatements $s '(?m)^[ \t]*@[A-Za-z_]'
+    $s = Remove-DepthStatements $s '(?m)^[ \t]*EXTEND\s+FORM\b'
+    return @{
+        MetaOpen  = $metaOpen
+        MetaEnd   = $metaEnd
+        HasMeta   = ($metaOpen -gt 0)
+        HasUsage  = $hasUsage
+        HasExtend = $hasExtend
+        Residual  = ($s -match '\S')
+    }
 }
 
 # Blank out top-level module-header statements (MODULE / REQUIRE / NAMESPACE /
@@ -2503,12 +2598,51 @@ function Cmd-Precheck {
                 Bad "$leaf - FAIL: no valid leading 'MODULE <Name>;' header - the restart loader requires one (precheck strips headers, it cannot invent a missing one)."
                 continue
             }
+            # Structural checks + coverage classification, BEFORE eval - they
+            # cover exactly what eval cannot see (META bodies compile only at
+            # instantiation; EXTEND FORM / '() + {}' crash eval's compiler).
+            $structShadow = Get-StructuralShadow $fileShadow
+            $cov = Get-EvalCoverage $structShadow
+            if ($cov.MetaOpen -gt $cov.MetaEnd) {
+                $failCount++
+                Bad "$leaf - FAIL: unclosed META ($($cov.MetaOpen) META vs $($cov.MetaEnd) line-start END outside comments/strings) - an unclosed META swallows the rest of the file at restart."
+                continue
+            }
+            if ($cov.MetaEnd -gt $cov.MetaOpen) {
+                # Only a Warn: END is also a DESIGN alignment literal, which
+                # in exotic formatting can start a line - a false FAIL here
+                # would cost more trust than the rare uncaught stray END.
+                Warn "$leaf - $($cov.MetaEnd) line-start END vs $($cov.MetaOpen) META: a genuinely stray END fails the restart parse (ignore if an END here is a DESIGN alignment value at line start)."
+            }
+            $balanceNotes = @()
+            foreach ($pair in @(@('(', ')'), @('{', '}'), @('[', ']'))) {
+                $opens  = [regex]::Matches($structShadow, [regex]::Escape($pair[0])).Count
+                $closes = [regex]::Matches($structShadow, [regex]::Escape($pair[1])).Count
+                if ($opens -ne $closes) { $balanceNotes += "$opens x '$($pair[0])' vs $closes x '$($pair[1])'" }
+            }
+            if ($balanceNotes.Count) {
+                Warn "$leaf - brackets look unbalanced outside comments/strings ($($balanceNotes -join '; ')) - if the restart fails with a parse error, start here (META fragments can legitimately unbalance, so this alone is not a FAIL)."
+            }
+            if ((-not $cov.Residual) -and ($cov.HasMeta -or $cov.HasUsage -or $cov.HasExtend)) {
+                # The main-file shape that used to burn a precheck cycle: all
+                # META definitions / @-instantiations / EXTEND FORM. eval can
+                # compile NONE of that, so posting it yields either a hollow
+                # PASS or a misleading compiler-crash report - say the truth
+                # upfront instead.
+                $skipCount++
+                Warn "$leaf - restart-only: the file is entirely META definitions / @-instantiations / EXTEND FORM. eval can check NONE of its content - ambiguity and constraint errors included - so only structure was verified (MODULE header, META/END balance, brackets). The restart IS the check for this file: budget the restart cycle, don't re-run precheck for it."
+                continue
+            }
             # NAMESPACE / PRIORITY steer how ambiguous names resolve; they are
             # stripped for the check, so a clean name pass can still resolve
             # differently at restart - the verdict carries that caveat.
             $nsCaveat = ""
             if ($fileShadow -cmatch '(?m)^[ \t]*(NAMESPACE|PRIORITY)\b') {
                 $nsCaveat = " (NAMESPACE/PRIORITY stripped for the check - ambiguous names can resolve differently at restart)"
+            }
+            $metaCaveat = ""
+            if ($cov.HasMeta) {
+                $metaCaveat = " (declares META: bodies compile only at @-instantiation - a definition not instantiated in THIS file stays unchecked until restart)"
             }
             $scriptText = (Strip-ModuleHeader $raw) + "`r`nrun() {}"
             # Transport: small scripts ride the %XX query parameter (decodes
@@ -2529,7 +2663,7 @@ function Cmd-Precheck {
                     -ContentType "application/x-www-form-urlencoded; charset=UTF-8" `
                     -Body ([Text.Encoding]::UTF8.GetBytes("script=$enc")) -UseBasicParsing -TimeoutSec 60
             }
-            Ok "$leaf - PASS (eval compiled and loaded it clean)$nsCaveat"
+            Ok "$leaf - PASS (eval compiled and loaded it clean)$nsCaveat$metaCaveat"
         } catch {
             $body = Get-ErrorResponseBody $_
             if (-not $body) {
@@ -2577,7 +2711,7 @@ function Cmd-Precheck {
                 # CLASS sits on line 2), so this outcome proves the syntax of
                 # the whole file and nothing about its names.
                 $where = if ($evalOnly[0] -match ':(\d+):\d+') { " at line $($Matches[1])" } else { "" }
-                Ok "$leaf - syntax OK (whole file). Names NOT checked: a load-only construct$where stops eval before name resolution - names in this file surface only on restart."
+                Ok "$leaf - syntax OK (whole file). Names NOT checked: a load-only construct$where stops eval before name resolution - names in this file surface only on restart.$metaCaveat"
             } else {
                 # A not-found on a name that another file of THIS selection
                 # declares is a cross-file reference eval cannot see, not a
@@ -2835,6 +2969,11 @@ function Cmd-Help {
     Write-Host @"
 lsfdev.ps1 - lsFusion development CLI
 
+Stable path: every run refreshes a version-independent copy at
+  %LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1
+Call THAT after the first run - the plugin-cache path embeds the plugin
+version and dies on every plugin update.
+
   clone          Clone an existing lsFusion project from a Git repository.
   check          Detect Java, PostgreSQL, Python, git and Maven.
   setup          Download server jar, client war, Tomcat; write settings.properties.
@@ -2860,7 +2999,13 @@ lsfdev.ps1 - lsFusion development CLI
                  src/main. Strips MODULE/REQUIRE headers, posts to /eval.
                  Verdicts say what was proven: files with load-only
                  constructs (CLASS/WHEN/...) get syntax-only coverage, and
-                 EXTEND FORM / '() + { }' files can't be linted at all.
+                 EXTEND FORM / '() + { }' files can't be linted at all. A
+                 file that is ENTIRELY META definitions / @-usages / EXTEND
+                 FORM is reported upfront as RESTART-ONLY (eval compiles none
+                 of it - ambiguity/constraint errors included); precheck
+                 still checks its structure (MODULE header, META/END balance,
+                 bracket balance) but the restart is the real check - budget
+                 it, don't re-run precheck on such files.
                  REQUIRE completeness is never checked (eval sees every
                  loaded module) - a missing REQUIRE surfaces only at restart.
   versions       List lsFusion versions on download.lsfusion.org and aliases.
@@ -2906,9 +3051,12 @@ Common options:
                         use -OpenScriptFile.
   -OpenScriptFile <path> 'verify': same as -OpenScript but read from a UTF-8
                         file (preferred for non-ASCII scripts).
-  -OpenExpect <text>    'verify': with -OpenScript, wait for this visible text
-                        (e.g. the form caption) on the opened form and report
-                        whether it appeared.
+  -OpenExpect <text>    'verify': with -OpenScript, wait for this text on the
+                        opened form and report whether it appeared. Matches
+                        visible text nodes AND the values of visible inputs
+                        (a form field's content is an input VALUE, not text -
+                        it used to false-negative); the report says which
+                        kind matched.
   -Click <text>         'verify' only: click navigator entry(ies) by visible
                         text before the final screenshot; chain with '>'
                         (e.g. -Click "Master data > Items"). Output goes to
@@ -2929,17 +3077,30 @@ Common options:
                           hover:<sel>[@x,y]         drag:<sel>[@x,y]=><sel>[@x,y]
                           mouse:down[@x,y]  mouse:up[@x,y]  mouse:move@x,y[,steps]
                           fill:<sel>=><value>       type:<sel>=><value>
-                          press:<key>  eval:<js>  wait:<ms>
-                        'drag' performs a real mousedown -> interpolated
-                        mousemoves -> mouseup gesture (drag-to-draw UIs: Gantt
-                        links, resize handles); 'mouse' gives raw
-                        viewport-coordinate primitives (move glides in 12
-                        interpolated steps by default so busy pages still see
-                        the path); 'type' presses real keys (React inputs
-                        that ignore fill); eval returns its value into the
-                        report. Chain stops at the first failed step.
-                        Screenshot goes to verify-do.png. Example:
-                          verify -Click "Schedule" -Do "fill:input.comment=>Ivanov","drag:.task-a=>.task-b","click:text=Book"
+                          edit:<caption|sel>=><val> press:<key>  eval:<js>  wait:<ms>
+                        Selectors resolve to the FIRST VISIBLE match: the web
+                        client keeps whole duplicate toolbars of inactive
+                        docked tabs in the DOM, so a bare first-match click
+                        used to hang on a hidden copy - hidden matches are now
+                        skipped and reported ('3 matched, using first visible
+                        (#2)'); if every match is hidden the step fails with
+                        that diagnosis. 'edit' drives the lsFusion IN-PLACE
+                        editor (fill/type can't - the <input> exists only
+                        after the cell is focused): it finds the panel cell by
+                        its visible caption (or any selector, e.g. a grid
+                        cell), double-clicks it, selects all, types the value
+                        and presses Enter; on a caption miss it lists the
+                        editable panel captions of the page. 'drag' performs a
+                        real mousedown -> interpolated mousemoves -> mouseup
+                        gesture (drag-to-draw UIs: Gantt links, resize
+                        handles); 'mouse' gives raw viewport-coordinate
+                        primitives (move glides in 12 interpolated steps by
+                        default so busy pages still see the path); 'type'
+                        presses real keys (React inputs that ignore fill);
+                        eval returns its value into the report. Chain stops at
+                        the first failed step. Screenshot goes to
+                        verify-do.png. Example:
+                          verify -Click "Schedule" -Do "edit:Comment=>Ivanov","drag:.task-a=>.task-b","click:text=Book"
   -Session              'verify' only: keep a persistent headless browser
                         (per-project CDP port) so the page - navigation, open
                         form, JS state - SURVIVES between verify calls:
@@ -2998,8 +3159,65 @@ Common options:
 "@
 }
 
+# ---------------------------------------------------- stable entry point ----
+# When installed as a plugin, this script's real path carries the PLUGIN
+# VERSION (...\plugins\cache\<marketplace>\lsfusion-ai-skills\<version>\
+# skills\lsfusion-dev\scripts\lsfdev.ps1), so every plugin update kills any
+# remembered absolute path (measured: a session memory pointing at 0.1.18
+# failed after the cache moved to 0.1.20). Every run therefore maintains a
+# tiny forwarder at a VERSION-INDEPENDENT path:
+#
+#   %LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1
+#
+# which re-resolves the newest installed skill copy at call time and forwards
+# all arguments (and the exit code) to it. That path is the one to remember,
+# document, and put in session memories.
+function Sync-StableShim {
+    try {
+        if (-not $env:LOCALAPPDATA) { return $null }
+        $shimDir = Join-Path $env:LOCALAPPDATA "lsfusion-dev"
+        # Degenerate install guard: if THIS script already runs from the shim
+        # location, rewriting it would overwrite the running file with
+        # forwarder text and orphan the next call.
+        if ("$PSScriptRoot".TrimEnd('\') -ieq $shimDir.TrimEnd('\')) { return (Join-Path $shimDir "lsfdev.ps1") }
+        $self = Join-Path $PSScriptRoot "lsfdev.ps1"
+        $shimText = @'
+# Auto-generated by the lsfusion-dev skill - STABLE entry point for lsfdev.ps1.
+# The real script lives under the Claude plugin cache, whose path contains the
+# plugin VERSION and changes on every plugin update; THIS path never changes.
+# The shim re-resolves the newest installed copy on every call and forwards
+# all arguments and the exit code. Remember this path, not the versioned one.
+$real = $null
+$cands = @(Get-ChildItem "$env:USERPROFILE\.claude\plugins\cache\*\lsfusion-ai-skills\*\skills\lsfusion-dev\scripts\lsfdev.ps1" -ErrorAction SilentlyContinue)
+if ($cands.Count) {
+    $real = ($cands | Sort-Object -Property `
+        @{Expression = { Test-Path (Join-Path $_.Directory.Parent.Parent.Parent.FullName '.in_use') }; Descending = $true},
+        @{Expression = { try { [version]$_.Directory.Parent.Parent.Parent.Name } catch { [version]'0.0' } }; Descending = $true} |
+        Select-Object -First 1).FullName
+}
+if (-not $real -and (Test-Path '__FALLBACK__')) { $real = '__FALLBACK__' }
+if (-not $real) {
+    Write-Host "[FAIL] No installed lsfusion-dev skill found: the plugin cache glob matched nothing and the copy that generated this shim is gone. Reinstall the lsfusion-ai-skills plugin (or call its skills\lsfusion-dev\scripts\lsfdev.ps1 directly)." -ForegroundColor Red
+    exit 1
+}
+& $real @args
+exit $LASTEXITCODE
+'@
+        $shimText = $shimText.Replace('__FALLBACK__', $self)
+        $shimPath = Join-Path $shimDir "lsfdev.ps1"
+        $current = ""
+        if (Test-Path $shimPath) { try { $current = [IO.File]::ReadAllText($shimPath) } catch { } }
+        if ($current -ne $shimText) {
+            New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+            [IO.File]::WriteAllText($shimPath, $shimText, (New-Object System.Text.UTF8Encoding($false)))
+        }
+        return $shimPath
+    } catch { return $null }
+}
+
 # ---------------------------------------------------------------- dispatch --
 
+$script:StableShimPath = Sync-StableShim
 try {
     switch ($Command.ToLower()) {
         "clone"           { Cmd-Clone }

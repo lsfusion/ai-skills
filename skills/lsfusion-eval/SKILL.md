@@ -353,7 +353,14 @@ producing the polite restriction error — measured on 7.0-SNAPSHOT:
 overrides of existing actions (`ClassCastException ... NFList`). A file
 containing those can't be linted past the offending statement — the
 restart is the only check for it (`precheck` reports such files as
-"cannot lint" rather than failing them). For a whole new module in one
+"cannot lint" rather than failing them). The limit case is a file that is
+*entirely* META definitions / `@`-instantiations / `EXTEND FORM` (a
+typical extension/main module): eval coverage there is **zero** — META
+bodies compile only at instantiation — and `precheck` classifies such
+files upfront as **"restart-only"**, checking just the structure (MODULE
+header, META/END balance, brackets); neither an ambiguity nor a
+constraint error in them can surface before the restart, so budget that
+cycle instead of re-linting. For a whole new module in one
 pass, temporarily strip the load-only options
 (`NONULL`/`MATERIALIZED`/`INDEXED`) so the `DATA`/calc/form surface
 checks cleanly, and probe each `CLASS`/`WHEN`/`CONSTRAINT` separately.

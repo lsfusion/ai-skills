@@ -66,16 +66,28 @@ it with a bypassed execution policy so it runs regardless of system settings:
 powershell -ExecutionPolicy Bypass -File .claude/skills/lsfusion-dev/scripts/lsfdev.ps1 <command> [options]
 ```
 
-**Resolve the real script path first — it is often not `.claude/skills/…`.**
-The path above holds only for a project-local skill copy. When `lsfusion-dev`
-is installed as a **plugin** (the usual case), `lsfdev.ps1` lives under the
-plugin cache instead, e.g.
-`C:\Users\<user>\.claude\plugins\cache\lsfusion\lsfusion-ai-skills\<ver>\skills\lsfusion-dev\scripts\lsfdev.ps1`.
-Invoking the relative `.claude/skills/...` path there fails with *"The argument
-… does not exist"* (exit 127). This `SKILL.md` file's own directory is the
-skill root: take the absolute path of the `scripts/lsfdev.ps1` next to it and
-use that (quoted) in every invocation. The examples below keep writing the
-short relative form for brevity — substitute your resolved absolute path.
+**Prefer the STABLE path — `%LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1`.** Every
+`lsfdev.ps1` run (any command) refreshes a tiny forwarder at that
+version-independent path; it re-resolves the newest installed skill copy at
+call time and forwards all arguments and the exit code. Once it exists (i.e.
+after the first lsfdev call ever on the machine), **call that path and put
+only that path in session memories / notes**. The reason: when the skill is
+installed as a **plugin** (the usual case), the real script lives under the
+plugin cache at
+`C:\Users\<user>\.claude\plugins\cache\lsfusion\lsfusion-ai-skills\<ver>\skills\lsfusion-dev\scripts\lsfdev.ps1`
+— a path that **embeds the plugin version and dies on every plugin update**
+(measured: a remembered `…\0.1.18\…` path failed with "does not exist" after
+the cache moved to `0.1.20`). A remembered stable path never rots this way.
+
+**First call on a fresh machine (no shim yet): resolve the real script path —
+it is often not `.claude/skills/…`.** The relative path above holds only for
+a project-local skill copy; invoking it under a plugin install fails with
+*"The argument … does not exist"* (exit 127). This `SKILL.md` file's own
+directory is the skill root: take the absolute path of the
+`scripts/lsfdev.ps1` next to it and use that (quoted) — the run itself then
+creates/updates the stable shim for every later call (`setup`/`check` print
+the shim path). The examples below keep writing the short relative form for
+brevity — substitute the stable path (or your resolved absolute path).
 
 `-ExecutionPolicy Bypass` is **required** on a default Windows install: without
 it PowerShell refuses to load unsigned `.ps1` files with
@@ -200,10 +212,10 @@ a running `verify -Session` browser, or anything else that happened before.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server). |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/press/eval/wait by any Playwright selector) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
-| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"). See "run `precheck`" below. |
+| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
@@ -216,8 +228,8 @@ re-download the client war at the same version — the `-SNAPSHOT`
 war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
-`-Do` (verify: generic click/hover/drag/mouse/fill/type/press/eval/wait steps
-by Playwright selector — see step 5), `-Session` / `-Reload` / `-EndSession`
+`-Do` (verify: generic click/hover/drag/mouse/fill/type/edit/press/eval/wait
+steps by Playwright selector, first visible match — see step 5), `-Session` / `-Reload` / `-EndSession`
 (verify: persistent browser between calls; `-Reload` forces a page reload in
 it), `-ScriptFile`, `-Timeout`. Run the script with no command to print full
 usage.
@@ -769,7 +781,25 @@ checked** (measured: the restriction preempts name resolution for the
 whole script, wherever the construct sits). Two constructs crash eval's
 compiler outright — `EXTEND FORM` and `() + { }` overrides of existing
 actions — such files come back as "cannot lint: only a restart checks
-this file". Do **not** use `api` for any of this: its `/eval/action`
+this file".
+
+**Know the restart-only file class — precheck names it upfront.** A file
+that is *entirely* META definitions / `@`-instantiations / `EXTEND FORM`
+(the typical "main project file" or extension module that decorates other
+modules' forms) gives eval **zero** coverage: META bodies compile only at
+instantiation and `EXTEND FORM` crashes the eval compiler, so precheck
+can catch **neither ambiguity nor constraint errors there** — for such
+files precheck reports **"restart-only"** immediately instead of a hollow
+PASS or a crash message. It still validates structure — MODULE header,
+**META/END balance** (an unclosed META is a hard FAIL: it swallows the
+rest of the file at restart) and bracket balance (a warning) — but plan
+your loop around the truth: **for a restart-only file, the restart IS the
+check**; go straight to it and read the log, don't spend cycles
+re-running precheck on that file. Files that merely *declare* META next
+to other code are linted normally and the verdict carries the caveat that
+un-instantiated META bodies stay unchecked until restart.
+
+Do **not** use `api` for any of this: its `/eval/action`
 endpoint wraps the script as an action body and any declaration dies
 with misleading wrapped-brace parse errors. The lsfusion-eval skill's
 "Syntax-checking `.lsf` without a restart" has the phase table and the
@@ -924,10 +954,14 @@ checking the unit-test output.
      The script compiles against *all* loaded modules — a bare name that is
      unique in your module (`name`, `date`, …) is routinely ambiguous here.
      Same rule as `api` scripts.
-   - `-OpenExpect "<text>"` waits for that visible text on the opened form
-     (caption, field label, a known cell value) and reports found /
-     not-found — that's your assertion; without it you just get the
-     screenshot.
+   - `-OpenExpect "<text>"` waits for that text on the opened form and
+     reports found / not-found — that's your assertion; without it you just
+     get the screenshot. It matches **visible text nodes AND the values of
+     visible inputs** (a form field's content is an input `value`, not a
+     text node — the value-only case used to false-negative on perfectly
+     healthy forms), and the report says which kind matched: a plain
+     "visible" for text, "as the VALUE of a visible input" for field
+     content.
    - Non-ASCII script text (Cyrillic keys, localized captions) → UTF-8 file
      + `-OpenScriptFile`, exactly like `api -ScriptFile` (see the UTF-8
      pitfall in step 4).
@@ -982,11 +1016,32 @@ checking the unit-test output.
      selector from value; a plain last `=` also works);
    - `type:<selector>=><value>` — same but pressing real keys, for React
      inputs that ignore programmatic fills;
+   - `edit:<caption>=><value>` — **the way to type into an lsFusion
+     panel/grid cell**: the in-place editor's `<input>` does not exist until
+     the cell gets focus, so `fill:`/`type:` can never reach it, and a blind
+     `dblclick@x,y` is viewport-fragile. `edit:` finds the panel cell by its
+     visible caption (the platform's own label→cell wiring, exact match then
+     substring; any Playwright selector also works as the target — that's
+     how you hit a *grid* cell), double-clicks it, selects all, types the
+     value and presses Enter. A caption miss fails fast and prints the
+     editable panel captions of the page; a cell whose double-click opens no
+     editor (read-only, action property) fails with that diagnosis instead
+     of typing into the void;
    - `press:<key>` (e.g. `Enter`), `eval:<js>` (result lands in the report),
      `wait:<ms>`.
 
+   `-Do` selectors resolve to the **first VISIBLE match**. The web client
+   keeps the full DOM of inactive docked tabs — toolbars included — so a
+   selector like `button:has-text("Zapisz")` routinely matches a hidden
+   duplicate first; the old first-match behavior then timed out with no
+   hint. Hidden matches are now skipped automatically and reported in the
+   step result (`2 matched, using first visible (#2)`); when **every**
+   match is hidden the step fails with exactly that diagnosis (scope the
+   selector or close the other tabs). You no longer need to append
+   `:visible` by hand, though it remains valid.
+
    ```
-   lsfdev.ps1 verify -Click "Расписание" -Do "fill:input.comment=>Иванов", "drag:.gantt-task-a=>.gantt-task-b", "click:button:has-text('Поставить')"
+   lsfdev.ps1 verify -Click "Расписание" -Do "edit:Комментарий=>Иванов", "drag:.gantt-task-a=>.gantt-task-b", "click:button:has-text('Поставить')"
    ```
 
    The chain stops at the first failed step; each step's ok/error (and every
