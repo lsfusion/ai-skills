@@ -2345,6 +2345,25 @@ function Get-LsfMaskedText([string]$text, [bool]$blankComments, [bool]$blankStri
             }
             continue
         }
+        # --- inline Java code literals <{ ... }> ----------------------------
+        # CODE_LITERAL is a single token ending at the FIRST '}>' (ANTLR's
+        # nongreedy .*). Its content is Java: double-quoted strings, Java
+        # comments, braces - and even the words META/END - may appear and
+        # must not leak into string/comment tracking or structural counts.
+        if ($c -eq '<' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '{') {
+            if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+            $i += 2
+            while ($i -lt $n) {
+                if ($chars[$i] -eq '}' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '>') {
+                    if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+                    $i += 2
+                    break
+                }
+                if ($blankStrings -and $chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
+                $i++
+            }
+            continue
+        }
         # --- raw strings ----------------------------------------------------
         if (($c -eq 'r' -or $c -eq 'R') -and (($i -eq 0) -or ("$($text[$i - 1])" -cnotmatch '[A-Za-z0-9_#]'))) {
             # simple form: r'...' - ends at the FIRST quote, no escapes
@@ -3282,9 +3301,18 @@ function Sync-StableShim {
         # and the literal fallback path.
         $cacheRoot = ""
         try {
+            # scripts -> lsfusion-dev -> skills -> <version>; then the root is
+            # THREE more levels up (<version> -> lsfusion-ai-skills ->
+            # <marketplace> -> root), matching the shim's
+            # <root>\*\lsfusion-ai-skills\*\skills\... glob shape. Both the
+            # version-looking leaf and the plugin-dir name are asserted, so a
+            # repo checkout (or any other layout) embeds nothing.
             $verDir = Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent
             if ($verDir -and ((Split-Path $verDir -Leaf) -match '^\d+(\.\d+)*([.-].+)?$')) {
-                $cacheRoot = Split-Path (Split-Path $verDir -Parent) -Parent
+                $pluginDir = Split-Path $verDir -Parent
+                if ($pluginDir -and ((Split-Path $pluginDir -Leaf) -ieq 'lsfusion-ai-skills')) {
+                    $cacheRoot = Split-Path (Split-Path $pluginDir -Parent) -Parent
+                }
             }
         } catch { }
         $shimText = @'
