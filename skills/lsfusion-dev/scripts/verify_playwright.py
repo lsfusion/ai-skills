@@ -73,30 +73,38 @@ def _resolve_visible(page, sel: str, timeout_ms: int = 15000):
     not — and the lsFusion web client keeps full duplicate toolbars/forms in
     the DOM for every docked-but-inactive tab, so a selector like
     ``button:has-text("Save")`` routinely matches an invisible copy first
-    and the click times out with no hint. This helper polls until some match
-    is visible and returns ``(locator, note)`` where note says when
-    duplicates were skipped (``"3 matched, using first visible (#2)"``).
-    Raises ValueError with the diagnosis when matches exist but every one is
-    hidden, or when nothing matches at all.
+    and the click times out with no hint. ``.locator("visible=true")`` is
+    Playwright's FILTERING engine (measured: filters the matched set itself
+    — including visibility:hidden — rather than descending into children),
+    so the visible subset is computed with no match cap and no per-element
+    round-trips. Returns ``(locator, note)`` where note reports skipped
+    hidden duplicates (``"3 matched, 1 visible - using the first visible"``).
+    Raises ValueError when matches exist but every one is hidden, or when
+    nothing matches; a selector that cannot be parsed re-raises Playwright's
+    own error (three strikes, so transient mid-navigation evaluation
+    failures don't) — the parse message beats a misleading
+    "matched nothing" after a silent 15 s wait.
     """
     loc = page.locator(sel)
+    vis = loc.locator("visible=true")
     deadline = time.time() + timeout_ms / 1000
     n = 0
+    bad = 0
     while True:
         try:
             n = loc.count()
-        except PWError:
-            n = 0  # malformed selectors raise later, on the action itself
-        for i in range(min(n, 50)):
-            nth = loc.nth(i)
-            try:
-                if nth.is_visible():
+            if n:
+                nv = vis.count()
+                if nv:
                     note = ""
                     if n > 1:
-                        note = f"{n} matched, using first visible (#{i + 1})"
-                    return nth, note
-            except PWError:
-                pass
+                        note = f"{n} matched, {nv} visible - using the first visible"
+                    return vis.first, note
+            bad = 0
+        except PWError:
+            bad += 1
+            if bad >= 3:
+                raise
         if time.time() >= deadline:
             break
         page.wait_for_timeout(250)
@@ -109,31 +117,29 @@ def _resolve_visible(page, sel: str, timeout_ms: int = 15000):
     raise ValueError(f"{sel!r} matched nothing within {timeout_ms} ms")
 
 
-def _any_visible(loc, cap: int = 20) -> bool:
-    """True when at least one of the locator's matches is visible."""
+def _any_visible(loc) -> bool:
+    """True when at least one of the locator's matches is visible.
+    Uses the visible=true filtering engine — no match cap."""
     try:
-        n = loc.count()
+        return loc.locator("visible=true").count() > 0
     except PWError:
         return False
-    for i in range(min(n, cap)):
-        try:
-            if loc.nth(i).is_visible():
-                return True
-        except PWError:
-            pass
-    return False
 
 
 # --open-expect fallback: text inside <input>/<textarea>/<select> is an
 # element VALUE, not a text node, so text locators never see it — a healthy
 # settings form full of inputs used to report "NOT found" on the very value
 # it displayed. Checks visible form controls' values (and the selected
-# option's label) for a case-insensitive substring match.
+# option's label) for a case-insensitive substring match. Visibility mirrors
+# Playwright's: a real box AND not visibility:hidden (which keeps its layout
+# rect, so a rect check alone would pass hidden inputs of inactive forms).
 _INPUT_VALUE_JS = """
 (needle) => {
   const n = (needle || '').toLowerCase();
   const vis = el => { const r = el.getClientRects()[0];
-                      return !!r && r.width > 0.5 && r.height > 0.5; };
+                      const cs = getComputedStyle(el);
+                      return !!r && r.width > 0.5 && r.height > 0.5 &&
+                             cs.visibility !== 'hidden' && cs.display !== 'none'; };
   for (const el of document.querySelectorAll('input, textarea, select')) {
     if (!vis(el)) continue;
     let v = '' + (el.value == null ? '' : el.value);
@@ -173,7 +179,9 @@ _PANEL_CELL_JS = """
   const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
   const target = norm(caption);
   const vis = el => { const r = el.getClientRects()[0];
-                      return !!r && r.width > 0.5 && r.height > 0.5; };
+                      const cs = getComputedStyle(el);
+                      return !!r && r.width > 0.5 && r.height > 0.5 &&
+                             cs.visibility !== 'hidden' && cs.display !== 'none'; };
   const labels = [...document.querySelectorAll('.panel-property-label')].filter(vis);
   const hit = labels.find(l => norm(l.textContent) === target)
            || labels.find(l => norm(l.textContent).includes(target));
@@ -188,7 +196,9 @@ _PANEL_CAPTIONS_JS = """
 () => {
   const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
   const vis = el => { const r = el.getClientRects()[0];
-                      return !!r && r.width > 0.5 && r.height > 0.5; };
+                      const cs = getComputedStyle(el);
+                      return !!r && r.width > 0.5 && r.height > 0.5 &&
+                             cs.visibility !== 'hidden' && cs.display !== 'none'; };
   return [...new Set([...document.querySelectorAll('.panel-property-label')]
       .filter(vis).map(l => norm(l.textContent)).filter(Boolean))];
 }
@@ -1048,7 +1058,7 @@ def main() -> int:
                                 # form open the first dblclick can land while
                                 # the cell is still wiring up.
                                 editor = None
-                                for attempt in range(2):
+                                for _ in range(2):
                                     cell.dblclick(timeout=15000)
                                     page.wait_for_timeout(400)
                                     editor = page.evaluate(
@@ -1056,8 +1066,9 @@ def main() -> int:
                                         " if (!a) return null;"
                                         " const t = a.tagName.toLowerCase();"
                                         " if (t === 'input' || t === 'textarea'"
-                                        "     || t === 'select' || a.isContentEditable)"
-                                        "   return t;"
+                                        "     || t === 'select') return t;"
+                                        " if (a.isContentEditable)"
+                                        "   return 'contenteditable';"
                                         " return null; }")
                                     if editor:
                                         break
@@ -1068,7 +1079,12 @@ def main() -> int:
                                         "editor (read-only cell? an action "
                                         "property? wrong cell?) - nothing was "
                                         "typed")
-                                if editor in ("input", "textarea"):
+                                # Replace, not append: select-all first. In a
+                                # contenteditable Ctrl+A selects the editable
+                                # root's content, same effect as in an input;
+                                # only <select> (keyboard option matching)
+                                # must skip it.
+                                if editor != "select":
                                     page.keyboard.press("Control+a")
                                 page.keyboard.type(value, delay=30)
                                 page.keyboard.press("Enter")

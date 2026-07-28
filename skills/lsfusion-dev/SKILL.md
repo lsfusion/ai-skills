@@ -1035,10 +1035,11 @@ checking the unit-test output.
    selector like `button:has-text("Zapisz")` routinely matches a hidden
    duplicate first; the old first-match behavior then timed out with no
    hint. Hidden matches are now skipped automatically and reported in the
-   step result (`2 matched, using first visible (#2)`); when **every**
-   match is hidden the step fails with exactly that diagnosis (scope the
-   selector or close the other tabs). You no longer need to append
-   `:visible` by hand, though it remains valid.
+   step result (`2 matched, 1 visible - using the first visible`); when
+   **every** match is hidden the step fails with exactly that diagnosis
+   (scope the selector or close the other tabs), and a selector that can't
+   be parsed fails fast with Playwright's own parse error. You no longer
+   need to append `:visible` by hand, though it remains valid.
 
    ```
    lsfdev.ps1 verify -Click "Расписание" -Do "edit:Комментарий=>Иванов", "drag:.gantt-task-a=>.gantt-task-b", "click:button:has-text('Поставить')"

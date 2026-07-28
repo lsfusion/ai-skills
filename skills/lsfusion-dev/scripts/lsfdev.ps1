@@ -2301,68 +2301,149 @@ function Get-ErrorResponseBody($err) {
     return $null
 }
 
-# Comment-blanked shadow of .lsf text: every character inside a // or /* */
-# comment becomes a space (line breaks kept), all other text - string
-# literals included - stays put, so positions match the original. One
-# lexical pass, not two regex passes: with regexes, a '/*' sitting inside a
-# line comment would open a phantom block that swallows real code. String
-# literals are tracked too ('...' with backslash escapes), so comment
-# openers inside strings don't blank anything.
-function Get-CommentBlankedShadow([string]$text) {
+# One lexical pass over .lsf text producing a same-length "shadow": selected
+# token classes become spaces, line breaks are kept, so LINE:COL positions
+# always match the original. Token classes follow the platform lexer
+# (LsfLogics.g), because naive quote-scanning misparses real literals:
+#   - comments: // to EOL, /* */ (a '/*' inside a line comment or a string
+#     must not open a phantom block);
+#   - strings: '...' with backslash escapes AND ${ ... } interpolation blocks
+#     (brace-nested, backslash escapes, bare quotes are LEGAL inside - a
+#     quote-scanner would cut '${f('x')}' short);
+#   - raw strings: r'...' / R'...' has NO escapes (r'C:\' is a complete
+#     literal - treating \ as an escape swallows the closing quote and
+#     derails everything after), and the delimited form r<S>'...'<S> (S = a
+#     special char) whose content may hold quotes and newlines. r/R counts
+#     as a raw prefix only when it STARTS the token: the char before it in
+#     the ORIGINAL text must not be [A-Za-z0-9_#] (else foor'x' / ##r'x'
+#     would misparse).
+function Get-LsfMaskedText([string]$text, [bool]$blankComments, [bool]$blankStrings) {
     $chars = $text.ToCharArray()
     $n = $chars.Length
-    $state = 'code'
-    for ($i = 0; $i -lt $n; $i++) {
+    $i = 0
+    while ($i -lt $n) {
         $c = $chars[$i]
-        if ($state -eq 'code') {
-            if ($c -eq "'") { $state = 'str' }
-            elseif ($c -eq '/' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '/') {
-                $state = 'line'; $chars[$i] = ' '; $chars[$i + 1] = ' '; $i++
+        # --- comments -------------------------------------------------------
+        if ($c -eq '/' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '/') {
+            while ($i -lt $n -and $chars[$i] -ne "`n" -and $chars[$i] -ne "`r") {
+                if ($blankComments) { $chars[$i] = ' ' }
+                $i++
             }
-            elseif ($c -eq '/' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '*') {
-                $state = 'block'; $chars[$i] = ' '; $chars[$i + 1] = ' '; $i++
+            continue
+        }
+        if ($c -eq '/' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '*') {
+            if ($blankComments) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+            $i += 2
+            while ($i -lt $n) {
+                if ($chars[$i] -eq '*' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '/') {
+                    if ($blankComments) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+                    $i += 2
+                    break
+                }
+                if ($blankComments -and $chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
+                $i++
             }
-        } elseif ($state -eq 'str') {
-            if ($c -eq '\') { $i++ }
-            elseif ($c -eq "'") { $state = 'code' }
-        } elseif ($state -eq 'line') {
-            if ($c -eq "`n" -or $c -eq "`r") { $state = 'code' }
-            else { $chars[$i] = ' ' }
-        } else {  # block
-            if ($c -eq '*' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '/') {
-                $chars[$i] = ' '; $chars[$i + 1] = ' '; $i++; $state = 'code'
-            } elseif ($c -ne "`r" -and $c -ne "`n") {
-                $chars[$i] = ' '
+            continue
+        }
+        # --- raw strings ----------------------------------------------------
+        if (($c -eq 'r' -or $c -eq 'R') -and (($i -eq 0) -or ("$($text[$i - 1])" -cnotmatch '[A-Za-z0-9_#]'))) {
+            # simple form: r'...' - ends at the FIRST quote, no escapes
+            if (($i + 1) -lt $n -and $chars[$i + 1] -eq "'") {
+                if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+                $i += 2
+                while ($i -lt $n -and $chars[$i] -ne "'") {
+                    if ($blankStrings -and $chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
+                    $i++
+                }
+                if ($i -lt $n) { if ($blankStrings) { $chars[$i] = ' ' }; $i++ }
+                continue
+            }
+            # delimited form: r<S>'...'<S>, S = RAW_STR_SPECIAL_CHAR (not a
+            # letter/digit/_/space/newline/quote and not one of +*,=<>()[]{}#)
+            if (($i + 2) -lt $n -and $chars[$i + 2] -eq "'") {
+                $s = $chars[$i + 1]
+                $specialOk = (-not [char]::IsLetterOrDigit($s)) -and ($s -ne '_') -and
+                             ($s -ne ' ') -and ($s -ne "`t") -and ($s -ne "`n") -and ($s -ne "`r") -and
+                             ($s -ne "'") -and ('+*,=<>()[]{}#'.IndexOf($s) -lt 0)
+                if ($specialOk) {
+                    if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' '; $chars[$i + 2] = ' ' }
+                    $i += 3
+                    while ($i -lt $n) {
+                        if ($chars[$i] -eq "'" -and ($i + 1) -lt $n -and $chars[$i + 1] -eq $s) {
+                            if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+                            $i += 2
+                            break
+                        }
+                        if ($blankStrings -and $chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
+                        $i++
+                    }
+                    continue
+                }
             }
         }
+        # --- ordinary strings (escapes + ${...} interpolation) --------------
+        if ($c -eq "'") {
+            if ($blankStrings) { $chars[$i] = ' ' }
+            $i++
+            while ($i -lt $n) {
+                $sc = $chars[$i]
+                if ($sc -eq '\') {
+                    if ($blankStrings) { $chars[$i] = ' ' }
+                    $i++
+                    if ($i -lt $n) {
+                        if ($blankStrings -and $chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
+                        $i++
+                    }
+                    continue
+                }
+                if ($sc -eq '$' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '{') {
+                    if ($blankStrings) { $chars[$i] = ' '; $chars[$i + 1] = ' ' }
+                    $i += 2
+                    $depth = 1
+                    while ($i -lt $n -and $depth -gt 0) {
+                        $bc = $chars[$i]
+                        if ($bc -eq '\') {
+                            if ($blankStrings) { $chars[$i] = ' ' }
+                            $i++
+                            if ($i -lt $n) {
+                                if ($blankStrings -and $chars[$i] -ne "`r" -and $chars[$i] -ne "`n") { $chars[$i] = ' ' }
+                                $i++
+                            }
+                            continue
+                        }
+                        if ($bc -eq '{') { $depth++ } elseif ($bc -eq '}') { $depth-- }
+                        if ($blankStrings -and $bc -ne "`r" -and $bc -ne "`n") { $chars[$i] = ' ' }
+                        $i++
+                    }
+                    continue
+                }
+                if ($sc -eq "'") {
+                    if ($blankStrings) { $chars[$i] = ' ' }
+                    $i++
+                    break
+                }
+                if ($blankStrings -and $sc -ne "`r" -and $sc -ne "`n") { $chars[$i] = ' ' }
+                $i++
+            }
+            continue
+        }
+        $i++
     }
     return -join $chars
 }
 
-# String-blanked version of a comment-blanked shadow: every character inside a
-# '...' literal (quotes included) becomes a space. The comment shadow keeps
-# string contents on purpose (positions must match the file for eval errors);
-# structural scans (bracket balance, META/END counting, statement extents)
-# must NOT see a '(' or an END living inside a caption string, so they run on
-# this second-pass shadow instead.
+# Comment-blanked shadow: comments become spaces, all other text - string
+# literals included - stays put (eval error positions must match the file).
+function Get-CommentBlankedShadow([string]$text) {
+    return Get-LsfMaskedText $text $true $false
+}
+
+# Structural shadow: comments AND every string-literal form become spaces.
+# Structural scans (bracket balance, META/END counting, statement extents)
+# must not see a '(' or an END living inside a caption string. Input may be
+# raw text or an already comment-blanked shadow - same result.
 function Get-StructuralShadow([string]$shadow) {
-    $chars = $shadow.ToCharArray()
-    $n = $chars.Length
-    $inStr = $false
-    for ($i = 0; $i -lt $n; $i++) {
-        $c = $chars[$i]
-        if (-not $inStr) {
-            if ($c -eq "'") { $inStr = $true; $chars[$i] = ' ' }
-        } else {
-            if ($c -eq '\') {
-                $chars[$i] = ' '
-                if (($i + 1) -lt $n -and $chars[$i + 1] -ne "`r" -and $chars[$i + 1] -ne "`n") { $chars[$i + 1] = ' '; $i++ }
-            }
-            elseif ($c -eq "'") { $inStr = $false; $chars[$i] = ' ' }
-            elseif ($c -ne "`r" -and $c -ne "`n") { $chars[$i] = ' ' }
-        }
-    }
-    return -join $chars
+    return Get-LsfMaskedText $shadow $true $true
 }
 
 # Blank every statement that starts at $startPattern and ends at the first ';'
@@ -2399,18 +2480,27 @@ function Remove-DepthStatements([string]$s, [string]$startPattern) {
 # residue, and the file then just takes the normal eval path.
 function Get-EvalCoverage([string]$structShadow) {
     $s = $structShadow
-    $metaOpen  = [regex]::Matches($s, '(?m)^[ \t]*META\b').Count
-    $metaEnd   = [regex]::Matches($s, '(?m)^[ \t]*END\b').Count
-    $hasExtend = [regex]::IsMatch($s, '(?m)^[ \t]*EXTEND\s+FORM\b')
-    $hasUsage  = [regex]::IsMatch($s, '(?m)^[ \t]*@[A-Za-z_]')
+    # Token-level, NOT line-anchored: lsFusion newlines are ordinary token
+    # separators, so 'p() = 1; END' with END mid-line is a perfectly legal
+    # META closer - a line-start-only count would flag a false unclosed-META
+    # FAIL on it. [regex] static calls are case-sensitive, matching the
+    # case-sensitive keywords. Trade-off: END is also a DESIGN alignment
+    # literal (alignment = END), which can only INFLATE MetaEnd - that can
+    # mask an unclosed META (missed detection) but never produce a false
+    # unclosed-META FAIL; the surplus direction is reported as a mere Warn,
+    # and only for files that declare META at all.
+    $metaOpen  = [regex]::Matches($s, '\bMETA\b').Count
+    $metaEnd   = [regex]::Matches($s, '\bEND\b').Count
+    $hasExtend = [regex]::IsMatch($s, '\bEXTEND\s+FORM\b')
+    $hasUsage  = [regex]::IsMatch($s, '@[A-Za-z_]')
     # Headers out first (structural variant: every occurrence, no
     # well-formedness gate - this is coverage math, not eval input).
-    $s = [regex]::Replace($s, '(?m)^[ \t]*(MODULE|REQUIRE|NAMESPACE|PRIORITY)\b[^;]*;', ' ')
-    # META bodies: non-greedy to the first line-start END (flat definitions;
-    # nested ones leave residue - conservative).
-    $s = [regex]::Replace($s, '(?ms)^[ \t]*META\b.*?^[ \t]*END\b[ \t]*;?', ' ')
-    $s = Remove-DepthStatements $s '(?m)^[ \t]*@[A-Za-z_]'
-    $s = Remove-DepthStatements $s '(?m)^[ \t]*EXTEND\s+FORM\b'
+    $s = [regex]::Replace($s, '\b(MODULE|REQUIRE|NAMESPACE|PRIORITY)\b[^;]*;', ' ')
+    # META bodies: lazy to the first END token (flat definitions; nested ones
+    # or an alignment END inside the body leave residue - conservative).
+    $s = [regex]::Replace($s, '(?s)\bMETA\b.*?\bEND\b[ \t]*;?', ' ')
+    $s = Remove-DepthStatements $s '@[A-Za-z_]'
+    $s = Remove-DepthStatements $s '\bEXTEND\s+FORM\b'
     return @{
         MetaOpen  = $metaOpen
         MetaEnd   = $metaEnd
@@ -2605,14 +2695,15 @@ function Cmd-Precheck {
             $cov = Get-EvalCoverage $structShadow
             if ($cov.MetaOpen -gt $cov.MetaEnd) {
                 $failCount++
-                Bad "$leaf - FAIL: unclosed META ($($cov.MetaOpen) META vs $($cov.MetaEnd) line-start END outside comments/strings) - an unclosed META swallows the rest of the file at restart."
+                Bad "$leaf - FAIL: unclosed META ($($cov.MetaOpen) META vs $($cov.MetaEnd) END outside comments/strings) - an unclosed META swallows the rest of the file at restart."
                 continue
             }
-            if ($cov.MetaEnd -gt $cov.MetaOpen) {
-                # Only a Warn: END is also a DESIGN alignment literal, which
-                # in exotic formatting can start a line - a false FAIL here
-                # would cost more trust than the rare uncaught stray END.
-                Warn "$leaf - $($cov.MetaEnd) line-start END vs $($cov.MetaOpen) META: a genuinely stray END fails the restart parse (ignore if an END here is a DESIGN alignment value at line start)."
+            if ($cov.MetaOpen -gt 0 -and $cov.MetaEnd -gt $cov.MetaOpen) {
+                # Only a Warn, and only for META-declaring files: END is also
+                # a DESIGN alignment literal (alignment = END), so a surplus
+                # END is often legitimate - a false FAIL here would cost more
+                # trust than the rare uncaught stray END.
+                Warn "$leaf - $($cov.MetaEnd) END vs $($cov.MetaOpen) META: a genuinely stray END fails the restart parse (ignore if the extra END is a DESIGN alignment value)."
             }
             $balanceNotes = @()
             foreach ($pair in @(@('(', ')'), @('{', '}'), @('[', ']'))) {
@@ -3082,9 +3173,9 @@ Common options:
                         client keeps whole duplicate toolbars of inactive
                         docked tabs in the DOM, so a bare first-match click
                         used to hang on a hidden copy - hidden matches are now
-                        skipped and reported ('3 matched, using first visible
-                        (#2)'); if every match is hidden the step fails with
-                        that diagnosis. 'edit' drives the lsFusion IN-PLACE
+                        skipped and reported ('3 matched, 1 visible - using
+                        the first visible'); if every match is hidden the
+                        step fails with that diagnosis. 'edit' drives the lsFusion IN-PLACE
                         editor (fill/type can't - the <input> exists only
                         after the cell is focused): it finds the panel cell by
                         its visible caption (or any selector, e.g. a grid
@@ -3181,14 +3272,40 @@ function Sync-StableShim {
         # forwarder text and orphan the next call.
         if ("$PSScriptRoot".TrimEnd('\') -ieq $shimDir.TrimEnd('\')) { return (Join-Path $shimDir "lsfdev.ps1") }
         $self = Join-Path $PSScriptRoot "lsfdev.ps1"
+        # The cache root THIS copy is installed under (…\<root>\<marketplace>\
+        # lsfusion-ai-skills\<version>\skills\lsfusion-dev\scripts). Embedded
+        # into the shim as an extra search root, so nonstandard cache
+        # locations (relocated config dirs, custom cache env vars) keep
+        # working: a plugin update lands in the same root the current copy
+        # runs from. Empty when the layout is not a versioned plugin cache
+        # (e.g. a repo checkout) - the shim then relies on the other roots
+        # and the literal fallback path.
+        $cacheRoot = ""
+        try {
+            $verDir = Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent
+            if ($verDir -and ((Split-Path $verDir -Leaf) -match '^\d+(\.\d+)*([.-].+)?$')) {
+                $cacheRoot = Split-Path (Split-Path $verDir -Parent) -Parent
+            }
+        } catch { }
         $shimText = @'
 # Auto-generated by the lsfusion-dev skill - STABLE entry point for lsfdev.ps1.
 # The real script lives under the Claude plugin cache, whose path contains the
 # plugin VERSION and changes on every plugin update; THIS path never changes.
 # The shim re-resolves the newest installed copy on every call and forwards
 # all arguments and the exit code. Remember this path, not the versioned one.
+# Search roots: CLAUDE_CONFIG_DIR\plugins\cache (relocated config dir), the
+# cache root the generating copy was installed under, and the default
+# USERPROFILE\.claude\plugins\cache.
+$roots = @()
+if ($env:CLAUDE_CONFIG_DIR) { $roots += (Join-Path $env:CLAUDE_CONFIG_DIR 'plugins\cache') }
+$roots += '__CACHEROOT__'
+if ($env:USERPROFILE) { $roots += (Join-Path $env:USERPROFILE '.claude\plugins\cache') }
+$cands = @()
+foreach ($r in @($roots | Where-Object { $_ } | Select-Object -Unique)) {
+    $cands += @(Get-ChildItem (Join-Path $r '*\lsfusion-ai-skills\*\skills\lsfusion-dev\scripts\lsfdev.ps1') -ErrorAction SilentlyContinue)
+}
+$cands = @($cands | Sort-Object -Property FullName -Unique)
 $real = $null
-$cands = @(Get-ChildItem "$env:USERPROFILE\.claude\plugins\cache\*\lsfusion-ai-skills\*\skills\lsfusion-dev\scripts\lsfdev.ps1" -ErrorAction SilentlyContinue)
 if ($cands.Count) {
     $real = ($cands | Sort-Object -Property `
         @{Expression = { Test-Path (Join-Path $_.Directory.Parent.Parent.Parent.FullName '.in_use') }; Descending = $true},
@@ -3200,10 +3317,17 @@ if (-not $real) {
     Write-Host "[FAIL] No installed lsfusion-dev skill found: the plugin cache glob matched nothing and the copy that generated this shim is gone. Reinstall the lsfusion-ai-skills plugin (or call its skills\lsfusion-dev\scripts\lsfdev.ps1 directly)." -ForegroundColor Red
     exit 1
 }
+# An in-process caller reads $LASTEXITCODE afterwards; without this reset a
+# stale nonzero value from an unrelated earlier native command would leak
+# through when the real script completes without running one.
+$global:LASTEXITCODE = 0
 & $real @args
 exit $LASTEXITCODE
 '@
-        $shimText = $shimText.Replace('__FALLBACK__', $self)
+        # Apostrophes in paths (C:\Users\O'Brien\...) must be doubled - the
+        # placeholders sit inside single-quoted literals in the shim text.
+        $shimText = $shimText.Replace('__FALLBACK__', $self.Replace("'", "''"))
+        $shimText = $shimText.Replace('__CACHEROOT__', "$cacheRoot".Replace("'", "''"))
         $shimPath = Join-Path $shimDir "lsfdev.ps1"
         $current = ""
         if (Test-Path $shimPath) { try { $current = [IO.File]::ReadAllText($shimPath) } catch { } }
