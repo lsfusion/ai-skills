@@ -4,8 +4,11 @@
 # `lsfdev.ps1 stop -ProjectDir <dir>` for each unique project dir. The ledger is
 # removed up front, so a failing stop cannot leave a stale ledger behind, and each
 # stop runs in its own try/catch, so one broken project cannot keep the rest
-# running. Instances belonging to other sessions (their ledgers carry other session
-# ids) and servers started outside lsfdev keep running.
+# running. A dir is skipped when another session's ledger claims it (our own ledger
+# is already gone, so any live claim means that session (re)started the project
+# after we did and owns it now); the claim is re-read right before each stop, which
+# leaves only the window of the stop itself. Servers started outside lsfdev keep
+# running - lsfdev stop on a project nothing runs in is a cheap no-op.
 # Accepted micro-race: a start whose async tracker has not written the ledger by
 # the time the session ends is not stopped - the server just stays up, which is no
 # worse than not having this hook at all.
@@ -23,6 +26,11 @@ Remove-Item -LiteralPath $ledger -Force
 $lsfdev = Join-Path $PSScriptRoot '..\skills\lsfusion-dev\scripts\lsfdev.ps1'
 foreach ($dir in $dirs) {
     if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
+    $claimed = $false
+    foreach ($f in Get-ChildItem -Path $env:TEMP -Filter 'claude-lsfdev-*.txt' -ErrorAction SilentlyContinue) {
+        try { if (@(Get-Content -LiteralPath $f.FullName -Encoding UTF8) -contains $dir) { $claimed = $true; break } } catch { }
+    }
+    if ($claimed) { continue }
     try { & $lsfdev stop -ProjectDir $dir } catch { }
 }
 exit 0

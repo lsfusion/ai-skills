@@ -873,6 +873,9 @@ function Stop-Tracked([string]$pidFile, [int[]]$ports, [string]$label) {
             }
         }
     }
+    # Load-bearing wording: hooks/lsfdev-session-track.ps1 matches
+    # "Previous application server|Tomcat stopped|was not running" in the tool
+    # output as proof that a start/restart really touched this project's processes.
     if ($killed) { Ok "$label stopped." } else { Info "$label was not running." }
 }
 
