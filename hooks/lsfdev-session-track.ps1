@@ -75,19 +75,24 @@ foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
             # -File must be the host's ACTIVE script target: after -Command or
             # -EncodedCommand the host treats the rest as command text, so a trailing
             # "-File ...lsfdev.ps1 start" never runs. powershell.exe accepts prefix
-            # shorthands (-c, -ec) AND slash forms (/Command, /c - measured), which
-            # parse as plain strings, not CommandParameterAst - check both spellings.
-            # This guards against accidental shapes only - the hook is not a security
-            # boundary: whoever authors the session's commands can stop any server
-            # directly; the ledger merely keeps HONEST commands from mis-claiming.
+            # shorthands (-c, -ec), slash forms (/Command, /c - measured) and quoted
+            # spellings ("-Command"), which parse as plain strings rather than
+            # CommandParameterAst - so normalize ANY dash/slash-prefixed element and
+            # prefix-match it. Over-rejection is fail-open (the start is merely
+            # untracked). This guards against accidental shapes only - the hook is not
+            # a security boundary: whoever authors the session's commands can stop any
+            # server directly; the ledger merely keeps HONEST commands from
+            # mis-claiming.
             $cmdParam = $false
             for ($j = 1; $j -lt $i - 1; $j++) {
                 $n = $null
                 if ($elems[$j] -is [CommandParameterAst]) { $n = $elems[$j].ParameterName }
                 else {
                     $t2 = Get-ConstText $elems[$j]
-                    if ($t2 -and $t2.Length -ge 2 -and $t2[0] -eq '/') { $n = $t2.Substring(1).Split(':')[0] }
+                    if ($t2 -and $t2.Length -ge 2 -and ($t2[0] -eq '/' -or $t2[0] -eq '-')) { $n = $t2.Substring(1) }
                 }
+                if (-not $n) { continue }
+                $n = $n.TrimStart('-', '/').Split(':')[0]
                 if ($n -and ('command'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -or
                     'encodedcommand'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase))) { $cmdParam = $true; break }
             }
