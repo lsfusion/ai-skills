@@ -777,26 +777,21 @@ without the matching `REQUIRE` still resolves — an incomplete `REQUIRE`
 list surfaces only at restart. When a file carries a load-only construct (`CLASS` /
 `DATA … NONULL` / `WHEN` / `CONSTRAINT`), eval answers `... cannot be
 used in EVAL module` — precheck reports that as **syntax OK, names NOT
-checked** (measured: the restriction preempts name resolution for the
-whole script, wherever the construct sits). Two constructs crash eval's
-compiler outright — `EXTEND FORM` and `() + { }` overrides of existing
-actions — such files come back as "cannot lint: only a restart checks
-this file".
+checked** (the restriction preempts name resolution for the whole
+script). Two constructs crash eval's compiler outright — `EXTEND FORM`
+and `() + { }` overrides of existing actions — such files come back as
+"cannot lint: only a restart checks this file".
 
 **Know the restart-only file class — precheck names it upfront.** A file
 that is *entirely* META definitions / `@`-instantiations / `EXTEND FORM`
-(the typical "main project file" or extension module that decorates other
-modules' forms) gives eval **zero** coverage: META bodies compile only at
-instantiation and `EXTEND FORM` crashes the eval compiler, so precheck
-can catch **neither ambiguity nor constraint errors there** — for such
-files precheck reports **"restart-only"** immediately instead of a hollow
-PASS or a crash message. It still validates structure — MODULE header,
-**META/END balance** (an unclosed META is a hard FAIL: it swallows the
-rest of the file at restart) and bracket balance (a warning) — but plan
-your loop around the truth: **for a restart-only file, the restart IS the
-check**; go straight to it and read the log, don't spend cycles
-re-running precheck on that file. Files that merely *declare* META next
-to other code are linted normally and the verdict carries the caveat that
+(the typical extension/main module) gets **zero** eval coverage — precheck
+reports **"restart-only"** immediately instead of a hollow PASS, checking
+just the structure: MODULE header, **META/END balance** (an unclosed META
+is a hard FAIL: it swallows the rest of the file at restart) and bracket
+balance (a warning). Plan the loop around the truth: **for a restart-only
+file, the restart IS the check** — go straight to it and read the log,
+don't spend cycles re-running precheck there. Files that merely *declare*
+META next to other code are linted normally, with the caveat that
 un-instantiated META bodies stay unchecked until restart.
 
 Do **not** use `api` for any of this: its `/eval/action`
@@ -917,13 +912,14 @@ checking the unit-test output.
 
    **To verify a specific form, open it directly with `-OpenScript` — the
    default; don't click through the navigator.** `verify` navigates the
-   headless browser to `<web>/eval/action?script=<your code>`; the platform
-   detects the interactive action in a browser navigation and routes it back
-   into the web client (302 → `/push-notification` → service worker →
-   `/main`), where the form opens exactly as if a user had opened it —
-   screenshot → `verify-open.png`. Because the payload is an ordinary action
-   script it is fully parameterizable — a named form, a form with bound
-   objects, or the edit card of one specific object:
+   headless browser to `<web>/eval/action?script=<your code>` — the
+   direct-open URL mechanism (canonical reference, shared with the
+   lsfusion-eval skill:
+   [../lsfusion-eval/references/form-open-url.md](../lsfusion-eval/references/form-open-url.md))
+   — and the form opens exactly as if a user had opened it — screenshot →
+   `verify-open.png`. The payload is an ordinary action script, fully
+   parameterizable — a named form, a form with bound objects, or the edit
+   card of one specific object:
 
    ```
    # a navigator form by name
@@ -938,18 +934,13 @@ checking the unit-test output.
 
    - **Open the form in the window mode it will have in production — for
      navigator forms and edit cards that means `DOCKED`, as in every example
-     above.** In this call context a bare `SHOW` defaults to a *floating*
-     window (synchronous → `FLOAT`), which is **not** how the user will see
-     the form: everything reachable from the navigator, and edit cards,
-     open as `DOCKED` tabs filling the forms panel. A float renders the
-     form in a small centered window, so the layout you screenshot (column
-     widths, flex fills, collapsed containers) differs from the real thing
-     — append `DOCKED` to judge the actual `DESIGN`. Use `FLOAT` (or
-     `EMBEDDED`/`POPUP`) only when the form genuinely opens that way in
-     prod — e.g. it is shown via `DIALOG` or `SHOW … FLOAT` in the code.
-     Best of all, when prod opens the form through a project action, call
-     *that action* in `-OpenScript` — the window mode (and filters,
-     session) come along for free.
+     above.** A bare `SHOW` in this call context defaults to a small
+     *floating* window whose layout (column widths, flex fills, collapsed
+     containers) is not what the user will see — append `DOCKED` to judge
+     the actual `DESIGN`; keep `FLOAT`/`EMBEDDED`/`POPUP` only for forms
+     prod itself opens as dialogs, and when prod opens the form through a
+     project action, call *that action* — mode, filters and session come
+     along (rationale: the shared reference above).
    - **Qualify every name with its namespace** (`Shop.items`, not `items`).
      The script compiles against *all* loaded modules — a bare name that is
      unique in your module (`name`, `date`, …) is routinely ambiguous here.
@@ -968,12 +959,9 @@ checking the unit-test output.
    - A script error (unknown form, missing namespace, typo) surfaces as the
      server's error text in the verify output — fix and re-run; nothing to
      screenshot-guess.
-   - `SHOW EDIT <Class> = <obj>` opens the class edit form (the one declared
-     with `EDIT <Class> OBJECT <o>`, or the auto-generated one); `SHOW
-     <form> OBJECTS <o> = <expr>` opens any form with objects bound.
-   - Verified on 6.2 and 7.0-SNAPSHOT. Needs the web client up; in devmode
-     it rides the auto-auth admin session (on a non-devmode install the
-     call is gated by `enableUI`/`enableAPI` — admin or `@@api` actions).
+   - Needs the web client up; in devmode it rides the auto-auth admin
+     session. The `SHOW EDIT` / `SHOW … OBJECTS` forms and the non-devmode
+     auth gating are in the shared reference above.
 
    **To test the user's path, use `-Click` / `-DoubleClick`** — reach for
    them when the *navigation itself* is what you're verifying (the navigator
@@ -1095,8 +1083,8 @@ checking the unit-test output.
    split below), or **write a real Playwright script.** The lsfusion-eval
    skill's Part 3 ships a ready Python template (login, waits, and
    lsFusion-specific selectors already handled) — start from it, not from
-   scratch (the direct-open URL mechanism above is documented there for
-   hand-written scripts too).
+   scratch (for the direct-open URL in a hand-written script, use the
+   shared reference linked above).
 
    The viewport defaults to **1920×1080** — judge layout at a realistic
    size before calling it broken: on a narrow viewport dense forms

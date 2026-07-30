@@ -721,57 +721,24 @@ Part's script.
 
 ### Opening a specific form directly by URL (no navigator clicking)
 
-An interactive action called from a **browser navigation** of the web
-server's Action API opens its forms in the web client. A `page.goto()` on
-
-```
-<base>/eval/action?script=<url-encoded action script>
-```
-
-makes the platform push the action as a *notification*, 302-redirect the
-tab to `/push-notification`, and hand the action to the app through the
-service worker — the tab lands back on `/main` with the form open, exactly
-as if the user had opened it. The payload is ordinary action code, so it
-is fully parameterizable:
+A `page.goto()` on `<base>/eval/action?script=<url-encoded action script>`
+opens the script's form in the web client (302 → `/push-notification` →
+service worker → `/main`), exactly as if the user had opened it — fully
+parameterizable down to one object's edit card:
 
 ```lsf
 SHOW Shop.items DOCKED;
 FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
 ```
 
-Rules that make it work (verified live on 6.2 and 7.0-SNAPSHOT):
-
-- **Open the form in the window mode it has in production — `DOCKED` for
-  anything reachable from the navigator and for edit cards**, as in both
-  examples. A bare `SHOW` in this call context defaults to a small
-  *floating* window (synchronous → `FLOAT`), so the rendered layout does
-  not match what the user sees; `DOCKED` opens the form as a tab filling
-  the forms panel. Keep `FLOAT` only for forms that prod itself opens as
-  dialogs (`DIALOG`, `SHOW … FLOAT`) — or simply call the project action
-  that opens the form, and the mode comes along.
-
-- **Visit `<base>/main` once first, in the same browser context** — that
-  registers the service worker which delivers the action. In a virgin
-  context a direct hit sticks on `/push-notification` (worker not yet in
-  control); one `page.reload()` of that stuck page recovers. Then
-  `page.wait_for_url("**/main*")` and wait for your form's
-  caption/selector with a generous timeout (first open builds the form).
-- **Qualify names with namespaces** (`Shop.items`, not `items`) — the
-  script compiles against *all* loaded modules, so bare names that are
-  unique in your module are routinely ambiguous.
-- URL-encode the script (`urllib.parse.quote`) — this also carries
-  non-ASCII text safely (percent-encoded UTF-8, no argv/code-page issues).
-- A script error returns a 500 page with the server's error text *instead
-  of* the redirect — if the URL never leaves `/eval/action`, read the body
-  text: it is the exact compile error.
-- Auth gates: devmode auto-auths as admin, nothing to do. On a deployed
-  install, log in first (same context), and the call is gated by
-  `enableUI` on top of the usual `enableAPI` rules — admin /
-  `System.interpreter` access for `/eval/action`, or an `@@api`-annotated
-  action via `/exec?action=...&p=...` (same redirect mechanism).
-- On the local dev install don't hand-roll this: `lsfdev.ps1 verify
-  -OpenScript "..."` (or `-OpenScriptFile`) does it all, with a screenshot
-  and an `-OpenExpect` assertion.
+**Before writing a script around this, read
+[references/form-open-url.md](references/form-open-url.md)** — the shared
+mechanism reference (also used by lsfusion-dev's `verify -OpenScript`, which
+is the no-hand-rolling path on a local dev install). It carries the rules
+that make the call work: `DOCKED` window mode (a bare `SHOW` floats and
+renders unrepresentative layout), the service-worker registration visit and
+stuck-page recovery, namespace-qualified names, URL-encoding, script errors
+coming back as the 500 body, and the auth gates on non-devmode installs.
 
 ### Things that will cost you a debug cycle if you don't know them
 
