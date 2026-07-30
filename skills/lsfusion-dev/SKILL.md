@@ -215,7 +215,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `stop` | Stop the application server and Tomcat. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server). |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
@@ -231,7 +231,7 @@ re-download the client war at the same version — the `-SNAPSHOT`
 war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
-`-Do` (verify: generic click/hover/drag/mouse/fill/type/edit/press/eval/wait
+`-Do` (verify: generic click/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait
 steps by Playwright selector, first visible match — see step 5), `-Session` / `-Reload` / `-EndSession`
 (verify: persistent browser between calls; `-Reload` forces a page reload in
 it), `-ScriptFile`, `-Timeout`. Run the script with no command to print full
@@ -887,7 +887,8 @@ checking the unit-test output.
    with a top-level self-check (no `NEWSESSION` wrapper), e.g.
    `APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');`.
    The `api` command adds two safety nets of its own: it prints a
-   version-appropriate hint whenever the body comes back empty, and it
+   version-appropriate hint whenever the body comes back empty (the full
+   explanation once per session, a recipe one-liner on later calls), and it
    tails the server log for `Server message:` lines after every call —
    which surfaces `MESSAGE ... NOWAIT` output and the constraint text a
    canceled `APPLY` logs, but **cannot rescue a plain `MESSAGE`** (no
@@ -1000,12 +1001,23 @@ checking the unit-test output.
    - `click:<selector>` / `dblclick:<selector>` — e.g. `click:text=Поставить`
      hits a React button by its caption;
    - `hover:<selector>` — real mouse-over (tooltips, hover-revealed handles);
-   - `drag:<selector>=><selector>` — a **real gesture**: `mousedown` on the
-     source, intermediate `mousemove`s, `mouseup` on the target — what
+   - `drag:<selector>=><selector>` — a **real mouse gesture**: `mousedown` on
+     the source, intermediate `mousemove`s, `mouseup` on the target — what
      drag-to-draw UIs (Gantt dependency links, resize handles, sliders)
-     actually listen for. `click`/`dblclick`/`hover`/`drag` selectors accept
-     an `@x,y` offset from the element's top-left corner
+     actually listen for. `click`/`dblclick`/`hover`/`drag`/`dnd` selectors
+     accept an `@x,y` offset from the element's top-left corner
      (`drag:.task-a@120,8=>.task-b@4,8` starts from a bar's edge connector);
+   - `dnd:<selector>=><selector>` — **HTML5 drag-and-drop**, the OTHER drag
+     protocol: real `DragEvent`s (`dragstart` → `dragover` → `drop` →
+     `dragend`) sharing one live `DataTransfer`, so what the component's
+     `dragstart` handler `setData()`s is readable in its `drop` handler.
+     Kanban boards, sortable lists and drop zones (`draggable="true"`
+     elements) listen to these and never see a mouse-event drag — a
+     component speaks one protocol or the other, so when `drag:` visibly
+     does nothing, use `dnd:`. The step reports whether `dragover` was
+     `preventDefault()`ed (a real browser fires `drop` only then — `NOT
+     preventDefault()ed` means the target isn't an armed drop zone) and the
+     `DataTransfer` types the source set;
    - `mouse:down[@x,y]` / `mouse:up[@x,y]` / `mouse:move@x,y[,steps]` — raw
      viewport-coordinate primitives when even `drag:` isn't enough (multi-leg
      gestures, precise paths). `move` glides in 12 interpolated steps by
@@ -1172,7 +1184,9 @@ checking the unit-test output.
      mousemoves (349 px jumps measured on a 700 px path), and multi-leg
      gestures are inexpressible — drag-to-draw UIs (Gantt links,
      sliders, resize handles) won't track it. Use `verify -Do
-     "drag:..."` / `mouse:` steps, which interpolate the path.
+     "drag:..."` / `mouse:` steps, which interpolate the path — and for
+     HTML5 drag-and-drop (kanban boards), `dnd:`, since mouse events
+     never reach `dragstart`/`drop` listeners at all.
    - **Evidence.** The pane leaves nothing on disk — no PNGs to attach,
      no JSON verdict, nothing re-runnable. When the user needs proof or
      a repeatable check, run `verify` even after eyeballing the pane.

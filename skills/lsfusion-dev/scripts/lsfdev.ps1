@@ -2140,7 +2140,7 @@ function Cmd-Verify {
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
     if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
-    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/dblclick/hover/drag/mouse/fill/type/edit/press/eval/wait by Playwright selector; first VISIBLE match)" }
+    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by Playwright selector; first VISIBLE match)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
     # Use --name=value form so an empty password is preserved through
@@ -3032,15 +3032,29 @@ function Cmd-Api {
             } else {
                 "APPLY; IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');"
             }
-            Info "(empty response body - normal for actions without RETURN/EXPORT, but carries no proof either:"
-            Info " a plain MESSAGE (no NOWAIT) is visible NOWHERE over HTTP - not here and not in the server"
-            Info " log, so the log tail below cannot surface it either; only MESSAGE ... NOWAIT leaves a log"
-            Info " line. A constraint-canceled APPLY still answers 200."
-            Info " Also: EXPORT must be at the TOP LEVEL - its result is a session-local property, so inside"
-            Info " NEWSESSION{} it is discarded with the session and never reaches the HTTP response (RETURN is"
-            Info " fine inside NEWSESSION - it propagates up the stack - but an /eval/action script already runs"
-            Info " in its own session, so no NEWSESSION wrapper is needed anyway)."
-            Info " For mutations, end the script with: $recipe)"
+            # The full explanation is identical on every call, and a seeding
+            # loop of a dozen api calls used to print all 9 lines a dozen
+            # times. Print it once per session - marker file, refreshed on
+            # every empty-body call, so "session" = a cluster of api activity
+            # with no 6-hour gap - then compress to the actionable core.
+            $hintMarker = Join-Path $StateDir "api-empty-hint.stamp"
+            $explained = (Test-Path $hintMarker) -and
+                (((Get-Date) - (Get-Item $hintMarker).LastWriteTime).TotalHours -lt 6)
+            if ($explained) {
+                Info "(empty response body - carries no proof, and a plain MESSAGE is invisible over HTTP."
+                Info " For mutations, end the script with: $recipe)"
+            } else {
+                Info "(empty response body - normal for actions without RETURN/EXPORT, but carries no proof either:"
+                Info " a plain MESSAGE (no NOWAIT) is visible NOWHERE over HTTP - not here and not in the server"
+                Info " log, so the log tail below cannot surface it either; only MESSAGE ... NOWAIT leaves a log"
+                Info " line. A constraint-canceled APPLY still answers 200."
+                Info " Also: EXPORT must be at the TOP LEVEL - its result is a session-local property, so inside"
+                Info " NEWSESSION{} it is discarded with the session and never reaches the HTTP response (RETURN is"
+                Info " fine inside NEWSESSION - it propagates up the stack - but an /eval/action script already runs"
+                Info " in its own session, so no NEWSESSION wrapper is needed anyway)."
+                Info " For mutations, end the script with: $recipe)"
+            }
+            New-Item -ItemType File -Force -Path $hintMarker | Out-Null
         }
     } catch {
         $errResp = $_.Exception.Response
@@ -3265,14 +3279,22 @@ Common options:
                         reach buttons/inputs inside CUSTOM (React) components
                         that text-based -Click cannot hit. Each step is
                         verb:rest with any Playwright selector (css, text=...,
-                        button:has-text(...)); click/dblclick/hover/drag
+                        button:has-text(...)); click/dblclick/hover/drag/dnd
                         selectors accept an @x,y offset from the element's
                         top-left corner:
                           click:<sel>[@x,y]         dblclick:<sel>[@x,y]
                           hover:<sel>[@x,y]         drag:<sel>[@x,y]=><sel>[@x,y]
+                          dnd:<sel>[@x,y]=><sel>[@x,y]
                           mouse:down[@x,y]  mouse:up[@x,y]  mouse:move@x,y[,steps]
                           fill:<sel>=><value>       type:<sel>=><value>
                           edit:<caption|sel>=><val> press:<key>  eval:<js>  wait:<ms>
+                        'drag' is a raw mouse gesture (mousedown/mousemove/
+                        mouseup - drag-to-draw UIs); 'dnd' speaks HTML5
+                        drag-and-drop (DragEvents sharing one live
+                        DataTransfer - kanban/sortable components listening
+                        dragstart/drop). A component understands one protocol
+                        or the other - if drag: visibly does nothing on a
+                        draggable UI, use dnd:.
                         Selectors resolve to the FIRST VISIBLE match: the web
                         client keeps whole duplicate toolbars of inactive
                         docked tabs in the DOM, so a bare first-match click

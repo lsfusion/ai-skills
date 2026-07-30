@@ -204,6 +204,54 @@ _PANEL_CAPTIONS_JS = """
 }
 """
 
+# dnd:<from>=><to> — the HTML5 drag-and-drop PROTOCOL, as opposed to drag:'s
+# raw mouse gesture. Components built on dragstart/dragover/drop (kanban
+# boards, sortable lists, drop zones — anything draggable="true") never see
+# a mouse-event drag: a native drag suppresses mousemove delivery, so such
+# components speak DragEvent only. The whole sequence shares ONE live
+# DataTransfer, so whatever the component's dragstart handler setData()s is
+# readable in its drop handler — the part ad-hoc dispatches get wrong.
+# pointerdown/mousedown fire first because SortableJS-style libraries arm
+# the drag (set draggable, bind handlers) on mousedown; the trailing
+# pointerup/mouseup releases that arm (synthetic dispatch never generates a
+# click). Returns diagnostics: whether dragover was preventDefault()ed — a
+# real browser fires drop ONLY then, so false means a live user drag would
+# not drop here — and the DataTransfer types the dragstart handler set.
+_DND_JS = """
+async ([src, dst, sx, sy, dx, dy]) => {
+  const settle = ms => new Promise(r => setTimeout(r, ms));
+  const dt = new DataTransfer();
+  const drag = (el, type, x, y) => {
+    const ev = new DragEvent(type, {bubbles: true, cancelable: true,
+                                    composed: true, view: window,
+                                    clientX: x, clientY: y, dataTransfer: dt});
+    el.dispatchEvent(ev);
+    return ev.defaultPrevented;
+  };
+  const mouse = (el, ctor, type, x, y, buttons) =>
+    el.dispatchEvent(new ctor(type, {bubbles: true, cancelable: true,
+                                     composed: true, view: window,
+                                     clientX: x, clientY: y,
+                                     button: 0, buttons: buttons}));
+  mouse(src, PointerEvent, 'pointerdown', sx, sy, 1);
+  mouse(src, MouseEvent, 'mousedown', sx, sy, 1);
+  await settle(50);
+  drag(src, 'dragstart', sx, sy);
+  await settle(50);
+  drag(src, 'drag', sx, sy);
+  drag(dst, 'dragenter', dx, dy);
+  let prevented = drag(dst, 'dragover', dx, dy);
+  await settle(50);
+  prevented = drag(dst, 'dragover', dx, dy) || prevented;
+  const types = [...dt.types];
+  drag(dst, 'drop', dx, dy);
+  drag(src, 'dragend', dx, dy);
+  mouse(dst, PointerEvent, 'pointerup', dx, dy, 0);
+  mouse(dst, MouseEvent, 'mouseup', dx, dy, 0);
+  return {prevented: prevented, types: types};
+}
+"""
+
 
 def _classify_click_error(msg: str):
     """Classify a failed Playwright click from its timeout message.
@@ -381,8 +429,13 @@ def main() -> int:
                     help="generic interaction step, run in order AFTER the "
                          "--click/--double-click navigation; repeatable. "
                          "Forms: click:<selector>, dblclick:<selector>, "
-                         "hover:<selector>, drag:<selector>=><selector>, "
-                         "mouse:down|up|move@x,y[,steps], "
+                         "hover:<selector>, drag:<selector>=><selector> "
+                         "(raw mouse gesture: mousedown/mousemove/mouseup - "
+                         "drag-to-draw UIs), dnd:<selector>=><selector> "
+                         "(HTML5 drag-and-drop: DragEvents sharing one live "
+                         "DataTransfer - kanban/sortable components listening "
+                         "dragstart/drop; a component speaks one protocol or "
+                         "the other), mouse:down|up|move@x,y[,steps], "
                          "fill:<selector>=><value>, type:<selector>=><value>, "
                          "edit:<panel caption or selector>=><value> (lsFusion "
                          "in-place editor: dblclick the cell, type, Enter), "
@@ -392,7 +445,7 @@ def main() -> int:
                          "(React) components that the text-based --click "
                          "cannot hit; selectors resolve to the first VISIBLE "
                          "match (hidden docked-tab duplicates are skipped and "
-                         "reported); hover/drag/click selectors accept an "
+                         "reported); hover/drag/dnd/click selectors accept an "
                          "@x,y offset from the element's top-left corner")
     ap.add_argument("--do-file", default="",
                     help="UTF-8 file with a JSON array of --do steps. The "
@@ -957,6 +1010,52 @@ def main() -> int:
                                 page.wait_for_timeout(100)
                                 page.mouse.up()
                                 page.wait_for_timeout(500)
+                            elif verb == "dnd":
+                                # The HTML5 drag-and-drop protocol - real
+                                # DragEvents sharing one live DataTransfer -
+                                # for kanban boards / sortable lists / drop
+                                # zones listening dragstart/dragover/drop.
+                                # drag: above speaks the OTHER protocol (raw
+                                # mouse events); a component understands one
+                                # or the other, so when drag: visibly does
+                                # nothing on a draggable UI, use this.
+                                if "=>" not in rest:
+                                    raise ValueError(
+                                        "dnd needs 'dnd:<from>=><to>' "
+                                        "(selectors, optional @x,y offsets)")
+                                src, dst = rest.split("=>", 1)
+                                ssel, spos = _split_pos(src)
+                                dsel, dpos = _split_pos(dst)
+                                sloc, snote = _resolve_visible(page, ssel)
+                                dloc, dnote = _resolve_visible(page, dsel)
+                                notes = [x for x in (snote, dnote) if x]
+                                sloc.scroll_into_view_if_needed(timeout=15000)
+                                dloc.scroll_into_view_if_needed(timeout=15000)
+                                spt = _loc_point(sloc, spos)
+                                dpt = _loc_point(dloc, dpos)
+                                if not spt:
+                                    raise ValueError(
+                                        f"dnd source {ssel!r} has no bounding box")
+                                if not dpt:
+                                    raise ValueError(
+                                        f"dnd target {dsel!r} has no bounding box")
+                                res = page.evaluate(
+                                    _DND_JS,
+                                    [sloc.element_handle(timeout=15000),
+                                     dloc.element_handle(timeout=15000),
+                                     spt[0], spt[1], dpt[0], dpt[1]])
+                                detail = (
+                                    "html5 dnd dispatched; dataTransfer types="
+                                    + (str(res["types"]) if res["types"]
+                                       else "[] (dragstart handler set no data)"))
+                                if not res["prevented"]:
+                                    detail += (
+                                        "; dragover was NOT preventDefault()ed"
+                                        " - a real browser would refuse this"
+                                        " drop (target may not be a drop zone)")
+                                notes.append(detail)
+                                step["detail"] = "; ".join(notes)
+                                page.wait_for_timeout(500)
                             elif verb == "mouse":
                                 # Raw primitives for fully manual gestures:
                                 # mouse:move@x,y[,steps], mouse:down[@x,y],
@@ -1112,7 +1211,8 @@ def main() -> int:
                             else:
                                 raise ValueError(
                                     f"unknown verb {verb!r} - use click/dblclick/"
-                                    "hover/drag/mouse/fill/type/edit/press/eval/wait")
+                                    "hover/drag/dnd/mouse/fill/type/edit/press/"
+                                    "eval/wait")
                             step["ok"] = True
                         except (PWTimeout, PWError, ValueError) as e:
                             step["detail"] = str(e).split("\n")[0]
