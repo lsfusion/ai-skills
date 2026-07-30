@@ -937,10 +937,11 @@ checking the unit-test output.
      above.** A bare `SHOW` in this call context defaults to a small
      *floating* window whose layout (column widths, flex fills, collapsed
      containers) is not what the user will see — append `DOCKED` to judge
-     the actual `DESIGN`; keep `FLOAT`/`EMBEDDED`/`POPUP` only for forms
-     prod itself opens as dialogs, and when prod opens the form through a
-     project action, call *that action* — mode, filters and session come
-     along (rationale: the shared reference above).
+     the actual `DESIGN`; keep `FLOAT`/`EMBEDDED`/`POPUP` only when the
+     form genuinely opens that way in prod (e.g. `DIALOG`, `SHOW … FLOAT`),
+     and when prod opens the form through a project action, call *that
+     action* — mode, filters and session come along (rationale: the shared
+     reference above).
    - **Qualify every name with its namespace** (`Shop.items`, not `items`).
      The script compiles against *all* loaded modules — a bare name that is
      unique in your module (`name`, `date`, …) is routinely ambiguous here.

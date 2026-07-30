@@ -39,10 +39,10 @@ FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
   to a small **floating** window — the rendered layout (column widths, flex
   fills, collapsed containers) then does not match what a user sees. `DOCKED`
   opens the form as a tab filling the forms panel. Keep `FLOAT` (or
-  `EMBEDDED`/`POPUP`) only for forms production itself opens as dialogs
-  (`DIALOG`, `SHOW … FLOAT`) — or, best of all, call the project action that
-  opens the form: the window mode (plus filters and session state) comes along
-  for free.
+  `EMBEDDED`/`POPUP`) only when the form genuinely opens that way in
+  production (e.g. it is shown via `DIALOG` or `SHOW … FLOAT` in the code) —
+  or, best of all, call the project action that opens the form: the window
+  mode (plus filters and session state) comes along for free.
 - **Visit `<base>` (or `/main`) once first, in the same browser context** —
   that registers the service worker which delivers the action. In a virgin
   context a direct hit sticks on `/push-notification` (worker not yet in
