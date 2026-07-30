@@ -42,9 +42,12 @@ lsFusion has **two** processes, plus a database:
   on port `7651`, and a WebSocket server on port `8887`. Started with
   `java -cp ".;<jar>" lsfusion.server.logics.BusinessLogicsBootstrap`.
 - **Web server** — the `lsfusion-client-<ver>.war` deployed in Apache Tomcat.
-  Serves the browser UI at the project's **app-id context path** —
-  `http://localhost:8080/<app id>/` (the root `/` just redirects there) — and
-  connects to the application server over RMI (port `7652`).
+  Serves the browser UI at the project's **app-id context path**; the SPA
+  entry is `http://localhost:8080/<app id>/main` — current 7.0-SNAPSHOT wars
+  **404 on the bare context root**, so `open`/`verify`/`status` probe the
+  root and fall back to `/main` automatically (the server root `/` redirects
+  into the app) — and connects to the application server over RMI (port
+  `7652`).
 
 A change to any `.lsf` file requires **restarting the application server** (the
 web server does not need a restart).
@@ -438,8 +441,9 @@ the project's `db.name`** and covers everything downstream:
   validated `-DbName x` (pass one or the other, not both), and
 - it becomes the **web context path**, derived from `db.name` with no extra
   key to keep in sync: the client war is deployed as `<app id>.war`, so the
-  UI lives at `http://localhost:<web port>/<app id>/` (the root `/` serves a
-  redirect there).
+  UI lives at `http://localhost:<web port>/<app id>/main` (the root `/`
+  serves a redirect there; the bare context root 404s on current
+  7.0-SNAPSHOT wars, and the tooling probes / falls back automatically).
 
 Tell the user which id you picked. If `setup` runs without `-AppId`, the skill
 derives a fallback id from the folder name plus a 4-hex path hash (e.g.
@@ -906,6 +910,13 @@ checking the unit-test output.
    - dump the final DOM → `verify-dom.html` and the browser console →
      `verify-console.txt`.
 
+   The default target is the probed landing URL (context root, or `/main`
+   when the root 404s — current 7.0-SNAPSHOT wars). A landing that answers
+   HTTP ≥ 400 is reported as `[WARN] … ERROR page` and the screenshot lines
+   are downgraded from `[OK]` — when you see that, the screenshots show an
+   error page, not the app; fix the URL/server before trusting anything else
+   in the run.
+
    In devmode lsFusion auto-authenticates, so there is **no login form**
    and the landing screenshot already shows the navigator + forms. The
    first `verify` ever installs Playwright + Chromium (~120 MB); one-time.
@@ -1209,9 +1220,11 @@ even read-only ones can lead you to false conclusions you then act on.
 After `start` / `restart` succeeds — whether you scaffolded a new module,
 edited existing code, fixed a server failure, or just brought the project up
 for inspection — **always run `open`** so the user lands in the running
-application and can click through it. `open` already targets the app's
-context path (`http://localhost:<web port>/<app id>/`); quote that full URL,
-context path included, whenever you tell the user where the app runs. Do not stop at "the server is up": the
+application and can click through it. `open` probes the app's context path
+and opens the URL that actually answers — `http://localhost:<web port>/<app
+id>/main` on current 7.0-SNAPSHOT wars, whose bare context root 404s; quote
+the URL `open` reports ("Opened <url>"), path included, whenever you tell
+the user where the app runs. Do not stop at "the server is up": the
 user expects to actually use the UI and try out what you built. This step
 applies even when `verify` already produced a screenshot for your own check —
 the screenshot is for you, `open` is for the user.

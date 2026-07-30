@@ -454,6 +454,9 @@ def main() -> int:
     result = {
         "url": args.url,
         "title": "",
+        # Main-document status of the initial navigation; stays None when no
+        # navigation happens (session continuation of a live page).
+        "http_status": None,
         "logged_in": False,
         "login_attempted": False,
         "console_errors": 0,
@@ -568,10 +571,15 @@ def main() -> int:
                     result["session"]["navigated"] = False
                 else:
                     try:
-                        page.goto(args.url, wait_until="load", timeout=args.timeout)
+                        resp = page.goto(args.url, wait_until="load",
+                                         timeout=args.timeout)
                     except PWError as e:
                         result["error"] = f"navigation failed: {e}"
                         return _finish(result, console_lines, console_path)
+                    if resp is not None:
+                        # Lets the caller flag an error landing (404 context
+                        # root, 500) instead of [OK]-ing its screenshots.
+                        result["http_status"] = resp.status
 
                     # Give the SPA a moment to settle before the first screenshot.
                     try:

@@ -563,6 +563,31 @@ function Get-WebUrl($cfg) {
     return "http://localhost:$($cfg.webPort)/$ctx/"
 }
 
+# The URL the SPA actually answers on. Current 7.0-SNAPSHOT wars 404 on the
+# bare context root: web.xml still declares <welcome-file>main</welcome-file>,
+# but Spring 5.3 resolves controllers by the full in-context path ("/"), which
+# nothing serves - the SPA entry is mapped at /main only. Where the root DOES
+# work it forwards to main anyway (main IS the welcome file), so probe the
+# root first and fall back to <root>main. On an unreachable server, return
+# the root unprobed - callers already handle a dead server.
+# Returns @{ url; ok } - ok = $false when no URL answered below HTTP 400.
+function Resolve-LandingUrl($cfg) {
+    $base = Get-WebUrl $cfg
+    foreach ($u in @($base, ($base + "main"))) {
+        try {
+            Invoke-WebRequest $u -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0 -ErrorAction Stop | Out-Null
+            return @{ url = $u; ok = $true }
+        } catch {
+            $resp = $_.Exception.Response
+            if (-not $resp) { return @{ url = $base; ok = $false } }
+            $code = 0; try { $code = [int]$resp.StatusCode } catch { }
+            # A 3xx (e.g. auth redirect to /login) proves the URL is routed.
+            if ($code -ge 300 -and $code -lt 400) { return @{ url = $u; ok = $true } }
+        }
+    }
+    return @{ url = $base; ok = $false }
+}
+
 # --- war <-> server build drift (SNAPSHOT versions) --------------------------
 # Neither artifact carries a version stamp in its manifest, but the zip entry
 # timestamps preserve the BUILD time - comparable across the two delivery
@@ -1378,14 +1403,18 @@ function Cmd-Setup {
             }
         } else {
             # Keep the context root useful: replace Tomcat's stock welcome app
-            # (or a leftover exploded ROOT) with a one-line redirect to the app
-            # context, so http://localhost:<webPort>/ still lands in the app.
+            # (or a leftover exploded ROOT) with a one-line redirect into the
+            # app, so http://localhost:<webPort>/ still lands in it. Target
+            # /<ctx>/main, not /<ctx>/: the bare context root 404s on current
+            # 7.0-SNAPSHOT wars (see Resolve-LandingUrl), while /main answers
+            # on every supported war - where the root works it forwards to
+            # main anyway.
             if (Test-Path (Join-Path $rootDir "index.jsp")) {   # stock Tomcat welcome app
                 Remove-Item $rootDir -Recurse -Force -ErrorAction SilentlyContinue
             }
             New-Item -ItemType Directory -Force -Path $rootDir | Out-Null
-            $redirect = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/' + $ctxName + '/"><title>lsFusion</title></head>' +
-                        '<body><a href="/' + $ctxName + '/">/' + $ctxName + '/</a></body></html>'
+            $redirect = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/' + $ctxName + '/main"><title>lsFusion</title></head>' +
+                        '<body><a href="/' + $ctxName + '/main">/' + $ctxName + '/main</a></body></html>'
             Set-Content -Path (Join-Path $rootDir "index.html") -Value $redirect -Encoding UTF8
         }
 
@@ -1927,7 +1956,15 @@ function Cmd-StartWeb {
     }
     Write-Host ""
     if ($up) {
-        Ok "Web client is up: $webUrl"
+        # $up only proves Tomcat answers HTTP (a 404 counts) - resolve the URL
+        # the app actually lives at before printing it.
+        $landing = Resolve-LandingUrl $cfg
+        Ok "Web client is up: $($landing.url)"
+        if (-not $landing.ok) {
+            Warn "Tomcat answers, but neither $webUrl nor ${webUrl}main returned a page below HTTP 400 - the war may still be deploying or is broken; re-check with 'status' in a moment."
+        } elseif ($landing.url -ne $webUrl) {
+            Info "The bare context root $webUrl returns 404 on this war (current 7.0-SNAPSHOT behavior) - the SPA entry is /main; open/verify/status use it automatically."
+        }
         Info "Default login: user '$($cfg.adminUser)', empty password."
     } else {
         # Not up. Pull together the Tomcat logs and look for a bind failure - the
@@ -1997,7 +2034,7 @@ function Cmd-Status {
 
     $tPid = 0
     if (Test-Path $TomcatPid) { [int]::TryParse((Get-Content $TomcatPid -Raw -Encoding UTF8).Trim(), [ref]$tPid) | Out-Null }
-    if ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Ok "Web client    : running (PID $tPid, $(Get-WebUrl $cfg))" }
+    if ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Ok "Web client    : running (PID $tPid, $((Resolve-LandingUrl $cfg).url))" }
     elseif (Test-PortOpen $web) { Warn "Web client    : something is on web port $web (PID file stale)" }
     else { Info "Web client    : stopped" }
 
@@ -2039,7 +2076,12 @@ function Cmd-Verify {
         return
     }
     $target = $Url
-    if (-not $target) { $target = Get-WebUrl $cfg }
+    if (-not $target) {
+        # Probe, don't assume: on wars whose bare context root 404s (current
+        # 7.0-SNAPSHOT) a Get-WebUrl default would screenshot the Tomcat
+        # error page and happily "verify" it.
+        $target = (Resolve-LandingUrl $cfg).url
+    }
     # Persistent session: a detached headless Chromium on a per-project CDP
     # port. The page (navigation, open form, JS state) survives between
     # verify calls, so multi-step scenarios skip the re-navigation cost.
@@ -2146,14 +2188,33 @@ function Cmd-Verify {
         Info "Session : $sessionNote"
     }
     if ($r.title) { Info "Page title : $($r.title)" }
+    # An error landing must not sail through as [OK] screenshots. The status
+    # comes from the navigation response; the title pattern (Tomcat's stock
+    # error page) covers session continuations, where nothing navigates and
+    # http_status stays null.
+    $landedError = $false
+    $landedStatus = 0
+    if ($r.PSObject.Properties['http_status'] -and $r.http_status) { $landedStatus = [int]$r.http_status }
+    if ($landedStatus -ge 400) {
+        $landedError = $true
+        Warn "Landing page returned HTTP $landedStatus - the screenshots below show an ERROR page, not the app."
+    } elseif ("$($r.title)" -match '^HTTP Status \d{3}') {
+        $landedError = $true
+        Warn "Page title is a Tomcat error page - the screenshots below show an ERROR page, not the app."
+    }
+    if ($landedError -and ($landedStatus -eq 404 -or "$($r.title)" -match '\b404\b')) {
+        Warn "A 404 here usually means the URL misses the SPA entry: current 7.0-SNAPSHOT wars serve nothing at the bare context root. Retry without -Url (the default target probes the root and falls back to /main), or point -Url at $(Get-WebUrl $cfg)main."
+    }
     if (Test-Path $r.artifacts.login_screenshot) {
         $kb = [math]::Round((Get-Item $r.artifacts.login_screenshot).Length / 1KB, 1)
-        Ok "Login screenshot      : $($r.artifacts.login_screenshot) ($kb KB)"
+        if ($landedError) { Warn "Login screenshot (ERROR page) : $($r.artifacts.login_screenshot) ($kb KB)" }
+        else { Ok "Login screenshot      : $($r.artifacts.login_screenshot) ($kb KB)" }
     }
     if (Test-Path $r.artifacts.app_screenshot) {
         $kb = [math]::Round((Get-Item $r.artifacts.app_screenshot).Length / 1KB, 1)
-        $tag = if ($r.logged_in) { "authenticated UI" } else { "post-submit state" }
-        Ok "App screenshot ($tag) : $($r.artifacts.app_screenshot) ($kb KB)"
+        $tag = if ($landedError) { "ERROR page" } elseif ($r.logged_in) { "authenticated UI" } else { "post-submit state" }
+        if ($landedError) { Warn "App screenshot ($tag) : $($r.artifacts.app_screenshot) ($kb KB)" }
+        else { Ok "App screenshot ($tag) : $($r.artifacts.app_screenshot) ($kb KB)" }
     }
     if ($r.open -and $r.open.requested) {
         if (Test-Path $r.artifacts.open_screenshot) {
@@ -2258,6 +2319,10 @@ function Cmd-Verify {
     if ($r.login_attempted) {
         if ($r.logged_in) { Ok "Login flow succeeded - the authenticated screenshot shows the app." }
         else { Warn "Login was attempted but the password field is still visible - check credentials and the login screenshot." }
+    } elseif ($landedError) {
+        # No login form because there is no app on this page at all - the
+        # devmode-auto-auth reading would be flatly wrong here.
+        Warn "No login form - the landing is an error page (see the WARN above), so nothing app-related was verified."
     } else {
         Ok "No login form on the landing page - devmode auto-authenticated as '$($cfg.adminUser)', the screenshot shows the running app."
     }
@@ -3016,9 +3081,15 @@ function Cmd-Api {
 
 function Cmd-Open {
     $cfg = Get-ConfigOrFail
-    $u = Get-WebUrl $cfg
+    $landing = Resolve-LandingUrl $cfg
+    $u = $landing.url
     Start-Process $u
     Ok "Opened $u in the default browser."
+    if (-not $landing.ok) {
+        Warn "Neither $u nor ${u}main answered below HTTP 400 - the web client is down or broken; check 'status'."
+    } elseif ($u -ne (Get-WebUrl $cfg)) {
+        Info "The bare context root $(Get-WebUrl $cfg) returns 404 on this war (current 7.0-SNAPSHOT behavior) - opened the SPA entry /main instead."
+    }
 }
 
 function Cmd-Versions {
@@ -3135,8 +3206,11 @@ Common options:
   -AppId <id>           Short app identifier, chosen when the application is
                         created. It IS the database name (db.name) and the web
                         context path: the war deploys as <id>.war and the UI
-                        lives at http://localhost:<web port>/<id>/ (/ redirects
-                        there). Lowercase letter first, then [a-z0-9_], max 30
+                        lives at http://localhost:<web port>/<id>/main (open/
+                        verify/status probe the bare context root and fall back
+                        to /main - current 7.0-SNAPSHOT wars 404 on the root;
+                        / redirects into the app either way).
+                        Lowercase letter first, then [a-z0-9_], max 30
                         chars; persisted as db.name in settings.properties;
                         derived from folder name + path hash when omitted.
                         A validated -DbName, in effect - pass one or the other.

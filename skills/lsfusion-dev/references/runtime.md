@@ -16,7 +16,7 @@ configuration, or when you need to change ports/versions.
     │                       webapps/<app id>.war -> web context /<app id>
     │                       (app id = db.name; the download itself is not
     │                       kept; webapps/ROOT holds only a redirect page
-    │                       to /<app id>/)
+    │                       to /<app id>/main)
     ├── server.out.log / server.err.log
     ├── tomcat.out.log
     ├── server.pid / tomcat.pid
@@ -184,8 +184,13 @@ lightstart skips the Reflection sync those lookups read from; see
 **Web server** (`start-web`): Tomcat is started by invoking its
 `org.apache.catalina.startup.Bootstrap` directly (so the skill owns the PID).
 The war is deployed as `webapps/<app id>.war` — the app id being `db.name` —
-so the UI is at `http://localhost:8080/<app id>/`; the root `/` serves a
-one-line redirect there (projects set up by pre-app-id skill versions keep
+so the UI is at `http://localhost:8080/<app id>/main`. The **bare context
+root 404s on current 7.0-SNAPSHOT wars**: `web.xml` still declares
+`<welcome-file>main</welcome-file>`, but Spring 5.3 resolves controllers by
+the full in-context path (`/`), which nothing serves — so `open`, `verify`
+and `status` probe the root and fall back to `/main` (a war whose root still
+answers is used as-is). The root `/` serves a one-line
+redirect to `/<app id>/main` (projects set up by pre-app-id skill versions keep
 `ROOT.war` at `/` until the next `setup`, which renames the war in place — no
 re-download; a `db.name` that is not context-safe also stays at `/`). The
 web client connects to the application server over RMI on `localhost:7652` by
