@@ -93,7 +93,10 @@ foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
                 }
                 if (-not $n) { continue }
                 $n = $n.TrimStart('-', '/').Split(':')[0]
-                if ($n -and ('command'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -or
+                # 'ec' is powershell.exe's documented EncodedCommand alias (measured),
+                # NOT a prefix of it - match it explicitly alongside the prefixes.
+                if ($n -and ($n -eq 'ec' -or
+                    'command'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -or
                     'encodedcommand'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase))) { $cmdParam = $true; break }
             }
             if ($cmdParam) { continue }
