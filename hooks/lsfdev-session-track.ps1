@@ -73,17 +73,23 @@ foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
             $exe = Get-ConstText $elems[0]
             if (-not $exe -or $exe -notmatch '(?i)(^|[\\/])(powershell|pwsh)(\.exe)?$') { continue }
             # -File must be the host's ACTIVE script target: after -Command or
-            # -EncodedCommand (or a prefix shorthand like -c) the host treats the rest
-            # as command text, so a trailing "-File ...lsfdev.ps1 start" never runs.
+            # -EncodedCommand the host treats the rest as command text, so a trailing
+            # "-File ...lsfdev.ps1 start" never runs. powershell.exe accepts prefix
+            # shorthands (-c, -ec) AND slash forms (/Command, /c - measured), which
+            # parse as plain strings, not CommandParameterAst - check both spellings.
             # This guards against accidental shapes only - the hook is not a security
             # boundary: whoever authors the session's commands can stop any server
             # directly; the ledger merely keeps HONEST commands from mis-claiming.
             $cmdParam = $false
             for ($j = 1; $j -lt $i - 1; $j++) {
-                if ($elems[$j] -isnot [CommandParameterAst]) { continue }
-                $n = $elems[$j].ParameterName
-                if ('command'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -or
-                    'encodedcommand'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { $cmdParam = $true; break }
+                $n = $null
+                if ($elems[$j] -is [CommandParameterAst]) { $n = $elems[$j].ParameterName }
+                else {
+                    $t2 = Get-ConstText $elems[$j]
+                    if ($t2 -and $t2.Length -ge 2 -and $t2[0] -eq '/') { $n = $t2.Substring(1).Split(':')[0] }
+                }
+                if ($n -and ('command'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -or
+                    'encodedcommand'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase))) { $cmdParam = $true; break }
             }
             if ($cmdParam) { continue }
         }
