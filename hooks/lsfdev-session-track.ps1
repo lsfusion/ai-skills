@@ -46,15 +46,21 @@ $ledger = Join-Path $env:TEMP ('claude-lsfdev-' + $in.session_id + '.txt')
 foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
     $elems = $cmd.CommandElements
 
-    # The invocation shape: some element whose constant text ends in lsfdev.ps1
-    # (direct call, & 'path', powershell -File path) followed by a start verb.
+    # The invocation shape: an element whose constant text ends in lsfdev.ps1 and is
+    # the invocation TARGET - the command's first element (direct call, & 'path') or
+    # the argument of a -File parameter (powershell -File path) - followed by a start
+    # verb. lsfdev.ps1 as a mere argument (cmd /c echo ... lsfdev.ps1 start ...) must
+    # not claim ownership. Only this canonical `<lsfdev.ps1> <verb> -ProjectDir
+    # <value>` shape is recognized; binder tricks (parameters before the verb,
+    # -Command start, abbreviated -Pro) are untracked on purpose - fail-open.
     $verbIdx = -1
     for ($i = 0; $i -lt $elems.Count - 1; $i++) {
         $t = $null
         if ($elems[$i] -is [StringConstantExpressionAst]) { $t = $elems[$i].Value }
         elseif ($elems[$i] -is [ExpandableStringExpressionAst]) { $t = $elems[$i].Value }
-        if ($t -and $t -match '(?i)lsfdev\.ps1$' -and
-            $elems[$i + 1] -is [StringConstantExpressionAst] -and
+        if (-not $t -or $t -notmatch '(?i)lsfdev\.ps1$') { continue }
+        if ($i -ne 0 -and -not ($elems[$i - 1] -is [CommandParameterAst] -and $elems[$i - 1].ParameterName -eq 'File')) { continue }
+        if ($elems[$i + 1] -is [StringConstantExpressionAst] -and
             $verbs -contains $elems[$i + 1].Value) { $verbIdx = $i + 1; break }
     }
     if ($verbIdx -lt 0) { continue }
@@ -79,11 +85,11 @@ foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
     Get-ChildItem -Path $env:TEMP -Filter 'claude-lsfdev-*.txt' |
         Where-Object { $_.FullName -ne $ledger } | ForEach-Object {
             try {
-                $lines = @(Get-Content -LiteralPath $_.FullName -Encoding UTF8)
+                $lines = @(Get-Content -LiteralPath $_.FullName -Encoding UTF8 -ErrorAction Stop)
                 $rest = @($lines -ne $dir)
                 if ($rest.Count -eq $lines.Count) { return }
-                if ($rest.Count) { Set-Content -LiteralPath $_.FullName -Value $rest -Encoding UTF8 }
-                else { Remove-Item -LiteralPath $_.FullName -Force }
+                if ($rest.Count) { Set-Content -LiteralPath $_.FullName -Value $rest -Encoding UTF8 -ErrorAction Stop }
+                else { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
             } catch { }
         }
 }

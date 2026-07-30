@@ -28,7 +28,8 @@ foreach ($dir in $dirs) {
     if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
     $claimed = $false
     foreach ($f in Get-ChildItem -Path $env:TEMP -Filter 'claude-lsfdev-*.txt' -ErrorAction SilentlyContinue) {
-        try { if (@(Get-Content -LiteralPath $f.FullName -Encoding UTF8) -contains $dir) { $claimed = $true; break } } catch { }
+        try { if (@(Get-Content -LiteralPath $f.FullName -Encoding UTF8 -ErrorAction Stop) -contains $dir) { $claimed = $true; break } }
+        catch { $claimed = $true; break }   # unreadable ledger: assume it claims the dir - skipping is the safe side
     }
     if ($claimed) { continue }
     try { & $lsfdev stop -ProjectDir $dir } catch { }
