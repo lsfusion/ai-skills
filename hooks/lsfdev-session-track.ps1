@@ -8,7 +8,7 @@
 # Claude sessions and servers started outside lsfdev (e.g. from the IDE) are never
 # touched.
 #
-# Two layers keep false ownership out (a false claim would stop someone else's server):
+# Three layers keep false ownership out (a false claim would stop someone else's server):
 # - Output gate: lsfdev.ps1 prints "Previous application server|Tomcat
 #   stopped|was not running" (Stop-Tracked) at the exact point it starts touching the
 #   project's processes; a command whose response lacks that marker never reached the
@@ -22,6 +22,10 @@
 #   regexes. Values that need evaluation ($vars, expandable strings) and paths that are
 #   not drive-qualified/UNC-absolute (they would resolve against the tool's persistent
 #   cwd or current drive, which this hook cannot see) are skipped on purpose.
+# - Ambiguity skip: the gate is per command, so the marker cannot be attributed to one
+#   invocation. If the parse yields MORE THAN ONE distinct project dir (two starts
+#   chained in one command, or an if/else whose dead branch starts another project),
+#   nothing is recorded - fail-open again: those servers merely outlive the session.
 
 using namespace System.Management.Automation.Language
 
@@ -41,25 +45,34 @@ $ast = [Parser]::ParseInput($c, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { exit 0 }
 
 $verbs = 'start', 'start-server', 'start-web', 'restart'
-$ledger = Join-Path $env:TEMP ('claude-lsfdev-' + $in.session_id + '.txt')
+$found = New-Object System.Collections.Generic.List[string]
+
+function Get-ConstText($e) {
+    if ($e -is [StringConstantExpressionAst]) { return $e.Value }
+    if ($e -is [ExpandableStringExpressionAst]) { return $e.Value }
+    return $null
+}
 
 foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
     $elems = $cmd.CommandElements
 
     # The invocation shape: an element whose constant text ends in lsfdev.ps1 and is
     # the invocation TARGET - the command's first element (direct call, & 'path') or
-    # the argument of a -File parameter (powershell -File path) - followed by a start
-    # verb. lsfdev.ps1 as a mere argument (cmd /c echo ... lsfdev.ps1 start ...) must
-    # not claim ownership. Only this canonical `<lsfdev.ps1> <verb> -ProjectDir
-    # <value>` shape is recognized; binder tricks (parameters before the verb,
-    # -Command start, abbreviated -Pro) are untracked on purpose - fail-open.
+    # the argument of a -File parameter of a PowerShell host (powershell/pwsh -File
+    # path; -File after anything else is just that command's argument) - followed by
+    # a start verb. lsfdev.ps1 as a mere argument (cmd /c echo ... lsfdev.ps1 start
+    # ...) must not claim ownership. Only this canonical `<lsfdev.ps1> <verb>
+    # -ProjectDir <value>` shape is recognized; binder tricks (parameters before the
+    # verb, -Command start, abbreviated -Pro) are untracked on purpose - fail-open.
     $verbIdx = -1
     for ($i = 0; $i -lt $elems.Count - 1; $i++) {
-        $t = $null
-        if ($elems[$i] -is [StringConstantExpressionAst]) { $t = $elems[$i].Value }
-        elseif ($elems[$i] -is [ExpandableStringExpressionAst]) { $t = $elems[$i].Value }
+        $t = Get-ConstText $elems[$i]
         if (-not $t -or $t -notmatch '(?i)lsfdev\.ps1$') { continue }
-        if ($i -ne 0 -and -not ($elems[$i - 1] -is [CommandParameterAst] -and $elems[$i - 1].ParameterName -eq 'File')) { continue }
+        if ($i -ne 0) {
+            if (-not ($elems[$i - 1] -is [CommandParameterAst] -and $elems[$i - 1].ParameterName -eq 'File')) { continue }
+            $exe = Get-ConstText $elems[0]
+            if (-not $exe -or $exe -notmatch '(?i)(^|[\\/])(powershell|pwsh)(\.exe)?$') { continue }
+        }
         if ($elems[$i + 1] -is [StringConstantExpressionAst] -and
             $verbs -contains $elems[$i + 1].Value) { $verbIdx = $i + 1; break }
     }
@@ -77,20 +90,26 @@ foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
     try { $dir = [IO.Path]::GetFullPath($dir) } catch { continue }
     $dir = $dir.TrimEnd('\', '/')                                       # one identity per project
     if ($dir -match '^[A-Za-z]:$') { $dir += '\' }
-
-    Add-Content -LiteralPath $ledger -Value $dir -Encoding UTF8
-    # Take-over: drop this dir from other sessions' ledgers. An unsynchronized rewrite
-    # can lose a line another session appends in the same instant; two sessions
-    # (re)starting the same project simultaneously is not worth file locking.
-    Get-ChildItem -Path $env:TEMP -Filter 'claude-lsfdev-*.txt' |
-        Where-Object { $_.FullName -ne $ledger } | ForEach-Object {
-            try {
-                $lines = @(Get-Content -LiteralPath $_.FullName -Encoding UTF8 -ErrorAction Stop)
-                $rest = @($lines -ne $dir)
-                if ($rest.Count -eq $lines.Count) { return }
-                if ($rest.Count) { Set-Content -LiteralPath $_.FullName -Value $rest -Encoding UTF8 -ErrorAction Stop }
-                else { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
-            } catch { }
-        }
+    $found.Add($dir)
 }
+
+$uniq = @($found | Sort-Object -Unique)                                 # case-insensitive
+if ($uniq.Count -ne 1) { exit 0 }                                       # none, or ambiguous - skip
+$dir = $uniq[0]
+$ledger = Join-Path $env:TEMP ('claude-lsfdev-' + $in.session_id + '.txt')
+
+Add-Content -LiteralPath $ledger -Value $dir -Encoding UTF8
+# Take-over: drop this dir from other sessions' ledgers. An unsynchronized rewrite
+# can lose a line another session appends in the same instant; two sessions
+# (re)starting the same project simultaneously is not worth file locking.
+Get-ChildItem -Path $env:TEMP -Filter 'claude-lsfdev-*.txt' |
+    Where-Object { $_.FullName -ne $ledger } | ForEach-Object {
+        try {
+            $lines = @(Get-Content -LiteralPath $_.FullName -Encoding UTF8 -ErrorAction Stop)
+            $rest = @($lines -ne $dir)
+            if ($rest.Count -eq $lines.Count) { return }
+            if ($rest.Count) { Set-Content -LiteralPath $_.FullName -Value $rest -Encoding UTF8 -ErrorAction Stop }
+            else { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
+        } catch { }
+    }
 exit 0
