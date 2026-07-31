@@ -259,16 +259,17 @@ access, installing JDK 11 or 17 is the most reliable fix.
 
 ## Changing the lsFusion version
 
-`setup -Version` accepts:
+`setup -Version` accepts (the skill targets platform 7 only — every alias
+resolves within the 7.x line):
 
-- **`stable`** / **`latest`** — the highest non-SNAPSHOT, non-beta release.
-- **`dev`** / **`snapshot`** — the latest SNAPSHOT release.
-- A **major-number alias** (e.g. `6`, `7`) — the latest release in that
-  major line; **`7` is the default** when no `-Version` is passed (in a
-  Maven project the pom's platform version wins over the default instead).
-  What an alias resolves to depends on what the download server currently
-  has; major lines can be stable or SNAPSHOT-only.
-- An **exact tag** (e.g. `6.2`, `7.0-SNAPSHOT`) — used verbatim.
+- **`stable`** / **`latest`** — the highest non-SNAPSHOT, non-beta 7.x
+  release; while none is published, falls back to the latest 7.x build.
+- **`dev`** / **`snapshot`** — the latest 7.x SNAPSHOT.
+- **`7`** — the latest 7.x build of any kind; **the default** when no
+  `-Version` is passed (in a Maven project the pom's platform version wins
+  over the default instead). What an alias resolves to depends on what the
+  download server currently has.
+- An **exact tag** (e.g. `7.0-SNAPSHOT`) — used verbatim.
 
 `lsfdev.ps1 versions` queries <https://download.lsfusion.org/java/> and prints
 what is actually available right now together with how each alias resolves.

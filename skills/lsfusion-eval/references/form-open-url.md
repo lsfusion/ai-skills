@@ -3,7 +3,7 @@
 Shared mechanism reference for the **lsfusion-dev** skill (`verify -OpenScript`
 automates all of this against the local dev install) and the **lsfusion-eval**
 skill (hand-written Playwright scripts and in-app-browser drives against any
-host). Verified live on 6.2 and 7.0-SNAPSHOT.
+host). Verified live on 7.0-SNAPSHOT.
 
 ## The mechanism
 

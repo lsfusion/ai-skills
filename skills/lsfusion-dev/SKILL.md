@@ -219,8 +219,7 @@ a running `verify -Session` browser, or anything else that happened before.
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
-(`7` — default; `stable`; `dev`/`snapshot`; a major-version alias; or an exact
-tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
+(`7` — default; `stable`; `dev`/`snapshot`; or an exact tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
 `-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-RefreshWar` (setup:
@@ -472,29 +471,31 @@ writes `settings.properties` and a starter `.gitignore` entry. Changing the app
 id later renames the deployed war in place (no re-download) — and, since the id
 is `db.name`, repoints the database as well.
 
-**Which lsFusion version.** **Default to `-Version 7`** — the latest 7.x
-build on the download server. The `7` alias tracks the highest 7.x available
-(currently `7.0-SNAPSHOT`) and rolls forward to the 7.0 stable release once
-it ships. Pick it when the user gives no version cue: 7.x carries the newest
-platform behaviour the skill is tuned for (for instance, headless `verify`
-relies on 7.0's automatic tooltip suppression instead of a workaround).
+**Which lsFusion version.** **This skill targets platform 7 only** — every
+alias resolves within the 7.x line. **Default to `-Version 7`** — the latest
+7.x build on the download server. The `7` alias tracks the highest 7.x
+available (currently `7.0-SNAPSHOT`) and rolls forward to the 7.0 stable
+release once it ships. Pick it when the user gives no version cue: 7.x
+carries the newest platform behaviour the skill is tuned for (for instance,
+headless `verify` relies on 7.0's automatic tooltip suppression instead of a
+workaround).
 
 Because the latest 7.x is a SNAPSHOT today, **mention once** to the user that
 SNAPSHOT builds can change daily, sometimes break, and may not be available
-through the apt installer used by deploy workflows — and that `-Version
-stable` (the latest non-SNAPSHOT release, currently 6.2) is there when they
-want a fixed, production-matching build. Don't switch tracks on your own.
+through the apt installer used by deploy workflows. Don't switch tracks on
+your own.
 
 Switch off the default **only** when the user clearly asks for it — e.g.
-"stable", a specific tag (like `6.2`), a major-version alias, or when the
-project itself pins a version (its `pom.xml` parent declares a specific
-version, or its README requires it). In that case pass `-Version
-<alias-or-tag>`. If the cue is ambiguous, **ask** rather than guessing —
-major versions differ a lot.
+"stable", a specific 7.x tag (like `7.0-SNAPSHOT`), or when the project
+itself pins a version (its `pom.xml` parent declares a specific version, or
+its README requires it). In that case pass `-Version <alias-or-tag>`. If the
+cue is ambiguous, **ask** rather than guessing. If a project pins a pre-7
+platform, surface that to the user before setup instead of proceeding: the
+skill's recipes assume 7.x, and older platforms are out of its scope.
 
 Which exact version each alias resolves to is **not stable** — it depends on
 what the download server currently publishes. Always run `lsfdev.ps1 versions`
-to see how `7`, `stable`, `dev`, major-number aliases, and concrete tags
+to see how `7`, `stable`, `dev`, and concrete tags
 resolve right now, before locking in a non-default choice. To switch later,
 re-run setup with the new alias and `-Force`; the skill removes the stale
 server jar and clears the init marker so the next start is a full one (fresh
@@ -874,8 +875,8 @@ checking the unit-test output.
 
    **Reading values back and confirming mutations has sharp edges — the
    canonical recipes are in the lsfusion-eval skill** ("Getting values
-   back", "Chaining and verifying"). In short: `RETURN <expr>;` is 7.0+
-   only (a parse error on 6.x — use `EXPORT FROM res = <expr>;` there), a
+   back", "Chaining and verifying"). In short: `RETURN <expr>;` sends a
+   scalar back in the response body, a
    plain `MESSAGE` is visible **nowhere** over HTTP (not in the response
    and not in the server log — only `MESSAGE ... NOWAIT` leaves a
    `Server message:` log line), and a constraint-canceled `APPLY`
@@ -883,7 +884,7 @@ checking the unit-test output.
    with a top-level self-check (no `NEWSESSION` wrapper), e.g.
    `APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');`.
    The `api` command adds two safety nets of its own: it prints a
-   version-appropriate hint whenever the body comes back empty (the full
+   recipe hint whenever the body comes back empty (the full
    explanation once per session, a recipe one-liner on later calls), and it
    tails the server log for `Server message:` lines after every call —
    which surfaces `MESSAGE ... NOWAIT` output and the constraint text a

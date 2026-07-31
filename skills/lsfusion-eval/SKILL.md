@@ -65,8 +65,8 @@ you make from reading local code is wrong.
 | One-shot fix on production data (with user approval) | **This skill** — same path; **never** silently |
 | Clean up all rows of a class | **This skill** — POST a delete-and-apply script to `/eval/action` |
 | Evaluate an lsFusion expression / call an action on a running server | **This skill** — HTTP Action API |
-| Confirm a class / property / form exists in the running schema | **This skill** — `RETURN OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0;` over `/eval/action` (7.0+; on 6.x: `EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0);`): 200 + count = exists, 500 "not found" = it doesn't |
-| Count / sample data | **This skill** — `RETURN <expr>;` (7.0+) or `EXPORT FROM ...` (any version) |
+| Confirm a class / property / form exists in the running schema | **This skill** — `RETURN OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0;` over `/eval/action`: 200 + count = exists, 500 "not found" = it doesn't |
+| Count / sample data | **This skill** — `RETURN <expr>;` (or `EXPORT FROM ...` for tabular data) |
 | See the `.lsf` source actually loaded on a remote host | **This skill** — `/files/list`, `/files/read`, `/files/search` on the web port |
 | Inspect physical DB tables / columns / indexes | Direct `psql` — but this is a last resort; **first ask the user**, per the rule in the **lsfusion-dev** skill. lsFusion mangles names; raw SQL almost always misleads. |
 | Edit `.lsf` source | The lsfusion-dev skill + IDE MCP tools |
@@ -99,15 +99,10 @@ from where you're running curl:
 Most introspection ("does this class exist", "count rows", "send a value
 back") fits `/eval/action` — you write one line of action code that sends
 the answer back in the response body, the server runs it, you read the
-value (the status code alone only proves the script compiled). **The
-value-returning statement depends on the platform major version**: `RETURN
-<expr>;` exists on **7.0+ only** — on 6.x (what the `stable` alias currently
-resolves to; the lsfusion-dev no-flag default is the `7` alias, with a Maven
-project's pom version winning over it) it is a **parse
-error** (`extraneous input ... expecting ';'`); the 6.x equivalent is
-`EXPORT FROM res = <expr>;`, which works on every version. Check the
-target's version first (`Current version:` in the server log) and pick the
-matching form below.
+value (the status code alone only proves the script compiled). The
+value-returning statement is `RETURN <expr>;` for a scalar; for tabular /
+structured data use `EXPORT FROM ...;` — both are detailed in "Getting
+values back" below.
 
 **Access control — `enableAPI` is the master gate; `@@api`/`@@noauth` are
 per-action overrides.** The `enableAPI` working parameter (default **`0`**
@@ -162,7 +157,7 @@ header present the server runs a real credential check on what you sent.
 `-u admin:<wrong-guess>` therefore returns `HTTP 401` even in devmode —
 don't try `-u admin:fusion` or `-u admin:admin` "just in case". An
 **empty-password** Basic (`-u admin:`) is accepted by current builds (200
-verified on both 6.2 and 7.0-SNAPSHOT, 2026-06; the empty password matches
+verified on 7.0-SNAPSHOT, 2026-06; the empty password matches
 the default admin account), though at least one snapshot-era build has been
 observed rejecting it with 401. The no-header form has no such history —
 make it your default for devmode, and fall back to a real password only if
@@ -194,7 +189,7 @@ corrupted, because it is **not the HTTP transport**: with the server JVM on
 a UTF-8 default encoding (lsfusion-dev always passes
 `-Dfile.encoding=UTF-8`; the lsfusion-deploy skill's locale preflight
 ensures it on servers), Cyrillic survives POST bodies and query strings
-alike — verified **byte-for-byte on both 6.2 and 7.0-SNAPSHOT** (2026-06),
+alike — verified **byte-for-byte on 7.0-SNAPSHOT** (2026-06),
 on the app-server port and the web port. The corruptions that do happen are
 **client-side, on Windows**:
 
@@ -379,11 +374,10 @@ trick (including `lsfdev.ps1 api`'s own `Server message:` capture) can
 recover it. Don't put `MESSAGE` in API scripts at all. Two ways to actually
 read a value:
 
-**1. `RETURN <expr>;` (platform 7.0+ only) — the action's return value
-becomes the response body.** Simplest path for a scalar (a count, a name, a
+**1. `RETURN <expr>;` — the action's return value becomes the response
+body.** Simplest path for a scalar (a count, a name, a
 flag). Works on both endpoints: as the last statement of an `/eval/action`
-body, or inside `run()` for `/eval`. **On 6.x this is a parse error** — use
-`EXPORT FROM` (method 2), which carries scalars just as well.
+body, or inside `run()` for `/eval`.
 
 ```bash
 # count via /eval/action — response body is the number, e.g. "6"
@@ -400,8 +394,8 @@ curl -sS -X POST \
   http://localhost:7651/eval
 ```
 
-**2. `EXPORT FROM` to stdout via the response body — works on every
-version.** For tabular / structured data (and, on 6.x, for scalars too) the
+**2. `EXPORT FROM` to stdout via the response body.** For tabular /
+structured data the
 action's `EXPORT` target becomes the HTTP response body — content type is
 derived from the format keyword.
 
@@ -414,7 +408,7 @@ EXPORT JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
 " \
   http://localhost:7651/eval/action
 
-# scalar via EXPORT — the 6.x substitute for RETURN (works on 7.0+ too):
+# scalars work via EXPORT too:
 #   EXPORT FROM res = 'hello';            → {"res":"hello"}
 #   EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Item i IS Item), 0);
 ```
@@ -422,8 +416,8 @@ EXPORT JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
 **Don't wrap `EXPORT` in `NEWSESSION { ... }`.** The export lands in a
 session-local property (`exportFile()`), which the HTTP layer reads *after*
 the action finishes; a surrounding `NEWSESSION` throws that property away on
-exit, so the response comes back **empty with HTTP 200** (verified on 6.2
-and 7.0). This is specific to `EXPORT` — `RETURN` is control flow that
+exit, so the response comes back **empty with HTTP 200** (verified on
+7.0). This is specific to `EXPORT` — `RETURN` is control flow that
 propagates up the stack, so `NEWSESSION { ... RETURN x; }` *does* return `x`
 (verified on 7.0). Either way, one-shot eval scripts don't need `NEWSESSION`
 at all — every `/eval`/`/eval/action` call already runs in its own fresh
@@ -435,14 +429,13 @@ comes back in the body instead of an ambiguous empty 200.
 
 ### Common recipes
 
-Each answers in the response body. The `EXPORT` forms run on **every**
-platform version (verified live on 6.2 and 7.0-SNAPSHOT, 2026-06); on 7.0+
-any of them can be shortened to `RETURN <the same expr>;`.
+Each answers in the response body (verified live on 7.0-SNAPSHOT, 2026-06).
+Any scalar `EXPORT` form can be shortened to `RETURN <the same expr>;`.
 
 ```lsf
 // Does class X exist, and how many objects? 200 + count = yes; 500 "not found" = no.
 EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF X x IS X), 0);
-// 7.0+ shorthand: RETURN OVERRIDE (GROUP SUM 1 IF X x IS X), 0;
+// shorthand: RETURN OVERRIDE (GROUP SUM 1 IF X x IS X), 0;
 
 // Does property p(Class) exist, and on how many objects is it set?
 EXPORT FROM res = STRING((OVERRIDE (GROUP SUM 1 IF p(Class c)), 0)) + ' / ' +
@@ -498,12 +491,12 @@ session) — and with `EXPORT` it would even *break* the readback (see the
 note in "Getting values back"):
 
 ```lsf
-// any version (6.x and 7.0+):
+// with EXPORT:
 // ... NEW / assignments ...
 APPLY;
 EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');
 
-// 7.0+ alternative with RETURN:
+// alternative with RETURN:
 // ... NEW / assignments ...
 APPLY;
 IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');

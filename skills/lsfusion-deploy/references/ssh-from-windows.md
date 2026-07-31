@@ -105,7 +105,7 @@ It really is the argv boundary, not the shell or the server: MSYS-internal tools
   Invoke-WebRequest -Uri "$URL`?script=$enc" -Method Post -Headers $hdr -UseBasicParsing
   ```
 
-Query string and POST body both decode as UTF-8 on a properly-configured server — verified byte-for-byte on 6.2 and 7.0-SNAPSHOT (2026-06). When non-ASCII *does* come back as `?`/mojibake, the cause is one of: this argv trap (outbound), a console pipe re-decoding the response in the ANSI code page (inbound — check bytes from a saved file before blaming the server), or a server JVM running with a non-UTF-8 default charset — that last one is fixed by the locale preflight in SKILL.md §1, not by switching transports. Mind also that very large scripts in the query string can exceed the connector's `maxHttpHeaderSize` (8 KB default) → raise it on the SSL connector if you hit `Request header is too large`.
+Query string and POST body both decode as UTF-8 on a properly-configured server — verified byte-for-byte on 7.0-SNAPSHOT (2026-06). When non-ASCII *does* come back as `?`/mojibake, the cause is one of: this argv trap (outbound), a console pipe re-decoding the response in the ANSI code page (inbound — check bytes from a saved file before blaming the server), or a server JVM running with a non-UTF-8 default charset — that last one is fixed by the locale preflight in SKILL.md §1, not by switching transports. Mind also that very large scripts in the query string can exceed the connector's `maxHttpHeaderSize` (8 KB default) → raise it on the SSL connector if you hit `Request header is too large`.
 
 ## First-time key install via SSH_ASKPASS
 

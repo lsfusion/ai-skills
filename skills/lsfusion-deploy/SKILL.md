@@ -403,7 +403,7 @@ What it does (read the script if in doubt: `curl -s https://download.lsfusion.or
 3. Starts the app-server unit — **this is when DB migration runs** and can fail.
 4. Stops the web-client unit, downloads matching `web-client-<version>.war`, extracts it into the client's webapp dir, starts the client.
 
-You can pass any Maven baseVersion Nexus knows about — `7.0`, `7.0-SNAPSHOT`, `6.2`. SNAPSHOT versions resolve to the latest timestamped build. Running update again when the latest SNAPSHOT in Nexus is already the one on disk is a no-op for the jar content (sha256 will match before/after), but the script still restarts both services — so the live process changes even when the jar doesn't.
+You can pass any Maven baseVersion Nexus knows about — `7.0`, `7.0-SNAPSHOT`. SNAPSHOT versions resolve to the latest timestamped build. Running update again when the latest SNAPSHOT in Nexus is already the one on disk is a no-op for the jar content (sha256 will match before/after), but the script still restarts both services — so the live process changes even when the jar doesn't.
 
 Same completion-detection caveat as the installer applies — `update-lsfusion6` also exits silently with no terminating stdout marker. See the **"Detecting completion: don't watch stdout, watch artifacts"** callout above; for an update the right signal is the `Server has successfully started` count going up past a pre-update baseline.
 

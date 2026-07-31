@@ -449,17 +449,19 @@ function Resolve-TomcatVersion {
 
 function Get-AvailableVersions {
     # Scrape the download server for every lsfusion-server-*.jar filename and
-    # split into stable / snapshot / beta tracks. Returns fallback values on
-    # network failure so the caller can still proceed.
+    # split into stable / snapshot / beta tracks. The skill targets platform 7
+    # only, so anything outside the 7.x line is dropped. Returns fallback
+    # values on network failure so the caller can still proceed.
     try {
         $html = (Invoke-WebRequest "$DownloadBase/" -UseBasicParsing -TimeoutSec 15).Content
         $raw = [regex]::Matches($html, 'lsfusion-server-([0-9][\w.-]*?)\.jar') |
             ForEach-Object { $_.Groups[1].Value } |
             Where-Object { $_ -notmatch '-(sources|javadoc)$' } |
+            Where-Object { $_ -like "7.*" } |
             Sort-Object -Unique
     } catch {
         return [pscustomobject]@{
-            stable   = @("6.2"); snapshot = @("7.0-SNAPSHOT"); beta = @()
+            stable   = @(); snapshot = @("7.0-SNAPSHOT"); beta = @()
             error    = $_.Exception.Message
         }
     }
@@ -472,11 +474,12 @@ function Get-AvailableVersions {
 }
 
 function Resolve-Version([string]$requested) {
-    # Concrete tags (e.g. "6.2", "7.0-SNAPSHOT") pass through; the words below
-    # are aliases for "the latest X in track Y". Defaults to the latest 7.x.
+    # Concrete tags (e.g. "7.0-SNAPSHOT") pass through; the words below are
+    # aliases for "the latest build in track Y" within the 7.x line - the
+    # skill targets platform 7 only. Defaults to the latest 7.x.
     if (-not $requested) { $requested = "7" }
     $lc = $requested.ToLowerInvariant()
-    if ($lc -notin @("stable", "latest", "dev", "snapshot", "6", "7")) {
+    if ($lc -notin @("stable", "latest", "dev", "snapshot", "7")) {
         return $requested
     }
     $av = Get-AvailableVersions
@@ -485,18 +488,18 @@ function Resolve-Version([string]$requested) {
     switch ($lc) {
         { $_ -in "stable", "latest" } {
             $b = $av.stable | Sort-Object $cmpStable -Descending | Select-Object -First 1
-            if ($b) { return $b } else { return "6.2" }
+            if ($b) { return $b }
+            # No stable 7.x release published yet - fall back to the latest
+            # 7.x build of any kind.
+            $b = $av.snapshot | Sort-Object $cmpSnap -Descending | Select-Object -First 1
+            if ($b) { return $b } else { return "7.0-SNAPSHOT" }
         }
         { $_ -in "dev", "snapshot" } {
             $b = $av.snapshot | Sort-Object $cmpSnap -Descending | Select-Object -First 1
             if ($b) { return $b } else { return "7.0-SNAPSHOT" }
         }
-        "6" {
-            $b = $av.stable | Where-Object { $_ -like "6.*" } | Sort-Object $cmpStable -Descending | Select-Object -First 1
-            if ($b) { return $b } else { return "6.2" }
-        }
         "7" {
-            $b = (@($av.snapshot) + @($av.stable)) | Where-Object { $_ -like "7.*" } | Sort-Object $cmpSnap -Descending | Select-Object -First 1
+            $b = (@($av.snapshot) + @($av.stable)) | Sort-Object $cmpSnap -Descending | Select-Object -First 1
             if ($b) { return $b } else { return "7.0-SNAPSHOT" }
         }
     }
@@ -2767,13 +2770,11 @@ function Cmd-Precheck {
             }
             $scriptText = (Strip-ModuleHeader $raw) + "`r`nrun() {}"
             # Transport: small scripts ride the %XX query parameter (decodes
-            # as UTF-8 on every platform build - same reason as Cmd-Api), but
-            # System.Uri and the server's request line cap out around 64 KB,
-            # so bigger payloads go as a form body with an explicit UTF-8
-            # charset. Decided on the ENCODED length - escaping expands up to
-            # 9x (Cyrillic chars become %XX%XX). (6.x-era builds decoded the
-            # body in the platform charset, but they cannot take a >64 KB URI
-            # either - there is no better channel for a big file on them.)
+            # as UTF-8 - same reason as Cmd-Api), but System.Uri and the
+            # server's request line cap out around 64 KB, so bigger payloads
+            # go as a form body with an explicit UTF-8 charset. Decided on the
+            # ENCODED length - escaping expands up to 9x (Cyrillic chars
+            # become %XX%XX).
             $enc = ConvertTo-EscapedData $scriptText
             $uri = "http://localhost:$($cfg.httpPort)/eval"
             if ($enc.Length -le 60000) {
@@ -2900,7 +2901,7 @@ function Cmd-Api {
     # Cmd-StartServer), and devmode lets a request with NO Authorization header
     # through as the anonymous user. With an Authorization header present the
     # server runs a real credential check instead: current builds (verified on
-    # 6.2 and 7.0-SNAPSHOT, 2026-06) accept Basic auth for 'admin' with an
+    # 7.0-SNAPSHOT, 2026-06) accept Basic auth for 'admin' with an
     # EMPTY password too, but at least one snapshot-era build was observed
     # rejecting it with HTTP 401 - the no-header form has no such history, so
     # we attach the header ONLY when a non-empty password is actually
@@ -2913,16 +2914,12 @@ function Cmd-Api {
     } else {
         Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent (the form that works on every platform build)."
     }
-    # The script travels as a percent-encoded query parameter (NOT a POST form
-    # body): EscapeDataString emits the UTF-8 bytes as %XX, which the server
-    # decodes as UTF-8 reliably on every platform version. (Current
-    # 7.0-SNAPSHOT decodes a POST form body as UTF-8 too, but 6.x-era builds
-    # used the platform default charset there and corrupted non-ASCII to '?' -
-    # the query parameter is the channel that behaves the same everywhere.)
-    # Exception: System.Uri and the server's request line cap out around
-    # 64 KB, so an oversized ENCODED script falls back to a UTF-8 form body -
-    # on a 6.x-era build a giant non-ASCII script may then land mangled, but
-    # the query channel would not carry it at all.
+    # The script travels as a percent-encoded query parameter for small
+    # payloads: EscapeDataString emits the UTF-8 bytes as %XX, which the
+    # server decodes as UTF-8 reliably (a POST form body with an explicit
+    # UTF-8 charset decodes identically - verified on 7.0-SNAPSHOT).
+    # System.Uri and the server's request line cap out around 64 KB, so an
+    # oversized ENCODED script falls back to that UTF-8 form body.
     $enc = ConvertTo-EscapedData $scriptText
     $useBody = ($enc.Length -gt 60000)
     $uri = if ($useBody) { "http://localhost:$($cfg.httpPort)/eval/action" }
@@ -2960,13 +2957,7 @@ function Cmd-Api {
         $bytes = $resp.RawContentStream.ToArray()
         if ($bytes.Length) { Write-Host ([System.Text.Encoding]::UTF8.GetString($bytes)) }
         else {
-            # The self-check recipe differs by platform version: RETURN is 7.0+
-            # only (a parse error on 6.x), where EXPORT FROM carries the value.
-            $recipe = if ("$($cfg.version)" -match '^6') {
-                "APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');"
-            } else {
-                "APPLY; IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');"
-            }
+            $recipe = "APPLY; IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');"
             # The full explanation is identical on every call, and a seeding
             # loop of a dozen api calls used to print all 9 lines a dozen
             # times. Print it once per session - marker file, refreshed on
@@ -3036,10 +3027,10 @@ function Cmd-Open {
 }
 
 function Cmd-Versions {
-    Head "lsFusion versions available on download.lsfusion.org"
+    Head "lsFusion versions available on download.lsfusion.org (7.x line only)"
     $av = Get-AvailableVersions
     if ($av.error) { Bad "Could not reach the download server: $($av.error)" }
-    Info "Stable     : $($av.stable -join ', ')"
+    Info "Stable     : $(if ($av.stable) { $av.stable -join ', ' } else { '(no stable 7.x release yet)' })"
     Info "Snapshot   : $($av.snapshot -join ', ')"
     if ($av.beta) { Info "Beta       : $($av.beta -join ', ')" }
     Write-Host ""
@@ -3047,14 +3038,15 @@ function Cmd-Versions {
     $cmpSnap   = { try { [version]($_ -replace '-SNAPSHOT', '') } catch { [version]"0.0" } }
     $latestStable = $av.stable | Sort-Object $cmpStable -Descending | Select-Object -First 1
     $latestSnap   = $av.snapshot | Sort-Object $cmpSnap -Descending | Select-Object -First 1
-    $latest6      = $av.stable | Where-Object { $_ -like "6.*" } | Sort-Object $cmpStable -Descending | Select-Object -First 1
-    $latest7      = (@($av.snapshot) + @($av.stable)) | Where-Object { $_ -like "7.*" } | Sort-Object $cmpSnap -Descending | Select-Object -First 1
+    $latest7      = (@($av.snapshot) + @($av.stable)) | Sort-Object $cmpSnap -Descending | Select-Object -First 1
+    # Mirror Resolve-Version: with no stable 7.x published, 'stable' falls
+    # back to the latest 7.x build, so print what it will actually resolve to.
+    if (-not $latestStable) { $latestStable = $latest7 }
     Head "Aliases for: setup -Version <X>"
     Info "stable / latest -> $latestStable"
     Info "dev / snapshot  -> $latestSnap"
-    Info "6               -> $latest6"
     Info "7               -> $latest7"
-    Info "<exact tag>     -> used as-is (e.g. 6.2, 7.0-SNAPSHOT)"
+    Info "<exact tag>     -> used as-is (e.g. 7.0-SNAPSHOT)"
 }
 
 function Cmd-Clone {
@@ -3156,8 +3148,8 @@ Common options:
                         A validated -DbName, in effect - pass one or the other.
   -DbPassword <pwd>     PostgreSQL password (needed for setup).
   -DbUser / -DbServer / -DbName
-  -Version <ver>        lsFusion version: '7' (default), 'stable', 'dev', '6',
-                        or exact (e.g. 6.2, 7.0-SNAPSHOT). See 'versions'.
+  -Version <ver>        lsFusion version: '7' (default), 'stable', 'dev',
+                        or exact (e.g. 7.0-SNAPSHOT). See 'versions'.
   -TomcatVersion <ver>  Pin a Tomcat 9 version.
   -TopModule <name>     Top lsFusion module to load.
   -RmiPort <port>       App-server RMI port (default 7652). Set per project to

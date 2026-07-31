@@ -34,7 +34,7 @@ ssh root@<host> 'grep "Current version" /var/log/lsfusion6-server/stdout.log | t
 grep -A2 '<parent>' pom.xml | grep '<version>'
 ```
 
-If the project parent says `7.0-SNAPSHOT` and the server says `6.2 (XXX)`, you need to [upgrade the platform](#platform-version-mismatch).
+If the versions differ — e.g. the project parent says `7.0-SNAPSHOT` while the server log reports the installer's bundled (older) version — you need to [upgrade the platform](#platform-version-mismatch).
 
 **Counter-cause:** an actual `.lsf` typo in the project. Open the file at the reported line and check — if the same syntax works locally with the dev skill, it's a version mismatch.
 
