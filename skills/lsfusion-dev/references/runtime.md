@@ -349,3 +349,83 @@ mismatches, or compile errors — same code runs either way. The legitimate
 `-FullStart` suggestions are exactly two: the canonical-name / Reflection
 case above, and the user explicitly caring about the user-facing settings
 lightstart skips (table-view layout, security-policy reload).
+
+## Dry run {#dryrun}
+
+Platform mechanics behind `lsfdev.ps1 dryrun` (setting `settings.dryRun`,
+in 7.0-SNAPSHOT since build `7.0-20260730.203938-1179`; the platform docs
+list it under Working parameters). All facts below are measured on
+2026-07-31 builds unless marked as source-derived.
+
+**Lifecycle cutoff.** Server startup fires lifecycle listeners in a fixed
+order: `BusinessLogics` (order 100, the whole logical model — parse,
+metacode expansion, name resolution, classes / properties / actions /
+forms creation and finalization), then `DBManager` (300, schema sync),
+`SecurityManager` (400), `RmiManager` (500, RMI port), `RemoteLogicsLoader`
+(600, exposes logics), daemons (8000 — the Action API HTTP server,
+WebSocket server, RabbitMQ), `ReflectionManager` (9000). With
+`settings.dryRun=true` the INIT event stops right before order 300:
+**only the logic phase runs**. The JVM then prints
+`Dry run finished successfully in N ms, exiting` and exits **0**; any
+startup error goes through the normal error logging and exits **1**
+(the nonzero code exists precisely so CI / agents can read the verdict).
+
+**What that implies (measured):** zero listening sockets for the dry-run
+JVM's entire lifetime (RMI 7652 / Action API 7651 / WebSocket 8887 all
+belong to managers past the cutoff) — so it runs next to a live server
+with no port juggling; no schema sync, no Reflection sync, no init-marker
+implications; a 772-module project completes the JVM phase in ~9 s where
+its restart takes 26–41 s+.
+
+**The DB adapter still connects — before the cutoff.** The platform's
+`DataAdapter` is wired during Spring context creation, which precedes the
+lifecycle cutoff: a dry run opens 2 PostgreSQL connections, and when the
+configured `db.name` does not exist it **creates the database** (empty —
+0 tables; the sync that would fill it is past the cutoff). Consequences:
+
+- PostgreSQL must be **reachable with valid credentials** even for a dry
+  run. "Validate without a live database" holds only in the sense of *no
+  initialized application database* — the DBMS itself is required.
+- An unreachable server (`db.server` typo, stopped service, wrong port)
+  puts the adapter into an **endless once-per-second retry loop** —
+  `ERROR StartLogger - Connection to <host> refused` repeating forever,
+  no progress, no exit. `lsfdev.ps1 dryrun` watches for that pattern and
+  kills the JVM with a `PostgreSQL is unreachable` verdict in ~10 s
+  instead of hanging to the timeout.
+
+**Version gate.** The Spring wiring for the setting (`<entry
+key="dryRun" .../>` in the jar's root `lsfusion.xml`) exists only in
+7.0-SNAPSHOT builds from `20260730.203938` on. On any older build the
+`-Dsettings.dryRun=true` flag is **silently ignored** and the "dry run"
+boots a REAL server — against the project's actual database and ports.
+`lsfdev.ps1 dryrun` therefore (1) inspects the server jar's
+`lsfusion.xml` up front and refuses unsupported builds, and (2) as a
+backstop for uninspectable jars, kills the JVM the moment
+`Server has successfully started` appears in the log.
+
+**Scope and `topModule` (measured).** Module scope is the `REQUIRE`
+closure of `logics.topModule` (plus system modules) — same as a real
+start. `dryrun -TopModule <M>` overrides it per-run via
+`-Dlogics.topModule` (a `-D` outranks the project's
+`lsfusion.properties`). Everything outside the closure is dropped
+**before parsing** — a module outside the closure contributes nothing,
+not even syntax errors — and dependents of `M` are not loaded either.
+Fast iteration: scoped run on the edited subtree; the gate before a
+restart: the unscoped run. Never persist a narrowed `topModule` into the
+project config: a *real* start with it would drop the out-of-closure
+modules' tables at schema sync.
+
+**lsfdev implementation notes.** The command reuses `start-server`'s
+launch plumbing (same Maven / staged classpath, same `-Xmx`, devmode,
+`--add-opens`, persisted `-JvmArgs`) with these differences: non-Maven
+staging goes to `.lsfusion-dev/dryrun-classes` (never wiping
+`target/classes` under a running server; in Maven mode `mvn compile` is
+incremental — the same thing an IDE build does); no `Ensure-Database`,
+no `-Ddb.*` mirror, no init-marker write, no PID-file/port takeover of
+the real server (a stuck *dry run* is reaped via its own
+`.lsfusion-dev/dryrun.pid`). Artifacts: `dryrun.out.log` /
+`dryrun.err.log` / `dryrun-cmd.txt` in `.lsfusion-dev/`. Error
+reporting mirrors a restart: parse errors batched per file, **one
+semantic error per run**, printed with `file:line:col` from the first
+`ERROR` line onward (the multi-KB `Class path:` preamble is filtered
+out of the tail).

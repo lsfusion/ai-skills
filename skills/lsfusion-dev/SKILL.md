@@ -216,6 +216,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
+| `dryrun` | **Full-fidelity validation of the whole project without starting it** (7.0-SNAPSHOT platform built 2026-07-31+; older builds are refused). Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets) and never touches the running server, so it validates safely **next to a live instance**. PostgreSQL must still be **reachable** (the DB adapter connects at startup and creates a missing database empty; unreachable → diagnosed in seconds). `-TopModule <M>` forces `logics.topModule` for the run, cutting the scope to M's REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
@@ -254,6 +255,7 @@ no-pipe note in step 4), so don't inflate it "just in case":
 | `start-server` — first start on this DB, or major-version upgrade (raise the inner `-Timeout` to 300 as well) | 600 s |
 | `verify` — first ever run (installs Playwright + Chromium, ~120 MB) | 300 s |
 | `verify` — later runs | default (300 s when `-OpenScript`/`-Click` hits the *first* open of a heavy form right after a restart — the lazy form build alone can take 40 s) |
+| `dryrun` | default (Maven compile / staging + a 4–10 s JVM phase even at 772 modules; the command's own watchdog kills hung runs, so the inner `-Timeout` rarely matters) |
 
 Rule of thumb: outer timeout ≈ the script's inner `-Timeout` (default 180 s)
 plus ~2 minutes of Maven/Tomcat overhead. Don't copy the 600 s ceiling from a
@@ -775,7 +777,8 @@ A parse error means bad syntax; `... is not found` means a missing
 element / `REQUIRE`. One blind spot the other way: eval's throwaway
 module depends on **every** loaded module, so a name your file uses
 without the matching `REQUIRE` still resolves — an incomplete `REQUIRE`
-list surfaces only at restart. When a file carries a load-only construct (`CLASS` /
+list surfaces only at restart or `dryrun` (which checks the real
+`REQUIRE` graph — see below). When a file carries a load-only construct (`CLASS` /
 `DATA … NONULL` / `WHEN` / `CONSTRAINT`), eval answers `... cannot be
 used in EVAL module` — precheck reports that as **syntax OK, names NOT
 checked** (the restriction preempts name resolution for the whole
@@ -790,16 +793,86 @@ reports **"restart-only"** immediately instead of a hollow PASS, checking
 just the structure: MODULE header, **META/END balance** (an unclosed META
 is a hard FAIL: it swallows the rest of the file at restart) and bracket
 balance (a warning). Plan the loop around the truth: **for a restart-only
-file, the restart IS the check** — go straight to it and read the log,
-don't spend cycles re-running precheck there. Files that merely *declare*
-META next to other code are linted normally, with the caveat that
-un-instantiated META bodies stay unchecked until restart.
+file, only a full load checks it** — `dryrun` (below) does that in seconds
+without touching the live server, the restart does it while applying the
+schema; don't spend cycles re-running precheck there. Files that merely
+*declare* META next to other code are linted normally, with the caveat
+that un-instantiated META bodies stay unchecked until a full load.
 
 Do **not** use `api` for any of this: its `/eval/action`
 endpoint wraps the script as an action body and any declaration dies
 with misleading wrapped-brace parse errors. The lsfusion-eval skill's
 "Syntax-checking `.lsf` without a restart" has the phase table and the
 raw-curl form for remote servers.
+
+**Between `precheck` and the restart sits `dryrun` — the full project
+check without starting anything.** It launches the server JVM with
+`-Dsettings.dryRun=true` (7.0-SNAPSHOT platform, builds from 2026-07-31
+on — the command refuses older jars, where the flag would be silently
+ignored and the run would come up as a real server): the whole logic —
+modules, classes, properties, actions, forms — is parsed,
+metacode-expanded, name-resolved and finalized exactly as at a restart,
+then the JVM exits **before the DB sync** instead of starting services.
+Exit code 0 = the logic loads; 1 = it does not (the error, with
+file:line:col, is printed). Every load-time blind spot of `precheck` is
+covered (all measured): names resolve against the file's **real
+`REQUIRE` closure**, so an incomplete `REQUIRE` list fails here;
+`EXTEND FORM`, `() + { }` overrides, META instantiation — the whole
+"restart-only" file class — get real checking; parse errors come
+batched, and, like a restart, **one semantic error per run**.
+
+```
+lsfdev.ps1 dryrun -ProjectDir "C:/Work/proj"                    # whole project
+lsfdev.ps1 dryrun -ProjectDir "C:/Work/proj" -TopModule Invoice # one subtree
+```
+
+What makes it different from a restart (all measured):
+
+- **The running server is untouched.** A dry run binds no ports (zero
+  listening sockets throughout its lifetime) and never stops, restarts
+  or reinitializes anything — the live instance keeps serving users
+  while the edit is validated. A failed restart takes the app down; a
+  failed dryrun leaves it running. It also leaves the init marker and
+  lightstart state alone, and stages its classpath into a separate
+  directory (`.lsfusion-dev/dryrun-classes`), not `target/classes`.
+- **No schema is applied.** The DB sync never runs — which also means a
+  dryrun PASS does not catch DB-migration issues, and the restart is
+  still what loads the schema. Validate first, restart once.
+- **~3–4× cheaper on the JVM phase and DB-independent in outcome**:
+  772-module project ≈ 9 s of JVM (a restart's full cycle is 26–41 s+
+  and holds the DB while it runs).
+- **PostgreSQL must still be reachable with valid credentials.** The
+  platform's DB adapter connects during Spring startup, *before* the
+  dry-run cutoff, and **creates the configured database (empty) when it
+  is missing**. With an unreachable server the JVM retries the
+  connection forever; the command detects the pattern and reports
+  `PostgreSQL is unreachable` in seconds — fix `db.server`/credentials,
+  don't raise the timeout.
+
+**`-TopModule <M>` limits the checked scope to M's `REQUIRE` closure**
+(plus system modules) by forcing `logics.topModule` for that run only —
+the project's `lsfusion.properties` is not touched. On the measured
+772-module project the closure of a leaf module was 11 modules and the
+JVM phase dropped from ~9 s to ~4 s. Two hard caveats, both measured:
+modules **outside the closure are not checked at all** (not even
+parsed), and **dependents of M are not checked either** — a signature
+change that breaks M's callers only surfaces in a full dryrun (or the
+restart). So scope iteration to the module you edit, but keep the
+unscoped `dryrun` as the gate before the restart. Never write
+`settings.dryRun` or a forced `topModule` into `settings.properties` /
+`lsfusion.properties` — a server started with `dryRun` just exits, and
+a persisted narrow `topModule` would make a real start **drop the
+out-of-closure modules' tables** at schema sync. lsfdev passes both as
+per-run `-D` flags only.
+
+When to reach for `dryrun` (instead of a restart, never instead of
+`precheck` — milliseconds still beat seconds mid-edit): as the **gate
+right before a restart** (a failed restart costs 26–41 s *and* downtime;
+a failed dryrun costs ~10–40 s and nothing else); for **restart-only
+files** (`EXTEND FORM` / all-META modules) where precheck proves
+nothing; to catch a **missing `REQUIRE`** precheck structurally cannot;
+and for CI-style "does this branch even load" checks on a box with a
+reachable PostgreSQL but no initialized application database.
 
 **Web resources (JS / CSS / images) need NO restart in devmode — any page
 load picks them up; browser cache is NOT a factor.** Files under

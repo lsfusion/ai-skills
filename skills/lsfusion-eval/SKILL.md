@@ -364,6 +364,18 @@ catches the typos first, cheaply. (For comparison, measured on
 7.0-SNAPSHOT: ~30 ms per precheck call vs a 26–41 s failed-restart cycle
 that reports a single name error.)
 
+**Full-fidelity alternative on a local dev box: `lsfdev.ps1 dryrun`**
+(lsfusion-dev skill; 7.0-SNAPSHOT builds from 2026-07-31). It launches
+the server JVM with `-Dsettings.dryRun=true`, which loads and checks the
+**whole project** exactly as a restart would — real `REQUIRE` graph
+(missing-REQUIRE caught), `EXTEND FORM`, META instantiation, the entire
+restart-only class — then exits before the DB sync: no ports bound, the
+running server untouched, ~9 s of JVM on a 772-module project
+(`-TopModule` narrows the scope further). It needs the sources and the
+platform jar locally plus a *reachable* PostgreSQL, so for a **remote**
+server eval stays the only lint; use eval per-edit (milliseconds),
+`dryrun` as the pre-restart gate.
+
 ### Getting values back
 
 `MESSAGE` is useless over the Action API: its text is swallowed entirely —

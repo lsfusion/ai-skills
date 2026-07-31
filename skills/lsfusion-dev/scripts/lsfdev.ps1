@@ -6,7 +6,7 @@
     powershell -ExecutionPolicy Bypass -File lsfdev.ps1 <command> [options]
 
   Commands: check setup start-server start-web start restart stop status
-            log verify open api help
+            log verify open api precheck dryrun help
 #>
 [CmdletBinding()]
 param(
@@ -584,6 +584,27 @@ function Get-ZipBuildDate([string]$path) {
                 if ((-not $max) -or ($t -gt $max)) { $max = $t }
             }
             return $max
+        } finally { $zip.Dispose() }
+    } catch { return $null }
+}
+
+# Whether this platform build understands settings.dryRun: the Spring wiring
+# for it (<entry key="dryRun" .../> in the jar's root lsfusion.xml) exists
+# only in 7.0-SNAPSHOT builds from 2026-07-31 on. On an older build the -D
+# flag is silently IGNORED and a "dry run" would come up as a REAL server -
+# against the project's actual database and ports. $null = could not inspect
+# (rely on the runtime guard then).
+function Test-JarSupportsDryRun([string]$jarPath) {
+    if (-not ($jarPath -and (Test-Path $jarPath))) { return $null }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+        try {
+            $entry = $zip.GetEntry("lsfusion.xml")
+            if (-not $entry) { return $null }
+            $reader = New-Object System.IO.StreamReader($entry.Open())
+            try { $xmlText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            return [bool]($xmlText -match 'key="dryRun"')
         } finally { $zip.Dispose() }
     } catch { return $null }
 }
@@ -1541,15 +1562,11 @@ $portLines$topLine
     }
 }
 
-function Cmd-StartServer {
-    Head "Start application server"
-    $cfg = Get-ConfigOrFail
-    $java = Find-Java
-    if (-not $java) { throw "Java not found. Install a JDK 11+ first." }
-
-    # Maven-aware path: if the project has pom.xml AND Maven is on PATH, let
-    # Maven resolve dependencies (including lsfusion-server itself) and build
-    # the classpath. Otherwise fall back to the downloaded server jar.
+# --- shared launch plumbing (start-server + dryrun) -------------------------
+# Detect HOW the server will be launched: Maven-resolved classpath (pom.xml +
+# mvn on PATH) or the downloaded server jar. Fails fast when the jar is
+# needed but missing, BEFORE any runtime state is touched.
+function Resolve-LaunchMode($cfg) {
     $useMaven = $false
     $mvn = $null
     if (Test-MavenProject $ProjectDir) {
@@ -1561,10 +1578,152 @@ function Cmd-StartServer {
             Warn "pom.xml present but Maven not on PATH - falling back to the downloaded server jar."
         }
     }
+    $jar = $null
     if (-not $useMaven) {
         $jar = Join-Path $StateDir "lsfusion-server-$($cfg.version).jar"
         if (-not (Test-Path $jar)) { throw "Server jar missing. Run setup again." }
     }
+    return [pscustomobject]@{ UseMaven = $useMaven; Mvn = $mvn; Jar = $jar }
+}
+
+# Count only modules that will actually be on the classpath, mirroring the
+# staging/classpath logic in Build-ServerClasspath: the Maven source roots
+# when they exist, else loose top-level .lsf (flat-project fallback). A
+# recursive scan over the whole project would also count Maven-staged copies
+# in target/, scratch/seed scripts in .lsfusion-dev/, and stray files in
+# unrelated subfolders - none of which load, making the number a misleading
+# signal.
+function Report-ProjectLsfFiles {
+    $srcRoots = @(@("src\main\lsfusion", "src\main\resources") |
+        ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ })
+    if ($srcRoots.Count) {
+        $lsf = @($srcRoots | ForEach-Object { Get-ChildItem $_ -Recurse -Filter *.lsf -ErrorAction SilentlyContinue })
+        $lsfWhere = "under src/main"
+    } else {
+        $lsf = @(Get-ChildItem $ProjectDir -File -Filter *.lsf -ErrorAction SilentlyContinue)
+        $lsfWhere = "at the project root"
+    }
+    if ($lsf.Count -eq 0) { Warn "No .lsf files found $lsfWhere - the server will start with system modules only." }
+    else { Info "Found $($lsf.Count) .lsf file(s) to load ($lsfWhere)." }
+    # Stray modules outside the loaded roots deserve a heads-up - a .lsf parked
+    # in docs/, scripts/ or next to the sources will silently NOT load.
+    $allLsf = @(Get-ChildItem $ProjectDir -Recurse -Filter *.lsf -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\(target|\.lsfusion-dev|\.git)\\' })
+    $strayCount = $allLsf.Count - $lsf.Count
+    if ($strayCount -gt 0) {
+        $verb = if ($strayCount -eq 1) { "is" } else { "are" }
+        Info "($strayCount more .lsf elsewhere in the project $verb NOT on the classpath and will not load.)"
+    }
+}
+
+# Build the launch classpath for the mode picked by Resolve-LaunchMode.
+# $stageRel is the staging directory (relative to the project root) used in
+# the non-Maven mode: start-server stages into target\classes; dryrun stages
+# into .lsfusion-dev\dryrun-classes so a validation run never wipes class
+# files from under a RUNNING server (the wipe+restage window would break
+# lazy classloading of INTERNAL Java action classes). In Maven mode both
+# callers share 'mvn compile' - incremental, no wipe: the same thing an IDE
+# build does under a running server.
+function Build-ServerClasspath($cfg, $mode, $java, [string]$stageRel = "target\classes") {
+    if ($mode.UseMaven) {
+        # 'mvn compile' refreshes target/classes (Maven incremental, fast after
+        # the first run). The dependency classpath is cached and only refreshed
+        # when pom.xml changes - resolving deps is the slow part of Maven.
+        $mvn = $mode.Mvn
+        $pomFile = Join-Path $ProjectDir "pom.xml"
+        $cpFile  = Join-Path $StateDir "maven-classpath.txt"
+        Info "mvn -B -q -DskipTests compile (first run pulls deps; later runs are incremental)..."
+        & $mvn -B -q -DskipTests -f $pomFile compile
+        if ($LASTEXITCODE -ne 0) { throw "mvn compile failed (exit $LASTEXITCODE)." }
+        $needResolve = (-not (Test-Path $cpFile)) -or ((Get-Item $pomFile).LastWriteTimeUtc -gt (Get-Item $cpFile).LastWriteTimeUtc)
+        if ($needResolve) {
+            Info "Resolving Maven dependency classpath..."
+            & $mvn -B -q -f $pomFile dependency:build-classpath "-Dmdep.outputFile=$cpFile" "-Dmdep.includeScope=runtime"
+            if ($LASTEXITCODE -ne 0) { throw "mvn dependency:build-classpath failed (exit $LASTEXITCODE)." }
+        } else {
+            Info "Reusing cached Maven classpath (pom.xml unchanged)."
+        }
+        $mavenCp = (Get-Content $cpFile -Raw -Encoding UTF8).Trim()
+        $depCount = (@($mavenCp -split ';' | Where-Object { $_.Trim() })).Count
+        $cpParts = @("target\classes")
+        foreach ($extra in @("src\main\resources", "src\main\lsfusion")) {
+            if (Test-Path (Join-Path $ProjectDir $extra)) { $cpParts += $extra }
+        }
+        $cpParts += $mavenCp
+        $cp = $cpParts -join ";"
+        Info "Classpath: target\classes + sources + $depCount Maven dependencies."
+        return $cp
+    }
+
+    # Build a Maven-style staging directory at $stageRel and put ONLY that
+    # (plus the server jar) on the classpath. Mixing the project root with
+    # src/main/lsfusion as classpath roots makes lsFusion discover the same
+    # .lsf file via two different relative paths and reject the second
+    # registration with "module 'X' has already been added".
+    $jar = $mode.Jar
+    $stageDir = Join-Path $ProjectDir $stageRel
+    Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+    # The server reads conf/settings.properties at runtime (Spring
+    # `file:conf/settings.properties` in lsfusion.xml, relative to the JVM
+    # working directory = project root). That file is AUTHORITATIVE: a copy
+    # is staged onto the classpath too, always sourced from conf/ - never
+    # the reverse - so a stale root-mirror value can never resurrect over a
+    # conf/ edit.
+    $confSettings = Join-Path $ProjectDir "conf\settings.properties"
+    if (Test-Path $confSettings) { Copy-Item -Path $confSettings -Destination $stageDir -Force }
+
+    # Copy from the canonical Maven source roots first.
+    $stagedFromMaven = $false
+    foreach ($extra in @("src\main\resources", "src\main\lsfusion")) {
+        $srcRoot = Join-Path $ProjectDir $extra
+        if (Test-Path $srcRoot) {
+            Copy-Item -Path (Join-Path $srcRoot '*') -Destination $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+            $stagedFromMaven = $true
+        }
+    }
+    # Flat-project fallback: pick up loose .lsf and lsfusion.properties
+    # files sitting at the project root.
+    if (-not $stagedFromMaven) {
+        $flatLsf  = @(Get-ChildItem $ProjectDir -File -Filter *.lsf -ErrorAction SilentlyContinue)
+        $flatProp = @(Get-ChildItem $ProjectDir -File -Filter *.properties -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -ne 'settings.properties' })
+        foreach ($f in @($flatLsf) + @($flatProp)) {
+            Copy-Item -Path $f.FullName -Destination $stageDir -Force
+        }
+    }
+
+    # Compile Java sources if present (rare, but lsFusion supports INTERNAL
+    # bindings to Java action classes).
+    $javaSrcRoot = Join-Path $ProjectDir "src\main\java"
+    if (Test-Path $javaSrcRoot) {
+        $javaFiles = @(Get-ChildItem $javaSrcRoot -Recurse -Filter *.java -ErrorAction SilentlyContinue)
+        if ($javaFiles.Count -gt 0) {
+            $javacExe = Join-Path (Split-Path $java.Path -Parent) "javac.exe"
+            if (Test-Path $javacExe) {
+                Info "Compiling $($javaFiles.Count) Java source(s) to $stageRel..."
+                $javacArgs = @("-d", $stageDir, "-cp", $jar) + ($javaFiles | ForEach-Object { $_.FullName })
+                & $javacExe @javacArgs
+                if ($LASTEXITCODE -ne 0) { throw "javac failed (exit $LASTEXITCODE)." }
+            } else {
+                Warn "src\main\java present but javac not next to java.exe - Java sources not compiled."
+            }
+        }
+    }
+
+    $cp = "$stageRel;$jar"
+    Info "Classpath: $stageRel (staged from src\main\* or project root) + server jar."
+    return $cp
+}
+
+function Cmd-StartServer {
+    Head "Start application server"
+    $cfg = Get-ConfigOrFail
+    $java = Find-Java
+    if (-not $java) { throw "Java not found. Install a JDK 11+ first." }
+
+    $mode = Resolve-LaunchMode $cfg
 
     Stop-Tracked $ServerPid @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort) "Previous application server"
     Ensure-Database $cfg
@@ -1595,120 +1754,9 @@ function Cmd-StartServer {
         Copy-Item -Path $rootBoot -Destination $confBoot -Force
     }
     Set-SettingsProperty $confBoot "db.name" $cfg.dbName
-    # Count only modules that will actually be on the classpath, mirroring the
-    # staging/classpath logic below: the Maven source roots when they exist,
-    # else loose top-level .lsf (flat-project fallback). A recursive scan over
-    # the whole project would also count Maven-staged copies in target/,
-    # scratch/seed scripts in .lsfusion-dev/, and stray files in unrelated
-    # subfolders - none of which load, making the number a misleading signal.
-    $srcRoots = @(@("src\main\lsfusion", "src\main\resources") |
-        ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ })
-    if ($srcRoots.Count) {
-        $lsf = @($srcRoots | ForEach-Object { Get-ChildItem $_ -Recurse -Filter *.lsf -ErrorAction SilentlyContinue })
-        $lsfWhere = "under src/main"
-    } else {
-        $lsf = @(Get-ChildItem $ProjectDir -File -Filter *.lsf -ErrorAction SilentlyContinue)
-        $lsfWhere = "at the project root"
-    }
-    if ($lsf.Count -eq 0) { Warn "No .lsf files found $lsfWhere - the server will start with system modules only." }
-    else { Info "Found $($lsf.Count) .lsf file(s) to load ($lsfWhere)." }
-    # Stray modules outside the loaded roots deserve a heads-up - a .lsf parked
-    # in docs/, scripts/ or next to the sources will silently NOT load.
-    $allLsf = @(Get-ChildItem $ProjectDir -Recurse -Filter *.lsf -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '\\(target|\.lsfusion-dev|\.git)\\' })
-    $strayCount = $allLsf.Count - $lsf.Count
-    if ($strayCount -gt 0) {
-        $verb = if ($strayCount -eq 1) { "is" } else { "are" }
-        Info "($strayCount more .lsf elsewhere in the project $verb NOT on the classpath and will not load.)"
-    }
+    Report-ProjectLsfFiles
 
-    if ($useMaven) {
-        # 'mvn compile' refreshes target/classes (Maven incremental, fast after
-        # the first run). The dependency classpath is cached and only refreshed
-        # when pom.xml changes - resolving deps is the slow part of Maven.
-        $pomFile = Join-Path $ProjectDir "pom.xml"
-        $cpFile  = Join-Path $StateDir "maven-classpath.txt"
-        Info "mvn -B -q -DskipTests compile (first run pulls deps; later runs are incremental)..."
-        & $mvn -B -q -DskipTests -f $pomFile compile
-        if ($LASTEXITCODE -ne 0) { throw "mvn compile failed (exit $LASTEXITCODE)." }
-        $needResolve = (-not (Test-Path $cpFile)) -or ((Get-Item $pomFile).LastWriteTimeUtc -gt (Get-Item $cpFile).LastWriteTimeUtc)
-        if ($needResolve) {
-            Info "Resolving Maven dependency classpath..."
-            & $mvn -B -q -f $pomFile dependency:build-classpath "-Dmdep.outputFile=$cpFile" "-Dmdep.includeScope=runtime"
-            if ($LASTEXITCODE -ne 0) { throw "mvn dependency:build-classpath failed (exit $LASTEXITCODE)." }
-        } else {
-            Info "Reusing cached Maven classpath (pom.xml unchanged)."
-        }
-        $mavenCp = (Get-Content $cpFile -Raw -Encoding UTF8).Trim()
-        $depCount = (@($mavenCp -split ';' | Where-Object { $_.Trim() })).Count
-        $cpParts = @("target\classes")
-        foreach ($extra in @("src\main\resources", "src\main\lsfusion")) {
-            if (Test-Path (Join-Path $ProjectDir $extra)) { $cpParts += $extra }
-        }
-        $cpParts += $mavenCp
-        $cp = $cpParts -join ";"
-        Info "Classpath: target\classes + sources + $depCount Maven dependencies."
-    } else {
-        # Build a Maven-style staging directory at target\classes and put ONLY
-        # that (plus the server jar) on the classpath. Mixing the project root
-        # with src/main/lsfusion as classpath roots makes lsFusion discover the
-        # same .lsf file via two different relative paths and reject the second
-        # registration with "module 'X' has already been added".
-        $stageDir = Join-Path $ProjectDir "target\classes"
-        Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
-        New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
-
-        # The server reads conf/settings.properties at runtime (Spring
-        # `file:conf/settings.properties` in lsfusion.xml, relative to the JVM
-        # working directory = project root). That file is AUTHORITATIVE: the
-        # pre-launch block above already bootstrapped it (from the root mirror
-        # when needed) and asserted db.name into it. A copy is staged onto the
-        # classpath too, always sourced from conf/ - never the reverse - so a
-        # stale root-mirror value can never resurrect over a conf/ edit.
-        $confSettings = Join-Path $ProjectDir "conf\settings.properties"
-        if (Test-Path $confSettings) { Copy-Item -Path $confSettings -Destination $stageDir -Force }
-
-        # Copy from the canonical Maven source roots first.
-        $stagedFromMaven = $false
-        foreach ($extra in @("src\main\resources", "src\main\lsfusion")) {
-            $srcRoot = Join-Path $ProjectDir $extra
-            if (Test-Path $srcRoot) {
-                Copy-Item -Path (Join-Path $srcRoot '*') -Destination $stageDir -Recurse -Force -ErrorAction SilentlyContinue
-                $stagedFromMaven = $true
-            }
-        }
-        # Flat-project fallback: pick up loose .lsf and lsfusion.properties
-        # files sitting at the project root.
-        if (-not $stagedFromMaven) {
-            $flatLsf  = @(Get-ChildItem $ProjectDir -File -Filter *.lsf -ErrorAction SilentlyContinue)
-            $flatProp = @(Get-ChildItem $ProjectDir -File -Filter *.properties -ErrorAction SilentlyContinue |
-                          Where-Object { $_.Name -ne 'settings.properties' })
-            foreach ($f in @($flatLsf) + @($flatProp)) {
-                Copy-Item -Path $f.FullName -Destination $stageDir -Force
-            }
-        }
-
-        # Compile Java sources if present (rare, but lsFusion supports INTERNAL
-        # bindings to Java action classes).
-        $javaSrcRoot = Join-Path $ProjectDir "src\main\java"
-        if (Test-Path $javaSrcRoot) {
-            $javaFiles = @(Get-ChildItem $javaSrcRoot -Recurse -Filter *.java -ErrorAction SilentlyContinue)
-            if ($javaFiles.Count -gt 0) {
-                $javacExe = Join-Path (Split-Path $java.Path -Parent) "javac.exe"
-                if (Test-Path $javacExe) {
-                    Info "Compiling $($javaFiles.Count) Java source(s) to target\classes..."
-                    $javacArgs = @("-d", $stageDir, "-cp", $jar) + ($javaFiles | ForEach-Object { $_.FullName })
-                    & $javacExe @javacArgs
-                    if ($LASTEXITCODE -ne 0) { throw "javac failed (exit $LASTEXITCODE)." }
-                } else {
-                    Warn "src\main\java present but javac not next to java.exe - Java sources not compiled."
-                }
-            }
-        }
-
-        $cp = "target\classes;$jar"
-        Info "Classpath: target\classes (staged from src\main\* or project root) + server jar."
-    }
+    $cp = Build-ServerClasspath $cfg $mode $java
 
     # Development JVM options. devmode is always on for local development.
     # lightstart makes restarts much faster; schema sync and business logic
@@ -1841,6 +1889,173 @@ function Cmd-StartServer {
         Warn "Startup not confirmed within $Timeout s. Server may still be initializing. Recent log:"
         $tailOut | ForEach-Object { Write-Host "    $_" }
         Info "Re-check with: lsfdev.ps1 log    (or start-server -Timeout 300)"
+    }
+}
+
+# Validate the whole project's logic without starting anything: launch the
+# server JVM with -Dsettings.dryRun=true, which compiles and checks every
+# module (parse, metacode expansion, name resolution, classes / properties /
+# actions / forms creation - everything a restart checks at load time) and
+# exits before the DB SYNC. Every manager past the logics phase is skipped
+# (schema sync, RMI, Action API, WebSocket), so the run binds NO ports
+# (measured: zero LISTENING sockets) and executes safely next to a live
+# server - it never stops, restarts or otherwise touches the running
+# instance, its schema, or the init marker. One caveat, all measured: the
+# platform's DB ADAPTER still connects to PostgreSQL during Spring context
+# creation (before the dry-run cutoff), creating the configured database
+# EMPTY if it is missing - so PostgreSQL must be reachable (an unreachable
+# one puts the JVM into an endless retry loop; detected and killed below).
+function Cmd-DryRun {
+    Head "Dry run (compile + check the logic - no ports, no schema sync)"
+    $cfg = Get-ConfigOrFail
+    $java = Find-Java
+    if (-not $java) { throw "Java not found. Install a JDK 11+ first." }
+    $mode = Resolve-LaunchMode $cfg
+
+    # Only a previous stuck DRY RUN is reaped here - never the real server.
+    $dryPidFile = Join-Path $StateDir "dryrun.pid"
+    if (Test-Path $dryPidFile) { Stop-Tracked $dryPidFile @() "Previous dry run" }
+
+    Report-ProjectLsfFiles
+    $cp = Build-ServerClasspath $cfg $mode $java ".lsfusion-dev\dryrun-classes"
+
+    # Version gate: refuse to launch when the build provably lacks dryRun -
+    # an ignored flag would boot a REAL server right into the project's
+    # database (and collide with a running instance on the same ports).
+    $jarPath = if ($mode.Jar) { $mode.Jar } else { Get-ResolvedServerJar $cfg }
+    $support = Test-JarSupportsDryRun $jarPath
+    if ($support -eq $true) {
+        Info "Platform build supports dryRun (verified in the server jar)."
+    } elseif ($support -eq $false) {
+        Bad "This platform build does not know settings.dryRun - it needs a 7.0-SNAPSHOT built on/after 2026-07-31."
+        if ($mode.UseMaven) { Info "Update the Maven-resolved snapshot (mvn -U -DskipTests compile), then re-run dryrun." }
+        else { Info "Refresh the downloaded jar: delete '$jarPath' and re-run setup (it refetches missing artifacts)." }
+        throw "dry run not supported by this platform build (an old build silently ignores the flag and starts for real)."
+    } else {
+        Warn "Could not inspect the server jar for dryRun support - relying on the runtime guard (the run is killed if it starts for real)."
+    }
+
+    # Top module scope: -TopModule forces logics.topModule for THIS run only
+    # (a -D outranks the project's lsfusion.properties), so only that
+    # module's REQUIRE closure (+ system modules) is loaded and checked -
+    # the lever that keeps a dry run fast on a many-module codebase. Without
+    # it the scope is whatever the project config says.
+    $topArgs = @()
+    if ($TopModule) {
+        $topArgs = @("-Dlogics.topModule=$TopModule")
+        Info "Top module FORCED for this run: $TopModule (only its REQUIRE closure + system modules are checked)."
+    } else {
+        $projProps = @("src\main\resources\lsfusion.properties", "lsfusion.properties") |
+            ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+        $projTop = if ($projProps) { Get-SettingsValue $projProps "logics.topModule" } else { $null }
+        if ($projTop) { Info "Top module from the project config: $projTop." }
+        else { Info "No topModule configured - every module on the classpath is loaded and checked." }
+    }
+
+    $extraJvm = @()
+    if ($cfg.PSObject.Properties.Name -contains 'jvmArgs' -and $cfg.jvmArgs) {
+        $extraJvm = @("$($cfg.jvmArgs)" -split '\s+' | Where-Object { $_ })
+        Info "Extra JVM args: $($extraJvm -join ' ')"
+    }
+    # devmode mirrors the real dev launch (same compile semantics); db.* and
+    # the denyDrop flags are omitted on purpose - the DB phase never runs.
+    $jvmArgs = @() + (Add-Opens $java.Major) + @(
+        "-Dlsfusion.server.devmode=true",
+        "-Dsettings.dryRun=true") + $topArgs + @(
+        "-Xmx2g", "-Dfile.encoding=UTF-8") + $extraJvm + @(
+        "-Dlsfdev.project=$ProjectDir",
+        "-cp", $cp,
+        "lsfusion.server.logics.BusinessLogicsBootstrap"
+    )
+    $dryOut = Join-Path $StateDir "dryrun.out.log"
+    $dryErr = Join-Path $StateDir "dryrun.err.log"
+    $launchCmdFile = Join-Path $StateDir "dryrun-cmd.txt"
+    "$($java.Path) $($jvmArgs -join ' ')" | Set-Content -Path $launchCmdFile -Encoding UTF8
+    Info "Launching java ($(($cp -split ';').Count) classpath entries; full command line: $launchCmdFile)"
+    Remove-Item $dryOut, $dryErr -ErrorAction SilentlyContinue
+    $proc = Start-Process -FilePath $java.Path -ArgumentList $jvmArgs `
+        -WorkingDirectory $ProjectDir -RedirectStandardOutput $dryOut `
+        -RedirectStandardError $dryErr -NoNewWindow -PassThru
+    # Cache the process handle NOW: without this, PowerShell 5.1 returns an
+    # empty ExitCode once the process has exited (measured - the verdict then
+    # misread a successful run as FAILED (exit )).
+    $null = $proc.Handle
+    $proc.Id | Set-Content $dryPidFile
+    Info "PID $($proc.Id). Waiting up to $Timeout s for the verdict..."
+
+    $deadline = (Get-Date).AddSeconds($Timeout)
+    $verdict = "timeout"
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        if ($proc.HasExited) { $verdict = "exited"; break }
+        # Runtime guard (backstop for an uninspectable jar): a platform that
+        # ignores the flag boots a real server - kill it the moment the
+        # startup marker appears instead of letting it run.
+        $log = (Read-FileText $dryOut) + "`n" + (Read-FileText $dryErr)
+        if ($log -match "Server has successfully started") { $verdict = "real-start"; break }
+        # A dry run still needs a REACHABLE PostgreSQL: the platform's DB
+        # adapter connects during Spring context creation, BEFORE the
+        # dry-run cutoff, and an unreachable server puts it into an ENDLESS
+        # once-a-second retry loop (measured: 180 s of 'Connection ...
+        # refused' with zero progress). Diagnose in seconds, not minutes.
+        if (@([regex]::Matches($log, "ERROR StartLogger - Connection to .* refused")).Count -ge 3) { $verdict = "db-unreachable"; break }
+    }
+    if ($verdict -ne "exited" -and -not $proc.HasExited) {
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    Remove-Item $dryPidFile -ErrorAction SilentlyContinue
+
+    Write-Host ""
+    $outText = Read-FileText $dryOut
+    $tailOut = Tail-Text $outText $Lines
+    $tailErr = Tail-Text (Read-FileText $dryErr) 30
+    if ($verdict -eq "real-start") {
+        Bad "The platform IGNORED settings.dryRun and started a REAL server - it has been killed (PID $($proc.Id))."
+        Info "This build predates dryRun (needs a 7.0-SNAPSHOT of 2026-07-31+). Update the platform, or validate via precheck + restart."
+        exit 1
+    }
+    if ($verdict -eq "db-unreachable") {
+        Bad "PostgreSQL is unreachable - the dry-run JVM has been killed (it would retry the connection forever)."
+        $tailOut | Select-Object -Last 3 | ForEach-Object { Write-Host "    $_" }
+        Info "A dry run skips the schema sync but the platform's DB adapter still CONNECTS at startup (before the dry-run cutoff). Fix db.server / credentials in conf/settings.properties, or start PostgreSQL, and re-run."
+        exit 1
+    }
+    if ($verdict -eq "timeout") {
+        Warn "No verdict within $Timeout s - the dry-run JVM has been killed. Recent log:"
+        $tailOut | ForEach-Object { Write-Host "    $_" }
+        Info "A dry run is usually well under a minute; raise -Timeout only if the log shows real compile progress."
+        exit 1
+    }
+    # The success MARKER is authoritative (printed immediately before
+    # System.exit(0) and only then); the exit code corroborates it.
+    if ($outText -match "Dry run finished successfully in (\d+) ms") {
+        $secs = [Math]::Round([long]$Matches[1] / 1000, 1)
+        $moduleCount = ""
+        if ($outText -match "module : #\d+ of (\d+)\b") { $moduleCount = "$($Matches[1]) modules, " }
+        $scope = if ($TopModule) { "the REQUIRE closure of '$TopModule'" } else { "the configured module set" }
+        Ok "Logic compiled and checked successfully in $secs s ($moduleCount$scope). No ports were bound, no schema was synced, nothing was started."
+        Info "This validates everything a restart checks at LOAD time; the restart itself is still needed to apply the schema (and to catch DB-sync/migration issues)."
+    } elseif ($proc.ExitCode -eq 0) {
+        Warn "JVM exited 0 but the dry-run success marker is missing - inspect the log:"
+        $tailOut | ForEach-Object { Write-Host "    $_" }
+        exit 1
+    } else {
+        Bad "Dry run FAILED (exit $($proc.ExitCode)) - the logic does not compile/check. Error:"
+        # Show from just before the first ERROR line (the .lsf error text with
+        # its file:line:col) and drop the startup preamble noise - the logged
+        # 'Class path:' line alone is tens of KB (it is in dryrun-cmd.txt).
+        $show = @($tailOut | Where-Object { $_ -notmatch 'StartLogger - (Class path|JVM arguments): ' })
+        $errIdx = -1
+        for ($i = 0; $i -lt $show.Count; $i++) { if ($show[$i] -match '\bERROR\b') { $errIdx = $i; break } }
+        if ($errIdx -ge 0) { $show = $show[([Math]::Max(0, $errIdx - 3))..($show.Count - 1)] }
+        $show | ForEach-Object { Write-Host "    $_" }
+        if (($tailErr -join "").Trim()) {
+            Write-Host "  --- stderr ---"
+            $tailErr | ForEach-Object { Write-Host "    $_" }
+        }
+        Write-Host ""
+        Info "Like a restart, ONE semantic error is reported per run (parse errors come batched) - fix and re-run. Sub-second single-file linting: precheck."
+        exit 1
     }
 }
 
@@ -2754,7 +2969,7 @@ function Cmd-Precheck {
                 # PASS or a misleading compiler-crash report - say the truth
                 # upfront instead.
                 $skipCount++
-                Warn "$leaf - restart-only: the file is entirely META definitions / @-instantiations / EXTEND FORM. eval can check NONE of its content - ambiguity and constraint errors included - so only structure was verified (MODULE header, META/END balance, brackets). The restart IS the check for this file: budget the restart cycle, don't re-run precheck for it."
+                Warn "$leaf - restart-only: the file is entirely META definitions / @-instantiations / EXTEND FORM. eval can check NONE of its content - ambiguity and constraint errors included - so only structure was verified (MODULE header, META/END balance, brackets). Only a full load checks this file: run 'dryrun' (seconds, live server untouched) or budget the restart cycle - don't re-run precheck for it."
                 continue
             }
             # NAMESPACE / PRIORITY steer how ambiguous names resolve; they are
@@ -3131,10 +3346,33 @@ version and dies on every plugin update.
                  FORM is reported upfront as RESTART-ONLY (eval compiles none
                  of it - ambiguity/constraint errors included); precheck
                  still checks its structure (MODULE header, META/END balance,
-                 bracket balance) but the restart is the real check - budget
-                 it, don't re-run precheck on such files.
+                 bracket balance) but only a full load is the real check -
+                 dryrun does it in seconds, the restart while applying.
                  REQUIRE completeness is never checked (eval sees every
-                 loaded module) - a missing REQUIRE surfaces only at restart.
+                 loaded module) - a missing REQUIRE surfaces only at
+                 restart or dryrun.
+  dryrun         Full-fidelity validation of the WHOLE project without
+                 starting it: launches the server JVM with
+                 -Dsettings.dryRun=true, which compiles and checks every
+                 module (parse, metacode expansion, name resolution vs the
+                 real REQUIRE graph, EXTEND FORM - everything a restart
+                 checks at LOAD time) and exits before the DB sync. Binds NO
+                 ports, syncs NO schema, runs safely NEXT TO a live server
+                 (never stops or touches it). PostgreSQL must still be
+                 REACHABLE with valid credentials: the platform's DB adapter
+                 connects at startup (before the dry-run cutoff) and creates
+                 the configured database EMPTY if missing; an unreachable
+                 server is detected and reported in seconds. Covers
+                 precheck's blind spots (missing REQUIRE, EXTEND FORM /
+                 restart-only files) at the cost of a JVM boot instead of
+                 milliseconds. -TopModule <M> forces logics.topModule for
+                 this run only, limiting the check to M's REQUIRE closure
+                 (faster on many-module projects).
+                 Exit code 0 = logic OK, 1 = validation failed (one semantic
+                 error per run, like a restart; parse errors come batched).
+                 Requires a 7.0-SNAPSHOT platform built on/after 2026-07-31
+                 (older builds are refused; they'd ignore the flag and start
+                 for real). The restart is still what APPLIES the schema.
   versions       List lsFusion versions on download.lsfusion.org and aliases.
 
 Common options:
@@ -3151,7 +3389,10 @@ Common options:
   -Version <ver>        lsFusion version: '7' (default), 'stable', 'dev',
                         or exact (e.g. 7.0-SNAPSHOT). See 'versions'.
   -TomcatVersion <ver>  Pin a Tomcat 9 version.
-  -TopModule <name>     Top lsFusion module to load.
+  -TopModule <name>     Top lsFusion module to load. For 'dryrun': forces
+                        logics.topModule for that run only (-D outranks the
+                        project's lsfusion.properties), limiting the check to
+                        that module's REQUIRE closure + system modules.
   -RmiPort <port>       App-server RMI port (default 7652). Set per project to
                         run several servers/configs at once.
   -HttpPort <port>      App-server HTTP / Action API port (default 7651).
@@ -3425,6 +3666,8 @@ try {
             Stop-Tracked $TomcatPid $webPorts "Tomcat"
             if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
         }
+        "dryrun"       { Cmd-DryRun }
+        "dry-run"      { Cmd-DryRun }
         "status"       { Cmd-Status }
         "log"          { Cmd-Log }
         "verify"       { Cmd-Verify }
