@@ -365,7 +365,8 @@ catches the typos first, cheaply. (For comparison, measured on
 that reports a single name error.)
 
 **Full-fidelity alternative on a local dev box: `lsfdev.ps1 dryrun`**
-(lsfusion-dev skill; 7.0-SNAPSHOT builds from 2026-07-31). It launches
+(lsfusion-dev skill; 7.0-SNAPSHOT builds since 2026-07-30,
+`20260730.203938` on). It launches
 the server JVM with `-Dsettings.dryRun=true`, which loads and checks the
 **whole project** exactly as a restart would — real `REQUIRE` graph
 (missing-REQUIRE caught), `EXTEND FORM`, META instantiation, the entire

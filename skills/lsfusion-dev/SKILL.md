@@ -216,7 +216,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
-| `dryrun` | **Full-fidelity validation of the whole project without starting it** (7.0-SNAPSHOT platform built 2026-07-31+; older builds are refused). Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets) and never touches the running server, so it validates safely **next to a live instance**. PostgreSQL must still be **reachable** (the DB adapter connects at startup and creates a missing database empty; unreachable → diagnosed in seconds). `-TopModule <M>` forces `logics.topModule` for the run, cutting the scope to M's REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
+| `dryrun` | **Full-fidelity validation of the whole project without starting it** (7.0-SNAPSHOT builds since 2026-07-30, first carrying build `20260730.203938`; older builds are refused — the command inspects the jar). Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets) and never touches the running server, so it validates safely **next to a live instance**. PostgreSQL must still be **reachable** (the DB adapter connects at startup and creates a missing database empty; unreachable → diagnosed in seconds). `-TopModule <M>` forces `logics.topModule` for the run, cutting the scope to M's REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
@@ -807,9 +807,10 @@ raw-curl form for remote servers.
 
 **Between `precheck` and the restart sits `dryrun` — the full project
 check without starting anything.** It launches the server JVM with
-`-Dsettings.dryRun=true` (7.0-SNAPSHOT platform, builds from 2026-07-31
-on — the command refuses older jars, where the flag would be silently
-ignored and the run would come up as a real server): the whole logic —
+`-Dsettings.dryRun=true` (7.0-SNAPSHOT builds since 2026-07-30, first
+carrying build `20260730.203938` — the command inspects the jar and
+refuses older ones, where the flag would be silently ignored and the
+run would come up as a real server): the whole logic —
 modules, classes, properties, actions, forms — is parsed,
 metacode-expanded, name-resolved and finalized exactly as at a restart,
 then the JVM exits **before the DB sync** instead of starting services.
@@ -833,8 +834,11 @@ What makes it different from a restart (all measured):
   or reinitializes anything — the live instance keeps serving users
   while the edit is validated. A failed restart takes the app down; a
   failed dryrun leaves it running. It also leaves the init marker and
-  lightstart state alone, and stages its classpath into a separate
-  directory (`.lsfusion-dev/dryrun-classes`), not `target/classes`.
+  lightstart state alone. Non-Maven projects stage the dry-run classpath
+  into a separate directory (`.lsfusion-dev/dryrun-classes`) so
+  `target/classes` is never wiped under a live server; in Maven mode the
+  incremental `mvn compile` does refresh `target/classes` — the same
+  thing an IDE build under a running server does.
 - **No schema is applied.** The DB sync never runs — which also means a
   dryrun PASS does not catch DB-migration issues, and the restart is
   still what loads the schema. Validate first, restart once.

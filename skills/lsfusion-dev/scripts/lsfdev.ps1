@@ -590,10 +590,11 @@ function Get-ZipBuildDate([string]$path) {
 
 # Whether this platform build understands settings.dryRun: the Spring wiring
 # for it (<entry key="dryRun" .../> in the jar's root lsfusion.xml) exists
-# only in 7.0-SNAPSHOT builds from 2026-07-31 on. On an older build the -D
-# flag is silently IGNORED and a "dry run" would come up as a REAL server -
-# against the project's actual database and ports. $null = could not inspect
-# (rely on the runtime guard then).
+# only in 7.0-SNAPSHOT builds since 2026-07-30 (first carrying build
+# 20260730.203938-1179, verified against the .m2 build history). On an older
+# build the -D flag is silently IGNORED and a "dry run" would come up as a
+# REAL server - against the project's actual database and ports. $null =
+# could not inspect (rely on the runtime guard then).
 function Test-JarSupportsDryRun([string]$jarPath) {
     if (-not ($jarPath -and (Test-Path $jarPath))) { return $null }
     try {
@@ -1586,6 +1587,37 @@ function Resolve-LaunchMode($cfg) {
     return [pscustomobject]@{ UseMaven = $useMaven; Mvn = $mvn; Jar = $jar }
 }
 
+# Make conf/settings.properties - the file the JVM actually reads (Spring
+# `file:conf/settings.properties`, relative to the working dir) - exist and
+# carry the resolved db.name before EVERY launch, not only at setup: db.name
+# has no safe default (a missing key silently sends the server to the shared
+# 'lsfusion' database), and configs written by older skill versions could
+# keep the name only in config.json. Bootstrap the file from the root mirror
+# first so its other keys (db.password etc.) survive. Idempotent when the
+# file is already right (Load-Config read the file's own value back into
+# $cfg), and the rewrite also re-encodes a BOM-damaged file that the JVM
+# would otherwise mis-parse (see Write-PropertiesFile). Shared by
+# start-server AND dryrun - the dry run's DB-adapter connect must aim at the
+# same database a real start would (finding: without this, a project whose
+# settings live only in the root mirror had its dry run silently target the
+# default DB).
+function Sync-ConfSettings($cfg) {
+    # settings.properties can live at the project root (scaffolded / non-Maven
+    # projects) OR in conf/ (Maven projects). Only warn when neither exists.
+    if (-not (Test-Path (Join-Path $ProjectDir "settings.properties")) -and
+        -not (Test-Path (Join-Path $ProjectDir "conf\settings.properties"))) {
+        Warn "settings.properties not found (looked in project root and conf/) - re-run setup."
+    }
+    $confBootDir  = Join-Path $ProjectDir "conf"
+    $confBoot     = Join-Path $confBootDir "settings.properties"
+    $rootBoot     = Join-Path $ProjectDir "settings.properties"
+    New-Item -ItemType Directory -Force -Path $confBootDir | Out-Null
+    if (-not (Test-Path $confBoot) -and (Test-Path $rootBoot)) {
+        Copy-Item -Path $rootBoot -Destination $confBoot -Force
+    }
+    Set-SettingsProperty $confBoot "db.name" $cfg.dbName
+}
+
 # Count only modules that will actually be on the classpath, mirroring the
 # staging/classpath logic in Build-ServerClasspath: the Maven source roots
 # when they exist, else loose top-level .lsf (flat-project fallback). A
@@ -1633,12 +1665,18 @@ function Build-ServerClasspath($cfg, $mode, $java, [string]$stageRel = "target\c
         $pomFile = Join-Path $ProjectDir "pom.xml"
         $cpFile  = Join-Path $StateDir "maven-classpath.txt"
         Info "mvn -B -q -DskipTests compile (first run pulls deps; later runs are incremental)..."
-        & $mvn -B -q -DskipTests -f $pomFile compile
+        # Native stdout goes to the console explicitly (Out-Host): this
+        # function's RETURN VALUE is the classpath string, and any uncaptured
+        # pipeline output (a Maven warning, an annotation-processor note)
+        # would silently prepend itself to it and corrupt the -cp argument.
+        # Pre-refactor this code ran inside Cmd-StartServer, whose output
+        # stream nobody consumed, so the leak was harmless there.
+        & $mvn -B -q -DskipTests -f $pomFile compile | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "mvn compile failed (exit $LASTEXITCODE)." }
         $needResolve = (-not (Test-Path $cpFile)) -or ((Get-Item $pomFile).LastWriteTimeUtc -gt (Get-Item $cpFile).LastWriteTimeUtc)
         if ($needResolve) {
             Info "Resolving Maven dependency classpath..."
-            & $mvn -B -q -f $pomFile dependency:build-classpath "-Dmdep.outputFile=$cpFile" "-Dmdep.includeScope=runtime"
+            & $mvn -B -q -f $pomFile dependency:build-classpath "-Dmdep.outputFile=$cpFile" "-Dmdep.includeScope=runtime" | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "mvn dependency:build-classpath failed (exit $LASTEXITCODE)." }
         } else {
             Info "Reusing cached Maven classpath (pom.xml unchanged)."
@@ -1704,7 +1742,7 @@ function Build-ServerClasspath($cfg, $mode, $java, [string]$stageRel = "target\c
             if (Test-Path $javacExe) {
                 Info "Compiling $($javaFiles.Count) Java source(s) to $stageRel..."
                 $javacArgs = @("-d", $stageDir, "-cp", $jar) + ($javaFiles | ForEach-Object { $_.FullName })
-                & $javacExe @javacArgs
+                & $javacExe @javacArgs | Out-Host
                 if ($LASTEXITCODE -ne 0) { throw "javac failed (exit $LASTEXITCODE)." }
             } else {
                 Warn "src\main\java present but javac not next to java.exe - Java sources not compiled."
@@ -1729,31 +1767,7 @@ function Cmd-StartServer {
     Ensure-Database $cfg
     Sync-InitMarker $cfg
 
-    # settings.properties can live at the project root (scaffolded / non-Maven
-    # projects) OR in conf/ (Maven projects, where the JVM reads conf/settings.properties
-    # off the working dir). Only warn when neither exists.
-    if (-not (Test-Path (Join-Path $ProjectDir "settings.properties")) -and
-        -not (Test-Path (Join-Path $ProjectDir "conf\settings.properties"))) {
-        Warn "settings.properties not found (looked in project root and conf/) - re-run setup."
-    }
-    # conf/settings.properties is what the JVM actually reads - make sure it
-    # exists and carries the resolved db.name before EVERY launch, not only at
-    # setup: db.name has no safe default (a missing key silently sends the
-    # server to the shared 'lsfusion' database), and configs written by older
-    # skill versions could keep the name only in config.json. Bootstrap the
-    # file from the root mirror first so its other keys (db.password etc.)
-    # survive. Idempotent when the file is already right (Load-Config read the
-    # file's own value back into $cfg), and the rewrite also re-encodes a
-    # BOM-damaged file that the JVM would otherwise mis-parse (see
-    # Write-PropertiesFile).
-    $confBootDir  = Join-Path $ProjectDir "conf"
-    $confBoot     = Join-Path $confBootDir "settings.properties"
-    $rootBoot     = Join-Path $ProjectDir "settings.properties"
-    New-Item -ItemType Directory -Force -Path $confBootDir | Out-Null
-    if (-not (Test-Path $confBoot) -and (Test-Path $rootBoot)) {
-        Copy-Item -Path $rootBoot -Destination $confBoot -Force
-    }
-    Set-SettingsProperty $confBoot "db.name" $cfg.dbName
+    Sync-ConfSettings $cfg
     Report-ProjectLsfFiles
 
     $cp = Build-ServerClasspath $cfg $mode $java
@@ -1916,6 +1930,10 @@ function Cmd-DryRun {
     $dryPidFile = Join-Path $StateDir "dryrun.pid"
     if (Test-Path $dryPidFile) { Stop-Tracked $dryPidFile @() "Previous dry run" }
 
+    # Same conf/settings.properties bootstrap as start-server: the dry run's
+    # DB-adapter connect (and its create-if-missing) must aim at the project's
+    # configured database, not the platform defaults.
+    Sync-ConfSettings $cfg
     Report-ProjectLsfFiles
     $cp = Build-ServerClasspath $cfg $mode $java ".lsfusion-dev\dryrun-classes"
 
@@ -1927,7 +1945,7 @@ function Cmd-DryRun {
     if ($support -eq $true) {
         Info "Platform build supports dryRun (verified in the server jar)."
     } elseif ($support -eq $false) {
-        Bad "This platform build does not know settings.dryRun - it needs a 7.0-SNAPSHOT built on/after 2026-07-31."
+        Bad "This platform build does not know settings.dryRun - it needs a 7.0-SNAPSHOT build from 2026-07-30 on (first carrying build 20260730.203938)."
         if ($mode.UseMaven) { Info "Update the Maven-resolved snapshot (mvn -U -DskipTests compile), then re-run dryrun." }
         else { Info "Refresh the downloaded jar: delete '$jarPath' and re-run setup (it refetches missing artifacts)." }
         throw "dry run not supported by this platform build (an old build silently ignores the flag and starts for real)."
@@ -1959,10 +1977,16 @@ function Cmd-DryRun {
     }
     # devmode mirrors the real dev launch (same compile semantics); db.* and
     # the denyDrop flags are omitted on purpose - the DB phase never runs.
+    # ORDER MATTERS: for duplicated -D flags the LAST occurrence wins, so the
+    # defaults (-Xmx2g) come before $extraJvm - a user -Xmx4g wins - while
+    # -Dsettings.dryRun and the forced topModule come AFTER $extraJvm: a
+    # persisted -Dlogics.topModule=X (a common way to pin the module set)
+    # must not silently override -TopModule, and nothing may override
+    # dryRun=true (that would boot a REAL server out of a validation call).
     $jvmArgs = @() + (Add-Opens $java.Major) + @(
         "-Dlsfusion.server.devmode=true",
-        "-Dsettings.dryRun=true") + $topArgs + @(
         "-Xmx2g", "-Dfile.encoding=UTF-8") + $extraJvm + @(
+        "-Dsettings.dryRun=true") + $topArgs + @(
         "-Dlsfdev.project=$ProjectDir",
         "-cp", $cp,
         "lsfusion.server.logics.BusinessLogicsBootstrap"
@@ -1997,9 +2021,15 @@ function Cmd-DryRun {
         # adapter connects during Spring context creation, BEFORE the
         # dry-run cutoff, and an unreachable server puts it into an ENDLESS
         # once-a-second retry loop (measured: 180 s of 'Connection ...
-        # refused' with zero progress). Diagnose in seconds, not minutes.
-        if (@([regex]::Matches($log, "ERROR StartLogger - Connection to .* refused")).Count -ge 3) { $verdict = "db-unreachable"; break }
+        # refused' with zero progress; source: only SQLSTATE 08001/57P03
+        # retry - 'Connection to X refused' and 'The connection attempt
+        # failed' texts; other connect errors, e.g. a rejected password,
+        # abort startup on their own). Diagnose in seconds, not minutes.
+        if (@([regex]::Matches($log, "ERROR StartLogger - (Connection to .* refused|The connection attempt failed)")).Count -ge 3) { $verdict = "db-unreachable"; break }
     }
+    # The 2 s poll granularity can time the loop out in the same tick the
+    # JVM finished - prefer the real outcome over a spurious timeout.
+    if ($verdict -eq "timeout" -and $proc.HasExited) { $verdict = "exited" }
     if ($verdict -ne "exited" -and -not $proc.HasExited) {
         try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
     }
@@ -2011,7 +2041,7 @@ function Cmd-DryRun {
     $tailErr = Tail-Text (Read-FileText $dryErr) 30
     if ($verdict -eq "real-start") {
         Bad "The platform IGNORED settings.dryRun and started a REAL server - it has been killed (PID $($proc.Id))."
-        Info "This build predates dryRun (needs a 7.0-SNAPSHOT of 2026-07-31+). Update the platform, or validate via precheck + restart."
+        Info "This build predates dryRun (needs a 7.0-SNAPSHOT build from 2026-07-30 on, first carrying 20260730.203938). Update the platform, or validate via precheck + restart."
         exit 1
     }
     if ($verdict -eq "db-unreachable") {
@@ -2040,7 +2070,13 @@ function Cmd-DryRun {
         $tailOut | ForEach-Object { Write-Host "    $_" }
         exit 1
     } else {
-        Bad "Dry run FAILED (exit $($proc.ExitCode)) - the logic does not compile/check. Error:"
+        # A logic (.lsf) failure always carries the compiler's '[error]:'
+        # block; a nonzero exit WITHOUT it is some other startup failure
+        # (DB auth thrown by the adapter, OOM, a platform bug) - don't
+        # misbrand that as a code error.
+        $logicFail = $outText -match '\[error\]:'
+        if ($logicFail) { Bad "Dry run FAILED (exit $($proc.ExitCode)) - the logic does not compile/check. Error:" }
+        else { Bad "Dry run FAILED (exit $($proc.ExitCode)) without a compiler error - read the exception below (typical: a -TopModule name that does not exist, DB auth rejected, out of memory, a platform issue). Log:" }
         # Show from just before the first ERROR line (the .lsf error text with
         # its file:line:col) and drop the startup preamble noise - the logged
         # 'Class path:' line alone is tens of KB (it is in dryrun-cmd.txt).
@@ -2054,7 +2090,7 @@ function Cmd-DryRun {
             $tailErr | ForEach-Object { Write-Host "    $_" }
         }
         Write-Host ""
-        Info "Like a restart, ONE semantic error is reported per run (parse errors come batched) - fix and re-run. Sub-second single-file linting: precheck."
+        if ($logicFail) { Info "Like a restart, ONE semantic error is reported per run (parse errors come batched) - fix and re-run. Sub-second single-file linting: precheck." }
         exit 1
     }
 }
@@ -3370,9 +3406,10 @@ version and dies on every plugin update.
                  (faster on many-module projects).
                  Exit code 0 = logic OK, 1 = validation failed (one semantic
                  error per run, like a restart; parse errors come batched).
-                 Requires a 7.0-SNAPSHOT platform built on/after 2026-07-31
-                 (older builds are refused; they'd ignore the flag and start
-                 for real). The restart is still what APPLIES the schema.
+                 Requires a 7.0-SNAPSHOT build from 2026-07-30 on (first
+                 carrying build 20260730.203938; older builds are refused -
+                 they'd ignore the flag and start for real). The restart is
+                 still what APPLIES the schema.
   versions       List lsFusion versions on download.lsfusion.org and aliases.
 
 Common options:

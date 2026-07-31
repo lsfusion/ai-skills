@@ -391,7 +391,15 @@ configured `db.name` does not exist it **creates the database** (empty —
   `ERROR StartLogger - Connection to <host> refused` repeating forever,
   no progress, no exit. `lsfdev.ps1 dryrun` watches for that pattern and
   kills the JVM with a `PostgreSQL is unreachable` verdict in ~10 s
-  instead of hanging to the timeout.
+  instead of hanging to the timeout. Source-derived scope: the adapter
+  retries **only** SQLSTATE 08001 / 57P03 (`Connection to X refused`,
+  `The connection attempt failed` — both matched by the watcher); any
+  other connect error (e.g. a rejected password where pg_hba actually
+  enforces one) is thrown immediately, context creation fails, and the
+  command reports it through the exit-code / missing-success-marker
+  path. On a dev box whose pg_hba trusts localhost, a wrong
+  `db.password` is invisible to a dry run (measured — the connection
+  succeeds regardless).
 
 **Version gate.** The Spring wiring for the setting (`<entry
 key="dryRun" .../>` in the jar's root `lsfusion.xml`) exists only in
