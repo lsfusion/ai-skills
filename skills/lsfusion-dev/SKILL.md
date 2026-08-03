@@ -216,7 +216,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
-| `dryrun` | **Full-fidelity validation of the whole project without starting it** (7.0-SNAPSHOT builds since 2026-07-30, first carrying build `20260730.203938`; older builds are refused — the command inspects the jar). Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets) and never touches the running server, so it validates safely **next to a live instance**. PostgreSQL must still be **reachable** (the DB adapter connects at startup and creates a missing database empty; unreachable → diagnosed in seconds). `-TopModule <M>` forces `logics.topModule` for the run, cutting the scope to M's REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
+| `dryrun` | **Full-fidelity validation of the whole project without starting it** (7.0-SNAPSHOT builds since 2026-07-30, first carrying build `20260730.203938`; older builds are refused — the command inspects the jar). Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets) and never touches the running server, so it validates safely **next to a live instance**. On builds since **2026-08-03** it opens **no DB connection at all** — no PostgreSQL needed; the first-wave builds (2026-07-30…08-02) still connected and created a missing DB, and an unreachable server hung them (the command diagnoses that in seconds). `-TopModule <M>` (comma-separated list allowed on 2026-08-03+ builds — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
@@ -845,24 +845,29 @@ What makes it different from a restart (all measured):
 - **~3–4× cheaper on the JVM phase and DB-independent in outcome**:
   772-module project ≈ 9 s of JVM (a restart's full cycle is 26–41 s+
   and holds the DB while it runs).
-- **PostgreSQL must still be reachable with valid credentials.** The
-  platform's DB adapter connects during Spring startup, *before* the
-  dry-run cutoff, and **creates the configured database (empty) when it
-  is missing**. With an unreachable server the JVM retries the
-  connection forever; the command detects the pattern and reports
-  `PostgreSQL is unreachable` in seconds — fix `db.server`/credentials,
-  don't raise the timeout.
+- **No PostgreSQL needed — on current builds.** Since the 2026-08-03
+  builds a dry run opens **no DB connection at all** (measured: zero
+  sockets; an unreachable server and a missing database are both
+  non-events). The first-wave builds (2026-07-30…08-02) still connected
+  during the logic phase, **created the configured database (empty)
+  when missing**, and retried an unreachable server forever — the
+  command detects that pattern and reports `PostgreSQL is unreachable`
+  in seconds; the cure is updating the platform (or fixing
+  `db.server`), not raising the timeout.
 
 **`-TopModule <M>` limits the checked scope to M's `REQUIRE` closure**
 (plus system modules) by forcing `logics.topModule` for that run only —
-the project's `lsfusion.properties` is not touched. On the measured
-772-module project the closure of a leaf module was 11 modules and the
-JVM phase dropped from ~9 s to ~4 s. Two hard caveats, both measured:
-modules **outside the closure are not checked at all** (not even
-parsed), and **dependents of M are not checked either** — a signature
-change that breaks M's callers only surfaces in a full dryrun (or the
-restart). So scope iteration to the module you edit, but keep the
-unscoped `dryrun` as the gate before the restart. Never write
+the project's `lsfusion.properties` is not touched. On 2026-08-03+
+builds the value may be a **comma-separated list** (`-TopModule
+"Sales,Purchase"` — quote it so PowerShell passes one string); the
+union of the closures is checked. On the measured 772-module project
+the closure of a leaf module was 11 modules and the JVM phase dropped
+from ~9 s to ~4 s. Two hard caveats, both measured: modules **outside
+the closure are not checked at all** (not even parsed), and
+**dependents of the listed modules are not checked either** — a
+signature change that breaks M's callers only surfaces in a full dryrun
+(or the restart). So scope iteration to the module you edit, but keep
+the unscoped `dryrun` as the gate before the restart. Never write
 `settings.dryRun` or a forced `topModule` into `settings.properties` /
 `lsfusion.properties` — a server started with `dryRun` just exits, and
 a persisted narrow `topModule` would make a real start **drop the
@@ -875,8 +880,9 @@ right before a restart** (a failed restart costs 26–41 s *and* downtime;
 a failed dryrun costs ~10–40 s and nothing else); for **restart-only
 files** (`EXTEND FORM` / all-META modules) where precheck proves
 nothing; to catch a **missing `REQUIRE`** precheck structurally cannot;
-and for CI-style "does this branch even load" checks on a box with a
-reachable PostgreSQL but no initialized application database.
+and for CI-style "does this branch even load" checks — on 2026-08-03+
+builds that box needs **no PostgreSQL at all** (first-wave builds
+needed a reachable one).
 
 **Web resources (JS / CSS / images) need NO restart in devmode — any page
 load picks them up; browser cache is NOT a factor.** Files under

@@ -372,10 +372,12 @@ the server JVM with `-Dsettings.dryRun=true`, which loads and checks the
 (missing-REQUIRE caught), `EXTEND FORM`, META instantiation, the entire
 restart-only class — then exits before the DB sync: no ports bound, the
 running server untouched, ~9 s of JVM on a 772-module project
-(`-TopModule` narrows the scope further). It needs the sources and the
-platform jar locally plus a *reachable* PostgreSQL, so for a **remote**
-server eval stays the only lint; use eval per-edit (milliseconds),
-`dryrun` as the pre-restart gate.
+(`-TopModule` narrows the scope further; comma-separated list on
+2026-08-03+ builds). It needs the sources and the platform jar locally
+— on 2026-08-03+ builds **no PostgreSQL at all** (older first-wave
+builds still connected to it) — so for a **remote** server eval stays
+the only lint; use eval per-edit (milliseconds), `dryrun` as the
+pre-restart gate.
 
 ### Getting values back
 

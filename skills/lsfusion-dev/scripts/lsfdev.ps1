@@ -1914,11 +1914,13 @@ function Cmd-StartServer {
 # (schema sync, RMI, Action API, WebSocket), so the run binds NO ports
 # (measured: zero LISTENING sockets) and executes safely next to a live
 # server - it never stops, restarts or otherwise touches the running
-# instance, its schema, or the init marker. One caveat, all measured: the
-# platform's DB ADAPTER still connects to PostgreSQL during Spring context
-# creation (before the dry-run cutoff), creating the configured database
-# EMPTY if it is missing - so PostgreSQL must be reachable (an unreachable
-# one puts the JVM into an endless retry loop; detected and killed below).
+# instance, its schema, or the init marker. DB behavior is split by build
+# (all measured): since 2026-08-03 (platform d98398f) a dry run opens NO
+# DB connection at all - no PostgreSQL needed; first-wave builds
+# (20260730.203938 .. 2026-08-02) still connected during the logic phase
+# (DBManager.initReflectionEvents), created the configured database EMPTY
+# if missing, and retried an unreachable server forever - detected and
+# killed below as a backstop (the jar gate cannot tell the builds apart).
 function Cmd-DryRun {
     Head "Dry run (compile + check the logic - no ports, no schema sync)"
     $cfg = Get-ConfigOrFail
@@ -2017,14 +2019,14 @@ function Cmd-DryRun {
         # startup marker appears instead of letting it run.
         $log = (Read-FileText $dryOut) + "`n" + (Read-FileText $dryErr)
         if ($log -match "Server has successfully started") { $verdict = "real-start"; break }
-        # A dry run still needs a REACHABLE PostgreSQL: the platform's DB
-        # adapter connects during Spring context creation, BEFORE the
-        # dry-run cutoff, and an unreachable server puts it into an ENDLESS
-        # once-a-second retry loop (measured: 180 s of 'Connection ...
-        # refused' with zero progress; source: only SQLSTATE 08001/57P03
-        # retry - 'Connection to X refused' and 'The connection attempt
-        # failed' texts; other connect errors, e.g. a rejected password,
-        # abort startup on their own). Diagnose in seconds, not minutes.
+        # First-wave-build backstop (2026-07-30 .. 08-02; fixed by platform
+        # d98398f on 2026-08-03): those builds still connect to PostgreSQL
+        # during the logic phase, and an unreachable server puts them into
+        # an ENDLESS once-a-second retry loop (measured: 180 s of
+        # 'Connection ... refused' with zero progress; source: only
+        # SQLSTATE 08001/57P03 retry; other connect errors abort startup on
+        # their own). Diagnose in seconds, not minutes; on current builds
+        # this pattern never fires.
         if (@([regex]::Matches($log, "ERROR StartLogger - (Connection to .* refused|The connection attempt failed)")).Count -ge 3) { $verdict = "db-unreachable"; break }
     }
     # The 2 s poll granularity can time the loop out in the same tick the
@@ -2045,9 +2047,9 @@ function Cmd-DryRun {
         exit 1
     }
     if ($verdict -eq "db-unreachable") {
-        Bad "PostgreSQL is unreachable - the dry-run JVM has been killed (it would retry the connection forever)."
+        Bad "PostgreSQL is unreachable - the dry-run JVM has been killed (this platform build would retry the connection forever)."
         $tailOut | Select-Object -Last 3 | ForEach-Object { Write-Host "    $_" }
-        Info "A dry run skips the schema sync but the platform's DB adapter still CONNECTS at startup (before the dry-run cutoff). Fix db.server / credentials in conf/settings.properties, or start PostgreSQL, and re-run."
+        Info "This build (2026-07-30..08-02) still connects to the DB during a dry run. Best fix: update the platform to a 2026-08-03+ 7.0-SNAPSHOT (dry runs then touch no DB at all); otherwise fix db.server in conf/settings.properties or start PostgreSQL, and re-run."
         exit 1
     }
     if ($verdict -eq "timeout") {
@@ -3394,16 +3396,17 @@ version and dies on every plugin update.
                  real REQUIRE graph, EXTEND FORM - everything a restart
                  checks at LOAD time) and exits before the DB sync. Binds NO
                  ports, syncs NO schema, runs safely NEXT TO a live server
-                 (never stops or touches it). PostgreSQL must still be
-                 REACHABLE with valid credentials: the platform's DB adapter
-                 connects at startup (before the dry-run cutoff) and creates
-                 the configured database EMPTY if missing; an unreachable
-                 server is detected and reported in seconds. Covers
+                 (never stops or touches it). On 2026-08-03+ builds it opens
+                 NO DB connection at all (no PostgreSQL needed); first-wave
+                 builds (2026-07-30..08-02) still connected, created a
+                 missing database empty, and hung on an unreachable server -
+                 that hang is detected and reported in seconds. Covers
                  precheck's blind spots (missing REQUIRE, EXTEND FORM /
                  restart-only files) at the cost of a JVM boot instead of
                  milliseconds. -TopModule <M> forces logics.topModule for
-                 this run only, limiting the check to M's REQUIRE closure
-                 (faster on many-module projects).
+                 this run only, limiting the check to the REQUIRE closure
+                 (faster on many-module projects); a comma-separated list
+                 (quote it: -TopModule "A,B") works on 2026-08-03+ builds.
                  Exit code 0 = logic OK, 1 = validation failed (one semantic
                  error per run, like a restart; parse errors come batched).
                  Requires a 7.0-SNAPSHOT build from 2026-07-30 on (first
@@ -3429,7 +3432,9 @@ Common options:
   -TopModule <name>     Top lsFusion module to load. For 'dryrun': forces
                         logics.topModule for that run only (-D outranks the
                         project's lsfusion.properties), limiting the check to
-                        that module's REQUIRE closure + system modules.
+                        that module's REQUIRE closure + system modules. On
+                        2026-08-03+ builds a comma-separated list is allowed
+                        (union of closures) - quote it: -TopModule "A,B".
   -RmiPort <port>       App-server RMI port (default 7652). Set per project to
                         run several servers/configs at once.
   -HttpPort <port>      App-server HTTP / Action API port (default 7651).

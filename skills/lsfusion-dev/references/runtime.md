@@ -377,29 +377,37 @@ with no port juggling; no schema sync, no Reflection sync, no init-marker
 implications; a 772-module project completes the JVM phase in ~9 s where
 its restart takes 26–41 s+.
 
-**The DB adapter still connects — before the cutoff.** The platform's
-`DataAdapter` is wired during Spring context creation, which precedes the
-lifecycle cutoff: a dry run opens 2 PostgreSQL connections, and when the
-configured `db.name` does not exist it **creates the database** (empty —
-0 tables; the sync that would fill it is past the cutoff). Consequences:
+**DB connection under dryRun — fixed on 2026-08-03; two behavior
+generations exist.** The jar gate cannot tell them apart (`lsfusion.xml`
+is identical), so know both:
 
-- PostgreSQL must be **reachable with valid credentials** even for a dry
-  run. "Validate without a live database" holds only in the sense of *no
-  initialized application database* — the DBMS itself is required.
-- An unreachable server (`db.server` typo, stopped service, wrong port)
-  puts the adapter into an **endless once-per-second retry loop** —
-  `ERROR StartLogger - Connection to <host> refused` repeating forever,
-  no progress, no exit. `lsfdev.ps1 dryrun` watches for that pattern and
-  kills the JVM with a `PostgreSQL is unreachable` verdict in ~10 s
-  instead of hanging to the timeout. Source-derived scope: the adapter
-  retries **only** SQLSTATE 08001 / 57P03 (`Connection to X refused`,
-  `The connection attempt failed` — both matched by the watcher); any
-  other connect error (e.g. a rejected password where pg_hba actually
-  enforces one) is thrown immediately, context creation fails, and the
-  command reports it through the exit-code / missing-success-marker
-  path. On a dev box whose pg_hba trusts localhost, a wrong
-  `db.password` is invisible to a dry run (measured — the connection
-  succeeds regardless).
+- **First-wave builds (`20260730.203938` … 2026-08-02)** did open 2
+  PostgreSQL connections during the *logic* phase: the
+  `DBManager.initReflectionEvents()` init task (the `Initializing
+  reflection events` log line) runs before the lifecycle cutoff and
+  called `ensureDB`, which **created a missing database** (empty —
+  0 tables) and, on an unreachable server, **retried forever** ~1/s
+  (`ERROR StartLogger - Connection to <host> refused`, no exit — dead
+  exit-code for CI). Source-derived scope of the retry: only SQLSTATE
+  08001 / 57P03 (`Connection to X refused`, `The connection attempt
+  failed`); other connect errors (a genuinely rejected password) are
+  thrown immediately and surface via the exit-code /
+  missing-success-marker path. On a dev box whose pg_hba trusts
+  localhost, a wrong `db.password` is invisible (measured).
+- **Builds since 2026-08-03** (platform commit `d98398f`, *Skip
+  DBManager.initReflectionEvents under dryRun*): the task returns early
+  — measured on the 2026-08-03 download build: an unreachable
+  PostgreSQL **passes** in ~5 s, the dry-run JVM opens **zero sockets
+  of any kind**, and a missing database is **NOT created**. "Validate
+  without a live database" now holds literally — no DBMS needed. (The
+  skip also means DB-stored user property overrides —
+  logging/materialized/notnull — are absent from the dry-run model;
+  irrelevant for load-time validation.)
+
+`lsfdev.ps1 dryrun` keeps its unreachable-DB watcher as a backstop for
+first-wave builds: on them it kills the JVM with a `PostgreSQL is
+unreachable` verdict in ~10 s instead of hanging to the timeout; on
+current builds the pattern simply never fires.
 
 **Version gate.** The Spring wiring for the setting (`<entry
 key="dryRun" .../>` in the jar's root `lsfusion.xml`) exists only in
@@ -415,9 +423,14 @@ backstop for uninspectable jars, kills the JVM the moment
 closure of `logics.topModule` (plus system modules) — same as a real
 start. `dryrun -TopModule <M>` overrides it per-run via
 `-Dlogics.topModule` (a `-D` outranks the project's
-`lsfusion.properties`). Everything outside the closure is dropped
-**before parsing** — a module outside the closure contributes nothing,
-not even syntax errors — and dependents of `M` are not loaded either.
+`lsfusion.properties`). Since the 2026-08-03 builds (platform commit
+`68ce253`) the value may be a **comma-separated list** — the union of
+the closures is loaded; quote it (`-TopModule "Sales,Purchase"`) so
+PowerShell passes one string (measured: an unknown name anywhere in the
+list fails with `Module 'X' not found`). Everything outside the closure
+is dropped **before parsing** — a module outside the closure contributes
+nothing, not even syntax errors — and dependents of the listed modules
+are not loaded either.
 Fast iteration: scoped run on the edited subtree; the gate before a
 restart: the unscoped run. Never persist a narrowed `topModule` into the
 project config: a *real* start with it would drop the out-of-closure
