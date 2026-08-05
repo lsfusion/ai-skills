@@ -30,6 +30,8 @@ param(
     [string]$Click = "",
     [string]$DoubleClick = "",
     [string[]]$Do = @(),
+    [string]$DoFile = "",
+    [switch]$AllowWarnings,
     [switch]$Session,
     [switch]$EndSession,
     [switch]$Reload,
@@ -320,9 +322,30 @@ function Test-ExistingProject([string]$projectDir) {
 }
 
 function Find-Python {
-    foreach ($n in @("python", "python3", "py")) {
-        $c = Get-Command $n -ErrorAction SilentlyContinue
-        if ($c) { return $c.Source }
+    # Returns a VALIDATED CPython 3 executable path, or $null. The trap this
+    # guards against (reported from the field): the Windows Store
+    # app-execution alias (...\Microsoft\WindowsApps\python.exe) that merely
+    # prints a Store hint (exit 9009) shadowing a real install later on
+    # PATH. The alias path CANNOT be skipped by name - a Store-INSTALLED
+    # Python legitimately lives at the same path - so every candidate is
+    # actually RUN and the first one that answers '--version' with Python 3
+    # wins (cmd /c swallows the stub's stderr without tripping
+    # $ErrorActionPreference=Stop).
+    foreach ($n in @("python", "python3")) {
+        foreach ($c in @(Get-Command $n -All -ErrorAction SilentlyContinue)) {
+            $src = $c.Source
+            if (-not $src) { continue }
+            $v = cmd /c "`"$src`" --version 2>nul"
+            if ($LASTEXITCODE -eq 0 -and "$v" -match '^Python 3') { return $src }
+        }
+    }
+    # The py launcher knows the real installs even when PATH carries only
+    # dead aliases - ask it where the newest CPython 3 actually lives.
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        $exe = cmd /c "`"$($py.Source)`" -3 -c `"import sys; print(sys.executable)`" 2>nul"
+        $exe = "$exe".Trim()
+        if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path $exe)) { return $exe }
     }
     return $null
 }
@@ -360,6 +383,30 @@ function Get-PortPids([int]$port) {
         $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
         return @($conns | Select-Object -ExpandProperty OwningProcess -Unique)
     } catch { return @() }
+}
+
+# HTTP status of a GET with redirects NOT followed: 2xx/3xx = the app
+# answers; 404/500 = a BOUND port serving a broken deployment (e.g. the war
+# failed to deploy) - NOT readiness; 0 = no HTTP answer at all. Implemented
+# on HttpWebRequest with AllowAutoRedirect=$false: PS 5.1's own
+# `Invoke-WebRequest -MaximumRedirection 0` throws on a 3xx with
+# Exception.Response = NULL (measured), which would misread a healthy
+# redirect-answering app (e.g. an auth-mode / -> /login 302) as "nothing
+# answered". At the .NET layer a 3xx is a normal response; 4xx/5xx arrive
+# as a WebException CARRYING the response.
+function Get-HttpProbeStatus([string]$url) {
+    try {
+        $req = [Net.WebRequest]::Create($url)
+        $req.Method = "GET"
+        $req.Timeout = 5000
+        $req.AllowAutoRedirect = $false
+        $resp = $req.GetResponse()
+        try { return [int]$resp.StatusCode } finally { $resp.Close() }
+    } catch [Net.WebException] {
+        $resp = $_.Exception.Response
+        if ($resp) { try { return [int]$resp.StatusCode } finally { $resp.Close() } }
+        return 0
+    } catch { return 0 }
 }
 
 function Test-PortOpen([int]$port) {
@@ -1862,9 +1909,15 @@ function Cmd-StartServer {
         if ($proc.HasExited) { $verdict = "failed"; break }
     }
 
+    # A JVM that LOGGED the success marker and then died (late port clash,
+    # OOM, a crashing plugin) is a dead server, not a started one - re-check
+    # liveness before trusting the marker.
+    if ($verdict -eq "started" -and $proc.HasExited) { $verdict = "failed" }
+
     Write-Host ""
     $tailOut = Tail-Text (Read-FileText $ServerOut) $Lines
     $tailErr = Tail-Text (Read-FileText $ServerErr) 30
+    $bind = $null
     if ($verdict -eq "started") {
         Ok "Application server started (RMI $($cfg.rmiPort), Action API $($cfg.httpPort), WebSocket $($cfg.webSocketPort))."
         # Trust, but verify: confirm which database this JVM is REALLY on.
@@ -1903,6 +1956,18 @@ function Cmd-StartServer {
         Warn "Startup not confirmed within $Timeout s. Server may still be initializing. Recent log:"
         $tailOut | ForEach-Object { Write-Host "    $_" }
         Info "Re-check with: lsfdev.ps1 log    (or start-server -Timeout 300)"
+    }
+    # Nonzero on anything but a confirmed healthy start, so automation (and
+    # the combined start/restart, which 'exit' short-circuits before Tomcat)
+    # never mistakes a dead or unconfirmed or wrong-database server for
+    # success. Exit AFTER the diagnostics above. The final liveness re-check
+    # catches a JVM that died while the DB binding was being verified.
+    if ($verdict -ne "started") { exit 1 }
+    if ($bind -and $bind.state -eq 'mismatch') { exit 1 }
+    if ($proc.HasExited) {
+        Bad "Application server exited right after startup (during verification). Last log lines:"
+        Tail-Text (Read-FileText $ServerOut) 20 | ForEach-Object { Write-Host "    $_" }
+        exit 1
     }
 }
 
@@ -2119,7 +2184,10 @@ function Cmd-StartWeb {
         throw "Tomcat shutdown port $($cfg.shutdownPort) is held by another process - Catalina cannot start. Re-run: setup -ShutdownPort <free port>, then start-web."
     }
     if (Test-PortBusyForeign $cfg.webPort $ownPids) {
-        Warn "Web port $($cfg.webPort) is held by another process; Tomcat may fail to bind it. Re-run: setup -WebPort <free port>."
+        # Fail fast: Tomcat cannot bind an occupied port, and worse - the
+        # FOREIGN process would answer the readiness probe below, turning a
+        # broken start into a false "[OK] Web client is up".
+        throw "Web port $($cfg.webPort) is held by another process - Tomcat cannot bind it (and the foreign process would answer the readiness probe). Re-run: setup -WebPort <free port>, then start-web."
     }
 
     # Point the web client at this instance's application server. The lsFusion
@@ -2174,15 +2242,49 @@ function Cmd-StartWeb {
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 3
         if ($proc.HasExited) { break }
-        try {
-            Invoke-WebRequest $webUrl -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0 -ErrorAction Stop | Out-Null
-            $up = $true; break
-        } catch {
-            if ($_.Exception.Response) { $up = $true; break }
-        }
+        # Readiness = a 2xx/3xx answer ONLY. An error status must keep
+        # polling: a Tomcat whose WAR failed to deploy serves 404s on a
+        # perfectly bound port, and that used to read as "up".
+        $code = Get-HttpProbeStatus $webUrl
+        if ($code -ge 200 -and $code -lt 400) { $up = $true; break }
     }
     Write-Host ""
     if ($up) {
+        # Liveness first (precise message for a Tomcat that answered once
+        # and died), then POSITIVE port ownership: the HTTP answer must be
+        # attributable to the Tomcat just launched. Requiring a positive
+        # match (not merely "no foreign owner") closes two real gaps: a
+        # foreign responder that answered and exited leaves an EMPTY owner
+        # list, and a Tomcat whose HTTP connector failed to bind KEEPS
+        # RUNNING (connector throwOnFailure defaults to false) - in both
+        # cases nothing on the port belongs to our PID. The lookup is
+        # retried briefly so a slow TCP-table refresh cannot false-fail.
+        if ($proc.HasExited) {
+            Bad "Tomcat answered the readiness probe but exited right after. Tomcat log tail:"
+            Tail-Text (Read-FileText $TomcatOut) 40 | ForEach-Object { Write-Host "    $_" }
+            exit 1
+        }
+        $owners = @()
+        foreach ($ownTry in 1..5) {
+            $owners = @(Get-PortPids $cfg.webPort)
+            if ($owners.Count) { break }
+            Start-Sleep -Seconds 1
+        }
+        if (-not ($owners -contains $proc.Id)) {
+            if ($owners.Count) {
+                Bad "Something responded at $webUrl, but web port $($cfg.webPort) is owned by PID(s) $($owners -join ', '), not the Tomcat just started (PID $($proc.Id)) - a foreign process is answering. Free the port or re-run: setup -WebPort <free port>."
+            } else {
+                Bad "Something responded at $webUrl, but no live listener on port $($cfg.webPort) is attributable to the Tomcat just started (PID $($proc.Id)) - either the responder died right after answering, or Tomcat's HTTP connector failed to bind while its JVM kept running (Tomcat does not exit on a connector bind failure). Tomcat log tail:"
+                Tail-Text (Read-FileText $TomcatOut) 40 | ForEach-Object { Write-Host "    $_" }
+            }
+            # This Tomcat is definitively not serving the app - leaving it
+            # running would make a later 'status' read "PID alive + port
+            # open" as healthy. Kill OUR JVM only (never the port's foreign
+            # owners) and drop the pid file.
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            Remove-Item $TomcatPid -Force -ErrorAction SilentlyContinue
+            exit 1
+        }
         Ok "Web client is up: $webUrl"
         Info "Default login: user '$($cfg.adminUser)', empty password."
     } else {
@@ -2208,11 +2310,22 @@ function Cmd-StartWeb {
         } elseif (-not $bindDiagnosed) {
             Warn "Web UI did not respond yet. Check 'lsfdev.ps1 status' shortly, or inspect .lsfusion-dev/tomcat/logs/."
         }
-        Tail-Text (Read-FileText $TomcatOut) 40 | ForEach-Object { Write-Host "    $_" }
+        $shownTail = @(Tail-Text (Read-FileText $TomcatOut) 40)
+        $shownTail | ForEach-Object { Write-Host "    $_" }
         if ($catalog) {
             Write-Host "  --- $($catalog.Name) ---"
-            Tail-Text (Read-FileText $catalog.FullName) 40 | ForEach-Object { Write-Host "    $_" }
+            $catTail = @(Tail-Text (Read-FileText $catalog.FullName) 40)
+            $catTail | ForEach-Object { Write-Host "    $_" }
+            $shownTail += $catTail
         }
+        # Explain benign ERROR-level lines only when they are in the tails
+        # the user actually SAW (a stale line deep in the full log must not
+        # trigger an explanation for nothing).
+        Note-BenignLogLines ($shownTail -join "`n")
+        # Nonzero on every not-up outcome (bind failure, dead Tomcat, no HTTP
+        # answer in time) - automation must not read a broken web start as
+        # success.
+        exit 1
     }
 }
 
@@ -2253,12 +2366,38 @@ function Cmd-Status {
 
     $tPid = 0
     if (Test-Path $TomcatPid) { [int]::TryParse((Get-Content $TomcatPid -Raw -Encoding UTF8).Trim(), [ref]$tPid) | Out-Null }
-    if ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Ok "Web client    : running (PID $tPid, $(Get-WebUrl $cfg))" }
+    # Positive ownership, not just "PID alive + port open": Tomcat keeps
+    # running when its HTTP connector fails to bind, so a foreign listener
+    # plus our idle JVM used to read as healthy here.
+    $webOwners = @(Get-PortPids $web)
+    $webUrlS = Get-WebUrl $cfg
+    if ((Process-Alive $tPid) -and (Test-PortOpen $web) -and (($webOwners -contains $tPid) -or -not $webOwners.Count)) {
+        # Ownership alone is not health: a bound port can serve 404/500 when
+        # the war failed to deploy - probe the app URL like start-web does.
+        $ownNote = if (-not $webOwners.Count) { " (port ownership not verifiable on this system)" } else { "" }
+        $code = Get-HttpProbeStatus $webUrlS
+        if ($code -ge 200 -and $code -lt 400) { Ok "Web client    : running (PID $tPid, $webUrlS)$ownNote" }
+        elseif ($code -gt 0) { Warn "Web client    : Tomcat PID $tPid serves port $web but the app answers HTTP $code - the war likely failed to deploy (check .lsfusion-dev/tomcat/logs/; setup -RefreshWar re-downloads it)$ownNote" }
+        else { Warn "Web client    : Tomcat PID $tPid holds port $web but nothing answered the HTTP probe - still starting, or the connector is wedged; retry status shortly$ownNote" }
+    }
+    elseif ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Warn "Web client    : Tomcat PID $tPid is alive but web port $web is served by PID(s) $($webOwners -join ', ') - its connector likely failed to bind (foreign process on the port). Free the port or setup -WebPort <free port>." }
     elseif (Test-PortOpen $web) { Warn "Web client    : something is on web port $web (PID file stale)" }
     else { Info "Web client    : stopped" }
 
     # Silent when war/server build dates agree (the healthy case).
     Test-WarServerBuildDrift $cfg
+}
+
+# Some platform log lines are ERROR-level noise, not failures - explain them
+# whenever a displayed tail carries one, so they don't read as app errors.
+# Known case (measured, NavigatorProviderImpl.removeNavigator): the web
+# client logs NORMAL navigator-session cleanup as
+# "ERROR MainDispatchServlet - Removing navigator <id>..." - fired e.g.
+# whenever a verify browser/session or a user tab closes.
+function Note-BenignLogLines([string]$text) {
+    if ($text -match 'ERROR\s+MainDispatchServlet\s+-\s+Removing navigator') {
+        Info "Note: 'ERROR MainDispatchServlet - Removing navigator ...' is the web client's NORMAL session cleanup (a browser tab or verify session closed), logged at ERROR level by the platform - not an application failure."
+    }
 }
 
 function Cmd-Log {
@@ -2272,6 +2411,7 @@ function Cmd-Log {
         Head "stderr (last 40 lines)"
         Write-Host $errTail
     }
+    Note-BenignLogLines (((Tail-Text $out $Lines) -join "`n") + "`n" + $errTail)
     Head "Verdict"
     $all = $out + "`n" + $err
     if ($all -match "Server has successfully started") { Ok "Log shows: Server has successfully started." }
@@ -2289,6 +2429,10 @@ function Cmd-Log {
 function Cmd-Verify {
     Head "Visual verification (Playwright)"
     $cfg = Get-ConfigOrFail
+    # Failed checks collected across the whole report; verify is STRICT by
+    # default - any entry here makes it exit 2 (unless -AllowWarnings), so
+    # automation can trust the exit code instead of parsing [WARN] lines.
+    $checkFails = New-Object System.Collections.Generic.List[string]
     if ($EndSession) {
         if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
         else { Info "No persistent verify session to end." }
@@ -2310,8 +2454,12 @@ function Cmd-Verify {
     }
 
     $py = Find-Python
-    if (-not $py) { throw "Python 3 not found. Install Python 3 to use Playwright verification." }
+    if (-not $py) { throw "Python 3 not found (Windows Store alias stubs are skipped on purpose). Install a real Python 3 to use Playwright verification." }
     Ensure-Playwright $py
+    # Say WHICH runtime was picked - a shadowed/stubbed Python is invisible
+    # otherwise and was reported costing manual PATH archaeology.
+    $pyVer = "$(cmd /c "`"$py`" --version 2>nul")".Trim()
+    Info "Python : $py ($pyVer, playwright module OK)"
 
     # Run the helper from a copy in the state dir: when the skill is installed
     # as a Claude Code plugin, scripts/ lives on a virtualized filesystem that
@@ -2350,11 +2498,39 @@ function Cmd-Verify {
         [IO.File]::WriteAllText($openFileArg, $openScriptText, (New-Object Text.UTF8Encoding($false)))
         Info "Open   : $($openScriptText.Trim() -replace '\s+', ' ') (direct form open via /eval/action)"
         if ($OpenExpect) { Info "Expect : '$OpenExpect' (text to wait for on the opened form)" }
+    } elseif ($OpenExpect) {
+        # Silently ignoring the assertion would let a mistyped call pass
+        # strict verify - bad usage, not a soft skip.
+        throw "-OpenExpect requires -OpenScript/-OpenScriptFile (it asserts on the form that script opens)."
     }
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
     if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
-    if ($Do.Count) { Info "Do     : $($Do.Count) generic step(s) after navigation (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by Playwright selector; first VISIBLE match)" }
+    # -Do steps: the repeatable parameter plus -DoFile (a JSON array OR one
+    # step per line with '#' comments). The file form survives every quoting
+    # layer - a nested 'powershell -Command' collapses array commas into ONE
+    # argument, which then executes as a single garbled selector.
+    $doSteps = @()
+    if ($DoFile) {
+        if (-not (Test-Path -LiteralPath $DoFile)) { throw "DoFile not found: $DoFile" }
+        # PS 5.1: Get-Content -Raw returns $null for a zero-byte file.
+        $doText = "$(Get-Content -Raw -Encoding UTF8 -LiteralPath $DoFile)"
+        if ($doText.TrimStart().StartsWith('[')) {
+            foreach ($item in @($doText | ConvertFrom-Json)) {
+                if ($null -eq $item) { continue }
+                if ($item -isnot [string]) { throw "DoFile JSON must be an array of step STRINGS; got an element of type $($item.GetType().Name)." }
+                if ($item) { $doSteps += $item }
+            }
+        } else {
+            $doSteps += @($doText -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+        }
+        Info "DoFile : $($doSteps.Count) step(s) from $DoFile"
+    }
+    $doSteps += @($Do | Where-Object { $_ })
+    foreach ($g in @($doSteps | Where-Object { $_ -match ',\s*(wait|click|dblclick|hover|drag|dnd|mouse|fill|type|edit|press|eval|assert-count|assert-text):' })) {
+        Warn "-Do step looks like SEVERAL steps glued together by a comma: '$g'. A nested 'powershell -Command' collapses array commas into one argument - pass steps as -Do 'a','b' from a direct shell, or one per line via -DoFile. It executes as ONE step."
+    }
+    if ($doSteps.Count) { Info "Do     : $($doSteps.Count) generic step(s) after navigation (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/assert-count/assert-text by Playwright selector; interaction verbs use the first VISIBLE match, assert-* all visible matches)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
     # Use --name=value form so an empty password is preserved through
@@ -2369,11 +2545,13 @@ function Cmd-Verify {
     # quote+space patterns (e.g. join(" | ")) get split apart no matter how
     # they are escaped. A file cannot be corrupted by argv quoting.
     $doArgs = @()
-    $doSteps = @($Do | Where-Object { $_ })
     if ($doSteps.Count) {
-        $doFile = Join-Path $StateDir "verify-do.json"
-        [IO.File]::WriteAllText($doFile, (ConvertTo-Json -InputObject $doSteps -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
-        $doArgs = @("--do-file=$doFile")
+        # NOTE: the staging file variable must NOT be named $doFile - PS
+        # variables are case-insensitive and it would clobber the -DoFile
+        # parameter.
+        $doJsonFile = Join-Path $StateDir "verify-do.json"
+        [IO.File]::WriteAllText($doJsonFile, (ConvertTo-Json -InputObject $doSteps -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+        $doArgs = @("--do-file=$doJsonFile")
     }
     $reloadArgs = @()
     if ($Reload) { $reloadArgs = @("--reload") }
@@ -2391,7 +2569,18 @@ function Cmd-Verify {
     if (-not $r) {
         Bad "verify_playwright.py did not return parseable JSON (exit $pyExit). Raw output:"
         Write-Host $jsonText
-        return
+        # A tool/protocol failure, not a failed check - -AllowWarnings
+        # (report-only for CHECKS) must not turn an unusable run into 0.
+        exit 1
+    }
+    # The helper's TOOL-failure envelope: exit 2 with a minimal {"error": ...}
+    # JSON (playwright module missing, unreadable staged open-script file) -
+    # distinguishable from a full run by the missing 'artifacts' block (a
+    # full result always carries it; a full run that hit an error exits 1).
+    # Same rule as above: never let -AllowWarnings convert it to 0.
+    if ($pyExit -eq 2 -or -not $r.PSObject.Properties['artifacts']) {
+        Bad "verify_playwright.py reported a tool failure (exit $pyExit): $($r.error)"
+        exit 1
     }
 
     Write-Host ""
@@ -2418,18 +2607,97 @@ function Cmd-Verify {
         }
         if ($r.open.error) {
             Bad "Direct form open failed: $($r.open.error)"
+            $checkFails.Add("direct form open failed")
         } else {
             $tag = if ($r.open.reloaded) { " (after one /push-notification reload)" } else { "" }
             Ok "Open script executed - landed on $($r.open.landed_url)$tag"
+            # DOM ground truth: which form is really on screen. The -OpenExpect
+            # text search alone is satisfiable by the same string in any grid
+            # of any form (measured: the app's own onWebClientStarted overrode
+            # the direct open, and a dashboard grid's copy of the text passed
+            # as [OK] while the requested card never opened) - so the verdict
+            # below compares the form the script names with the active tab /
+            # visible lsfusion-form sIDs, and a found expect on the WRONG form
+            # is reported as a warning, not a pass.
+            $vForms = @($r.open.visible_forms)
+            $oTabs  = @($r.open.open_tabs)
+            $frontParts = @()
+            if ($r.open.active_tab) { $frontParts += "tab '$($r.open.active_tab)'" }
+            if ($vForms.Count)      { $frontParts += "visible sID(s): $($vForms -join ', ')" }
+            if ($frontParts.Count) {
+                $tabsNote = if ($oTabs.Count -gt 1) { "; all open tabs: $($oTabs -join ' | ')" } else { "" }
+                Info "Active form : $($frontParts -join '; ')$tabsNote"
+            }
+            $sNames = @(@($r.open.script_forms) | ForEach-Object { $_.name })
+            $openVerdict = "$($r.open.form_match)"
+            $wrongForm = $false
+            switch ($openVerdict) {
+                'match' {
+                    $basisNote = if ($r.open.form_basis) { " - $($r.open.form_basis)" } else { "" }
+                    Ok "Open check: the script's form is on screen ('$($r.open.form_matched)'$basisNote)."
+                }
+                'probable' {
+                    # An auto form is on screen for a SHOW EDIT/LIST <Class> -
+                    # consistent, but auto forms don't expose their class in
+                    # the DOM, so an unrelated EDIT would look identical.
+                    # Only a scoped -OpenExpect hit (below) upgrades this to
+                    # a verified pass.
+                    Info "Open check: $($r.open.form_basis) - CONSISTENT with the script's '$($r.open.form_matched)', but circumstantial. It is verified only if the -OpenExpect text is found INSIDE that form; without -OpenExpect judge verify-open.png."
+                }
+                'open-inactive' {
+                    $wrongForm = $true
+                    Warn "Open check: the script's form ('$($sNames -join "', '")') appears to be open but NOT on screen - another form was activated over it (typically the app's own startup action, e.g. onWebClientStarted). The screenshot and any -OpenExpect text reflect the ACTIVE form, not the script's."
+                }
+                'not-open' {
+                    $wrongForm = $true
+                    Warn "Open check: nothing matching the script's form ('$($sNames -join "', '")') is open - the direct open did not take effect (typical cause: the app's own startup action, e.g. onWebClientStarted, opened/activated another form over it). If the form is merely named/captioned differently than the script mention, ignore this and judge verify-open.png."
+                }
+                default {
+                    if ($sNames.Count) { Info "Open check: could not read (or re-confirm) the form state from the DOM - judge verify-open.png." }
+                    else { Info "Open check: the script names no form directly (no SHOW/DIALOG/ACTIVATE in it - e.g. it calls a project action), so the opened-form identity is not cross-checked." }
+                }
+            }
+            if ($wrongForm) { $checkFails.Add("open check: the script's form is not on screen") }
             if ($r.open.expect) {
+                $positiveVerdict = ($openVerdict -eq 'match' -or $openVerdict -eq 'probable')
                 if ($r.open.expect_found) {
-                    if ("$($r.open.expect_where)" -eq 'input-value') {
-                        Ok "Expected text '$($r.open.expect)' found - as the VALUE of a visible input (a form field shows it; it is not a text node)."
+                    $whereNote = if ("$($r.open.expect_where)" -eq 'input-value') { "as the VALUE of a visible input - a form field shows it; it is not a text node" } else { "as visible text" }
+                    if ($wrongForm) {
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) - but the script's form is NOT what is on screen (see the open check above), so the match comes from ANOTHER form (e.g. the same string in a grid). NOT a pass - judge verify-open.png."
+                    } elseif ($positiveVerdict -and "$($r.open.expect_scope)" -eq 'form') {
+                        $pin = if ($openVerdict -eq 'probable') { " - together with the open check above this pins that form as the script's" } else { "" }
+                        Ok "Expected text '$($r.open.expect)' found ($whereNote) INSIDE the opened form's DOM subtree$pin."
+                    } elseif ($openVerdict -eq 'match') {
+                        # Caption-matched form = no element identity, so the
+                        # hit is page-wide and COULD belong to another visible
+                        # form/window. Under the strict contract an unscoped
+                        # hit is unverified, not a pass.
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but the form was matched by tab caption only, so the hit could not be scoped to it - UNVERIFIED; judge verify-open.png (or -AllowWarnings if that run must exit 0)."
+                        $checkFails.Add("expect not scopeable (form matched by caption only)")
+                    } elseif ($openVerdict -eq 'probable') {
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but could not be scoped to the circumstantially matched form (no single form element to scope to) - it does NOT verify the open; judge verify-open.png."
+                        $checkFails.Add("expect not verifiable against the circumstantially matched form")
+                    } elseif ($sNames.Count) {
+                        # The script names concrete forms but the cross-check
+                        # could not run or confirm - a page-wide hit may be the
+                        # very wrong-form false positive; never present it as
+                        # a pass.
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but the opened-form cross-check could not run or confirm (see above) - UNVERIFIED, the hit may come from another form; judge verify-open.png."
+                        $checkFails.Add("expect found but UNVERIFIED (form state unreadable)")
                     } else {
-                        Ok "Expected text '$($r.open.expect)' is visible on the opened form."
+                        # No form named in the script: nothing stronger than a
+                        # page-wide claim exists - say exactly that.
+                        Ok "Expected text '$($r.open.expect)' found ($whereNote) on the page - the opened-form identity is not cross-checkable for this script (no SHOW/DIALOG/ACTIVATE in it), confirm via verify-open.png."
                     }
                 }
-                else { Warn "Expected text '$($r.open.expect)' NOT found - neither as visible text nor as any visible input's value. Check verify-open.png (caption may differ / form may be empty)." }
+                elseif ($positiveVerdict -and $r.open.expect_found_elsewhere) {
+                    Warn "Expected text '$($r.open.expect)' is on the page but NOT inside the opened form ('$($r.open.form_matched)') - it belongs to another form/window (the same string elsewhere is the very false positive this check exists for). NOT a pass - judge verify-open.png."
+                    $checkFails.Add("expected text only OUTSIDE the opened form")
+                }
+                else {
+                    Warn "Expected text '$($r.open.expect)' NOT found - neither as visible text nor as any visible input's value. Check verify-open.png (caption may differ / form may be empty)."
+                    $checkFails.Add("expected text '$($r.open.expect)' not found")
+                }
             }
         }
     }
@@ -2443,6 +2711,7 @@ function Cmd-Verify {
             # actionability call log, which the classification below already
             # summarizes (the full text stays in the JSON on stdout).
             Warn "Click-through failed after [$($r.click.clicked -join ' > ')]: $(@($r.click.error -split "`r?`n")[0])"
+            $checkFails.Add("click-through failed")
             $seg = if ($r.click.failed_segment) { $r.click.failed_segment } else { $Click }
             switch ("$($r.click.reason)") {
                 'not_found' {
@@ -2451,6 +2720,9 @@ function Cmd-Verify {
                 'intercepted' {
                     Warn "Element '$seg' WAS found and visible, but another element intercepted every click: $($r.click.blocked_by)"
                     Warn "That is a loading overlay / sliding panel / hover popup on top - even a forced click did not land. Check verify-click.png for what was covering it; retry, or reach the target with -Do 'click:<css selector>'."
+                }
+                'not_enabled' {
+                    Warn "Element '$seg' was found and visible but stayed DISABLED - for native lsFusion controls that usually means a SERVER-side state (DISABLEIF / readonly / permissions; commonly: a value typed just before was never committed); CUSTOM/React components may also disable purely client-side."
                 }
                 'not_visible' {
                     Warn "Element '$seg' exists in the DOM but its text is not visible (icon-only navigator entry or a collapsed panel) - text-based -Click cannot hit it. Click it via -Do 'click:<css selector>' (e.g. by lsfusion-container attribute from verify-dom.html)."
@@ -2485,9 +2757,11 @@ function Cmd-Verify {
         }
         if ($r.double_click.error) {
             Warn "Double-click failed: $(@($r.double_click.error -split "`r?`n")[0])"
+            $checkFails.Add("double-click failed")
             switch ("$($r.double_click.reason)") {
                 'not_found'   { Warn "No cell with visible text '$DoubleClick' - row text is locale/data-dependent; check verify-dblclick.png for the actual grid text." }
                 'intercepted' { Warn "Row found, but clicks were intercepted by: $($r.double_click.blocked_by) - likely a loading overlay; check verify-dblclick.png and retry." }
+                'not_enabled' { Warn "Row/cell found but stayed DISABLED (for native lsFusion controls usually a server-side DISABLEIF / readonly state) - check verify-dblclick.png." }
                 'not_visible' { Warn "The matched text exists but is not visible (hidden column / virtualized row?) - check verify-dblclick.png; scroll or filter first via -Do." }
                 default       { Warn "Row found but never became clickable - check verify-dblclick.png." }
             }
@@ -2501,7 +2775,12 @@ function Cmd-Verify {
     if ($r.do -and $r.do.requested) {
         foreach ($s in $r.do.steps) {
             if ($s.ok) { Ok "do: $($s.action)$(if ($s.detail) { "  ->  $($s.detail)" })" }
-            else { Warn "do FAILED: $($s.action) - $($s.detail)" }
+            else {
+                Warn "do FAILED: $($s.action) - $($s.detail)"
+                $act = "$($s.action)"
+                if ($act.Length -gt 60) { $act = $act.Substring(0, 57) + "..." }
+                $checkFails.Add("do step failed: $act")
+            }
         }
         if ($r.do.error) { Warn "-Do chain stopped at the first failure; remaining steps were skipped." }
         if (Test-Path $r.artifacts.do_screenshot) {
@@ -2513,15 +2792,37 @@ function Cmd-Verify {
 
     if ($r.login_attempted) {
         if ($r.logged_in) { Ok "Login flow succeeded - the authenticated screenshot shows the app." }
-        else { Warn "Login was attempted but the password field is still visible - check credentials and the login screenshot." }
+        else {
+            Warn "Login was attempted but the password field is still visible - check credentials and the login screenshot."
+            $checkFails.Add("login failed")
+        }
     } else {
         Ok "No login form on the landing page - devmode auto-authenticated as '$($cfg.adminUser)', the screenshot shows the running app."
     }
 
     if ($r.console_errors -gt 0) {
+        # Diagnostics, not an assertion: console errors are reported but do
+        # not flip the exit code (apps routinely log noise there).
         Warn "Browser console reported $($r.console_errors) error(s) - see $($r.artifacts.console)."
     }
-    if ($r.error) { Bad "Playwright reported: $($r.error)" }
+    if ($r.error) {
+        Bad "Playwright reported: $($r.error)"
+        $checkFails.Add("playwright error")
+    }
+
+    # STRICT exit contract: 0 = every requested check passed; 2 = at least
+    # one check failed (or the run could not be judged). -AllowWarnings keeps
+    # the old report-only behavior (always 0 unless the tool itself dies).
+    if ($checkFails.Count) {
+        Write-Host ""
+        if ($AllowWarnings) {
+            Warn "verify: $($checkFails.Count) check(s) FAILED ($($checkFails -join '; ')) - exiting 0 because -AllowWarnings."
+        } else {
+            Bad "verify FAILED: $($checkFails -join '; ')"
+            Info "Strict exit (code 2) is the default so automation cannot mistake a failed check for a pass; pass -AllowWarnings for report-only exit 0."
+            exit 2
+        }
+    }
 }
 
 # Basic-auth headers for the /eval* endpoints. The header is attached ONLY
@@ -3466,7 +3767,12 @@ Common options:
                         visible text nodes AND the values of visible inputs
                         (a form field's content is an input VALUE, not text -
                         it used to false-negative); the report says which
-                        kind matched.
+                        kind matched. The open is cross-checked against the
+                        DOM: the report prints the form really on screen
+                        (active tab + lsfusion-form sIDs), WARNs when it is
+                        not the form the script names, and scopes the text
+                        sample to the matched form's subtree - found text on
+                        the wrong form is NOT a pass.
   -Click <text>         'verify' only: click navigator entry(ies) by visible
                         text before the final screenshot; chain with '>'
                         (e.g. -Click "Master data > Items"). Output goes to
@@ -3489,6 +3795,7 @@ Common options:
                           mouse:down[@x,y]  mouse:up[@x,y]  mouse:move@x,y[,steps]
                           fill:<sel>=><value>       type:<sel>=><value>
                           edit:<caption|sel>=><val> press:<key>  eval:<js>  wait:<ms>
+                          assert-count:<sel>=><n>   assert-text:<sel>=><substring>
                         'drag' is a raw mouse gesture (mousedown/mousemove/
                         mouseup - drag-to-draw UIs); 'dnd' speaks HTML5
                         drag-and-drop (DragEvents sharing one live
@@ -3496,18 +3803,22 @@ Common options:
                         dragstart/drop). A component understands one protocol
                         or the other - if drag: visibly does nothing on a
                         draggable UI, use dnd:.
-                        Selectors resolve to the FIRST VISIBLE match: the web
-                        client keeps whole duplicate toolbars of inactive
-                        docked tabs in the DOM, so a bare first-match click
-                        used to hang on a hidden copy - hidden matches are now
-                        skipped and reported ('3 matched, 1 visible - using
-                        the first visible'); if every match is hidden the
-                        step fails with that diagnosis. 'edit' drives the lsFusion IN-PLACE
+                        Interaction verbs resolve selectors to the FIRST
+                        VISIBLE match: the web client keeps whole duplicate
+                        toolbars of inactive docked tabs in the DOM, so a
+                        bare first-match click used to hang on a hidden
+                        copy - hidden matches are now skipped and reported
+                        ('3 matched, 1 visible - using the first visible');
+                        if every match is hidden the step fails with that
+                        diagnosis. The assert-* verbs instead consider ALL
+                        visible matches. 'edit' drives the lsFusion IN-PLACE
                         editor (fill/type can't - the <input> exists only
                         after the cell is focused): it finds the panel cell by
                         its visible caption (or any selector, e.g. a grid
                         cell), double-clicks it, selects all, types the value
-                        and presses Enter; on a caption miss it lists the
+                        and commits it - Enter for single-line editors, BLUR
+                        for multiline textarea/rich-text ones (plain Enter is
+                        a newline there); on a caption miss it lists the
                         editable panel captions of the page. 'drag' performs a
                         real mousedown -> interpolated mousemoves -> mouseup
                         gesture (drag-to-draw UIs: Gantt links, resize
@@ -3515,10 +3826,39 @@ Common options:
                         primitives (move glides in 12 interpolated steps by
                         default so busy pages still see the path); 'type'
                         presses real keys (React inputs that ignore fill);
-                        eval returns its value into the report. Chain stops at
-                        the first failed step. Screenshot goes to
-                        verify-do.png. Example:
-                          verify -Click "Schedule" -Do "edit:Comment=>Ivanov","drag:.task-a=>.task-b","click:text=Book"
+                        eval returns its value into the report. Failed
+                        click/dblclick/hover steps are CLASSIFIED (disabled
+                        the whole wait = server-side DISABLEIF, often an
+                        uncommitted value; covered by a named overlay;
+                        became hidden; disappeared) instead of a bare
+                        Timeout line. edit: commits multiline editors
+                        (textarea/rich text) by BLUR - plain Enter is a
+                        newline there. The assert-*
+                        steps are native checks: assert-count passes when
+                        EXACTLY n visible matches exist, assert-text when some
+                        visible match's text or input value contains the
+                        substring (case-insensitive); both poll up to 5 s and
+                        fail the step (and the strict verify exit) otherwise.
+                        Chain stops at the first failed step. Screenshot goes
+                        to verify-do.png. Example:
+                          verify -Click "Schedule" -Do "edit:Comment=>Ivanov","drag:.task-a=>.task-b","click:text=Book","assert-count:.task-card=>3"
+  -DoFile <path>        'verify': read -Do steps from a UTF-8 file - either a
+                        JSON array of step strings, or ONE STEP PER LINE
+                        (blank lines and # comments skipped). The robust
+                        transport when calls are nested (a nested
+                        'powershell -Command' collapses -Do array commas into
+                        one argument, gluing steps into a single garbled
+                        selector - lsfdev warns when a step looks glued).
+                        File steps run before any -Do steps.
+  -AllowWarnings        'verify': report-only mode - failed checks still
+                        print [WARN]/[FAIL] but the exit code stays 0. By
+                        DEFAULT verify is strict: any failed check (expect
+                        not found / found on the wrong form, open check
+                        mismatch, failed click/double-click/do step, login
+                        failure, playwright error) exits 2 so automation can
+                        trust the exit code. Tool-level errors (bad usage,
+                        missing python, an unusable Playwright result) exit 1
+                        either way.
   -Session              'verify' only: keep a persistent headless browser
                         (per-project CDP port) so the page - navigation, open
                         form, JS state - SURVIVES between verify calls:
@@ -3717,8 +4057,20 @@ try {
         "api"          { Cmd-Api }
         "precheck"     { Cmd-Precheck }
         "versions"     { Cmd-Versions }
-        default        { Cmd-Help }
+        "help"         { Cmd-Help }
+        default {
+            # A typo (verfiy, strat) must not read as success to automation.
+            Bad "Unknown command '$Command'."
+            Cmd-Help
+            exit 1
+        }
     }
+    # Explicit success code. Commands that fail exit nonzero themselves
+    # (throw -> catch -> 1, strict verify -> 2, dryrun verdicts -> 1);
+    # reaching this line means the command completed. Without the explicit
+    # exit an in-process caller could read a STALE $LASTEXITCODE left by an
+    # incidental native command (curl, psql, cmd) inside a successful run.
+    exit 0
 } catch {
     Bad $_.Exception.Message
     exit 1

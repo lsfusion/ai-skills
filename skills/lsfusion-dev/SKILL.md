@@ -228,8 +228,11 @@ re-download the client war at the same version — the `-SNAPSHOT`
 war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
 `-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
-`-Do` (verify: generic click/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait
-steps by Playwright selector, first visible match — see step 5), `-Session` / `-Reload` / `-EndSession`
+`-Do` (verify: generic click/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/assert-count/assert-text
+steps by Playwright selector, first visible match — see step 5), `-DoFile`
+(verify: `-Do` steps from a file — JSON array or one per line; survives
+nested quoting), `-AllowWarnings` (verify: report-only exit 0 — by default
+any failed check exits 2), `-Session` / `-Reload` / `-EndSession`
 (verify: persistent browser between calls; `-Reload` forces a page reload in
 it), `-ScriptFile`, `-Timeout`. Run the script with no command to print full
 usage.
@@ -611,6 +614,13 @@ returns one of three verdicts:
   earlier and you won't sit around when the startup actually takes 40 s.
   Default `-Timeout` is fine; raise it only if you're explicitly working
   around a long first-time schema sync (see the lightstart policy below).
+
+**Exit codes are strict**: only a confirmed healthy start exits 0 —
+**failed**, **inconclusive**, a `DATABASE MISMATCH`, and a web client that
+never answered HTTP all exit 1 (after printing their diagnostics), and the
+combined `start`/`restart` stops before Tomcat when the app server did not
+come up. Automation can trust `$LASTEXITCODE`; an unknown command name also
+exits 1.
 
 `.lsf` syntax errors surface here, in the server log. Read them carefully and
 correct the code with help from `lsfusion_retrieve_docs`.
@@ -1039,6 +1049,31 @@ checking the unit-test output.
      healthy forms), and the report says which kind matched: a plain
      "visible" for text, "as the VALUE of a visible input" for field
      content.
+   - **The open itself is cross-checked against the DOM.** The report
+     prints the form really on screen (`Active form : tab '…'; visible
+     sID(s): …`) and compares it with the form/class the script names —
+     `[OK] Open check: the script's form is on screen ('…' - sID …)` is the
+     real pass (the trailing note says which evidence matched). A
+     `[WARN] Open check:` means the `SHOW` did not take effect (or its form
+     was covered): measured false positive — an app's own
+     `onWebClientStarted` opened a dashboard over the requested card, and
+     the card's name sitting in a dashboard grid still satisfied the text
+     search. When the matched form is a concrete DOM element, the
+     `-OpenExpect` hit is additionally **scoped to that form's subtree** —
+     text sitting only on another form reports as `on the page but NOT
+     inside the opened form`. For `SHOW EDIT/LIST <Class>` the DOM carries
+     no class identity (an auto form is just `_FORM_<n>`, a caption is just
+     text), so the open check alone is only *circumstantial* (Info, not
+     OK): **pair such opens with `-OpenExpect`** — a hit inside that form
+     is what verifies it. **A found `-OpenExpect` under a WARNed open check
+     is demoted to a WARN — never treat it as a pass**, and it fails the
+     strict exit (verify exits 2 on any failed check; `-AllowWarnings` for
+     report-only exit 0); same when the cross-check itself could not run or
+     confirm while the script names a form (`UNVERIFIED`). Only when the
+     script's form is merely *named* nothing like what it shows (custom
+     edit form named unlike its class) may a WARN be over-cautious — then
+     judge `verify-open.png` (and pass `-AllowWarnings` if that run must
+     exit 0).
    - Non-ASCII script text (Cyrillic keys, localized captions) → UTF-8 file
      + `-OpenScriptFile`, exactly like `api -ScriptFile` (see the UTF-8
      pitfall in step 4).
@@ -1072,7 +1107,21 @@ checking the unit-test output.
    selector** (css, `text=...`, `button:has-text(...)`):
 
    - `click:<selector>` / `dblclick:<selector>` — e.g. `click:text=Поставить`
-     hits a React button by its caption;
+     hits a React button by its caption. Failures are **classified** like
+     `-Click`'s, never a bare `Timeout 15000ms`: *DISABLED* (for native
+     lsFusion controls that usually means a **server-side** state —
+     `DISABLEIF`/readonly, commonest real cause: a value typed just before
+     was never committed; CUSTOM/React components may also disable purely
+     client-side), *another element intercepts the pointer* (naming the
+     overlay), *became hidden*, *disappeared* — mixed retry histories
+     report the **last** observed state. **Grid-row action buttons**:
+     `click:text="▶"` hits the column **header** (the header carries the
+     caption text; the row buttons are icon-only) — scope by row instead:
+     `click:tr:has-text("<text unique to that row>") .btn`. Interaction
+     verbs take the *first visible* match, so the row text must identify
+     ONE row, and bare `.btn` is safe only when the row has exactly one
+     button — with several, use a button-specific class/attribute from
+     `verify-dom.html`;
    - `hover:<selector>` — real mouse-over (tooltips, hover-revealed handles);
    - `drag:<selector>=><selector>` — a **real mouse gesture**: `mousedown` on
      the source, intermediate `mousemove`s, `mouseup` on the target — what
@@ -1108,14 +1157,30 @@ checking the unit-test output.
      visible caption (the platform's own label→cell wiring, exact match then
      substring; any Playwright selector also works as the target — that's
      how you hit a *grid* cell), double-clicks it, selects all, types the
-     value and presses Enter. A caption miss fails fast and prints the
-     editable panel captions of the page; a cell whose double-click opens no
-     editor (read-only, action property) fails with that diagnosis instead
-     of typing into the void;
+     value and **commits with the right gesture for the editor kind**:
+     single-line editors commit on Enter, but **multiline editors (`TEXT`
+     properties → `textarea`, rich text → contenteditable) treat plain
+     Enter as a NEWLINE** — the value then never reaches the server and
+     e.g. a `DISABLEIF` on it stays on; for those `edit:` commits by
+     **blurring the editor** (measured: the reliable commit for the plain
+     `TEXT` textarea — a focus loss commits every editor kind, which is
+     also why a "sacrificial" click elsewhere works by hand).
+     A caption miss fails fast and prints the editable panel captions of
+     the page; a cell whose double-click opens no editor (read-only, action
+     property) fails with that diagnosis instead of typing into the void;
    - `press:<key>` (e.g. `Enter`), `eval:<js>` (result lands in the report),
-     `wait:<ms>`.
+     `wait:<ms>`;
+   - `assert-count:<selector>=><n>` / `assert-text:<selector>=><substring>` —
+     **native assertions**: exactly `n` visible matches / some visible
+     match's text **or input value** contains the substring
+     (case-insensitive). Both poll up to 5 s (a render lagging the previous
+     action isn't a failure), then fail the step — and with it the strict
+     `verify` exit — with a concrete diagnosis (`3 visible match(es),
+     expected 4`; the texts actually found). Prefer these over eyeballing
+     `verify-do.png` for countable/textual expectations.
 
-   `-Do` selectors resolve to the **first VISIBLE match**. The web client
+   `-Do` interaction verbs resolve selectors to the **first VISIBLE match**
+   (the `assert-*` verbs consider **all** visible matches). The web client
    keeps the full DOM of inactive docked tabs — toolbars included — so a
    selector like `button:has-text("Zapisz")` routinely matches a hidden
    duplicate first; the old first-match behavior then timed out with no
@@ -1135,7 +1200,21 @@ checking the unit-test output.
    `verify-do.png`. Non-ASCII values in `-Do` cross the same argv boundary as
    `api -Script` — when calling through bash + `powershell.exe`, put Cyrillic
    text in an `eval:` step or run the command via an in-process PowerShell
-   tool instead (see the UTF-8 pitfall in step 4).
+   tool instead (see the UTF-8 pitfall in step 4). **Steps with commas or
+   nested quoting → `-DoFile <path>`**: a UTF-8 file with a JSON array of
+   steps or ONE step per line (`#` comments allowed) — a nested
+   `powershell -Command` collapses `-Do` array commas into one argument,
+   gluing steps into a single garbled selector (lsfdev warns when a step
+   looks glued); the file transport cannot be corrupted by quoting layers.
+
+   **`verify` is strict by default: exit 0 means every requested check
+   passed.** Any failed check — `-OpenExpect` not found or found on the
+   wrong form, a WARNed open check, a failed `-Click`/`-DoubleClick`/`-Do`
+   step (assertions included), a login failure, a Playwright error — exits
+   **2**, so scripts and CI can trust `$LASTEXITCODE` instead of parsing
+   `[WARN]` lines. `-AllowWarnings` restores report-only exit 0; tool-level
+   errors (missing python, bad usage) exit 1 either way. Browser console
+   errors are reported but never flip the exit code (apps log noise there).
 
    **Iterating on a multi-step scenario? Add `-Session`.** By default every
    `verify` run starts a fresh browser and pays the navigation (and the slow
@@ -1167,10 +1246,12 @@ checking the unit-test output.
    failure-time page: `Clickable navigator captions: ...`, so pick from that
    list instead of guessing); **intercepted** (element found and visible, but
    an overlay — loading glass, sliding panel, hover popup — swallowed every
-   click; a forced click is attempted automatically and reported); or **not
-   visible** (the text exists in the DOM but is CSS-hidden, e.g. icon-only
-   navbar entries — text-based `-Click` cannot hit those, use `-Do
-   'click:<css>'` with a selector from `verify-dom.html`). Captions and row
+   click; a forced click is attempted automatically and reported);
+   **disabled** (found and visible but never enabled — for native lsFusion
+   controls usually a server-side `DISABLEIF`/readonly/permission state);
+   or **not visible** (the text exists in the DOM but is CSS-hidden, e.g.
+   icon-only navbar entries — text-based `-Click` cannot hit those, use
+   `-Do 'click:<css>'` with a selector from `verify-dom.html`). Captions and row
    text are locale/data-dependent — trust the printed caption list and
    `verify-app.png` / `verify-click.png` over any assumption about what the
    captions "should" be. `-Click`/`-DoubleClick`/`-Do` cover "did it render"

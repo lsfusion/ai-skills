@@ -133,40 +133,267 @@ def _any_visible(loc) -> bool:
 # option's label) for a case-insensitive substring match. Visibility mirrors
 # Playwright's: a real box AND not visibility:hidden (which keeps its layout
 # rect, so a rect check alone would pass hidden inputs of inactive forms).
+# The optional sid scopes the search to one form's subtree (the element with
+# that lsfusion-form attribute value) - null means the whole document.
 _INPUT_VALUE_JS = """
-(needle) => {
+([needle, sid]) => {
   const n = (needle || '').toLowerCase();
+  const roots = sid
+      ? [...document.querySelectorAll('[lsfusion-form="' + CSS.escape(sid) + '"]')]
+      : [document];
   const vis = el => { const r = el.getClientRects()[0];
                       const cs = getComputedStyle(el);
                       return !!r && r.width > 0.5 && r.height > 0.5 &&
                              cs.visibility !== 'hidden' && cs.display !== 'none'; };
-  for (const el of document.querySelectorAll('input, textarea, select')) {
-    if (!vis(el)) continue;
-    let v = '' + (el.value == null ? '' : el.value);
-    if (el.tagName === 'SELECT' && el.selectedOptions && el.selectedOptions.length)
-      v = v + ' ' + (el.selectedOptions[0].label || '');
-    if (v.toLowerCase().includes(n)) return true;
-  }
+  for (const root of roots)
+    for (const el of root.querySelectorAll('input, textarea, select')) {
+      if (!vis(el)) continue;
+      let v = '' + (el.value == null ? '' : el.value);
+      if (el.tagName === 'SELECT' && el.selectedOptions && el.selectedOptions.length)
+        v = v + ' ' + (el.selectedOptions[0].label || '');
+      if (v.toLowerCase().includes(n)) return true;
+    }
   return false;
 }
 """
 
 
+def _expect_probe(page, expect: str, sid: str = "") -> str:
+    """One-shot --open-expect sample - visible text OR a visible input's
+    value - optionally scoped to the subtree of the form whose lsfusion-form
+    attribute equals sid. Returns 'text' / 'input-value' / ''."""
+    scope = page.locator(f'[lsfusion-form="{sid}"]') if sid else page
+    try:
+        if _any_visible(scope.get_by_text(expect)):
+            return "text"
+    except PWError:
+        pass
+    try:
+        if page.evaluate(_INPUT_VALUE_JS, [expect, sid or None]):
+            return "input-value"
+    except PWError:
+        pass
+    return ""
+
+
 def _wait_expect(page, expect: str, timeout_ms: int = 45000) -> str:
-    """Wait for --open-expect text as visible text OR a visible input's
-    value. Returns 'text' / 'input-value' / '' (not found)."""
+    """Wait for --open-expect text anywhere on the page. Returns 'text' /
+    'input-value' / '' (not found). This is only the RENDER GATE - the
+    authoritative sample is re-taken after the form state is judged (and
+    scoped to the matched form), because a hit taken here can belong to a
+    state that later changed (e.g. a startup dashboard showing the text
+    before the requested form finished opening)."""
     deadline = time.time() + timeout_ms / 1000
     while True:
-        if _any_visible(page.get_by_text(expect)):
-            return "text"
-        try:
-            if page.evaluate(_INPUT_VALUE_JS, expect):
-                return "input-value"
-        except PWError:
-            pass
+        where = _expect_probe(page, expect)
+        if where:
+            return where
         if time.time() >= deadline:
             return ""
         page.wait_for_timeout(800)
+
+
+# --open-script ground truth: which form is really on screen. The --open-expect
+# text search alone proved too weak an assert - the same string sitting in any
+# grid of any form satisfied it (measured: the app's own onWebClientStarted
+# overrode the direct open, a dashboard's "Active projects" grid still showed
+# the card's name, and the run reported [OK] while the card never opened). An
+# assert that passes when the tested action did not happen is worse than no
+# assert - so the caller cross-checks the form the script names against the
+# DOM. Two pieces of the platform's own wiring make that exact:
+#   * every form layout root carries lsfusion-form="<form sID>"
+#     (GFormController.attach; sID = canonical name for named forms,
+#     _FORM_<n> for auto-generated EDIT/LIST forms);
+#   * the docked-forms strip is the .forms-container tab panel whose tab bar
+#     items are .nav-item with .active on the selected one (FlexTabBar) -
+#     tab panels INSIDE a form sit under its [lsfusion-form] root, so the
+#     strip is the one bar with no such ancestor.
+# Inactive docked forms stay in the DOM hidden, so visibility separates the
+# forms on screen from the rest; forms nested inside another form's element
+# (EMBEDDED / ContainerForm) are content of their parent, not open forms.
+_FORM_STATE_JS = """
+() => {
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+  const vis = el => { const r = el.getClientRects()[0];
+                      const cs = getComputedStyle(el);
+                      return !!r && r.width > 0.5 && r.height > 0.5 &&
+                             cs.visibility !== 'hidden' && cs.display !== 'none'; };
+  const state = {tabs: [], active_tab: null, visible_forms: [], hidden_forms: []};
+  const bar = [...document.querySelectorAll('.forms-container .tab-bar')]
+      .find(b => !b.closest('[lsfusion-form]'));
+  if (bar)
+    for (const it of bar.querySelectorAll('.nav-item')) {
+      const cap = norm(it.textContent);
+      state.tabs.push(cap);
+      if (it.classList.contains('active')) state.active_tab = cap;
+    }
+  for (const el of document.querySelectorAll('[lsfusion-form]')) {
+    if (el.parentElement && el.parentElement.closest('[lsfusion-form]')) continue;
+    const sid = el.getAttribute('lsfusion-form') || '';
+    (vis(el) ? state.visible_forms : state.hidden_forms).push(sid);
+  }
+  return state;
+}
+"""
+
+
+def _collect_form_state(page):
+    """Open-forms snapshot from the live DOM (None on any evaluation error -
+    the check must degrade to 'unknown', never kill the run)."""
+    try:
+        got = page.evaluate(_FORM_STATE_JS)
+        if isinstance(got, dict):
+            return {
+                "tabs": [str(t) for t in (got.get("tabs") or [])],
+                "active_tab": (None if got.get("active_tab") is None
+                               else str(got.get("active_tab"))),
+                "visible_forms": [str(s) for s in (got.get("visible_forms") or [])],
+                "hidden_forms": [str(s) for s in (got.get("hidden_forms") or [])],
+            }
+    except PWError:
+        pass
+    return None
+
+
+# Forms the open script says it opens/activates. Grammar-grounded
+# (LsfLogics.g mappedForm / activate / stringLiteral rules):
+# SHOW [<formId> =] <form> | SHOW (EDIT|LIST) <Class> ... | DIALOG <same> |
+# ACTIVATE FORM <form> - where <formId> is a string literal (plain or raw
+# r'...'), or a bare ID (stringLiteral admits an ID token). Strings and
+# comments (// and /* */, both in the lexer) are stripped first - in ONE
+# pass, so a quote inside a comment or a '/*' inside a string cannot desync
+# the lexing - and quoted data cannot fake a mention. (Known lexing gaps,
+# both vanishingly unlikely in short open scripts: a raw string ENDING in a
+# backslash, and the r$'...'$ special-delimiter raw form.) 'EDIT'/'LIST'
+# need trailing whitespace, so a form named EDITOR still parses as a form
+# mention; a bare-ID formId requires '=' right after it, so it never eats
+# the form name itself.
+_OPEN_MENTION_RE = re.compile(
+    r"\b(?:SHOW|DIALOG)\s+(?:(?:[rR]?'[^']*'|[A-Za-z_]\w*)\s*=\s*)?"
+    r"(?:(EDIT|LIST)\s+)?"
+    r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
+    r"|\bACTIVATE\s+FORM\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)")
+
+
+def _extract_script_forms(script: str):
+    bare = re.sub(r"'(?:\\.|[^'\\])*'|//[^\n]*|/\*.*?\*/",
+                  lambda m: "''" if m.group(0).startswith("'") else " ",
+                  script, flags=re.S)
+    out, seen = [], set()
+    for m in _OPEN_MENTION_RE.finditer(bare):
+        name = m.group(2) or m.group(3)
+        kind = "class" if m.group(1) else "form"
+        if name and (kind, name) not in seen:
+            seen.add((kind, name))
+            out.append({"name": name, "kind": kind})
+    return out
+
+
+def _name_matches_sid(name: str, sid: str) -> bool:
+    """Script mention vs a form's sID (canonical name, Namespace.name). A
+    qualified mention must equal the sID; a bare one matches the last
+    segment. Case-insensitive, deliberately NO substring matching - 'Project'
+    must not match a 'projects' dashboard; that near-miss is the very false
+    positive this check exists to catch."""
+    n, s = name.casefold(), sid.casefold()
+    if "." in n:
+        return s == n
+    return s == n or s.split(".")[-1] == n
+
+
+def _name_matches_caption(name: str, cap) -> bool:
+    """Mention vs a tab caption - exact (normalized, case-insensitive) only.
+    Captions are human text ('Проект'); an identifier matches one only when
+    the caption defaults to the name. Substring matching would resurrect the
+    wrong-form false positive."""
+    if not cap:
+        return False
+    return (" ".join(str(cap).split()).casefold()
+            == name.split(".")[-1].casefold())
+
+
+def _judge_open_form(mentions, state):
+    """Did the script's form actually end up on screen? Returns (verdict,
+    matched_name, basis, basis_sid): verdict is 'match' (a mentioned form is
+    visible / is the active tab), 'probable' (an auto form is visible for a
+    class mention - consistent but circumstantial, see below),
+    'open-inactive' (mentioned form is open but hidden behind another),
+    'not-open' (no trace of it), 'unknown' (no mentions, or no DOM state);
+    basis says which evidence produced the verdict, so the report can show
+    HOW exact a pass is; basis_sid is the concrete matched form element's
+    sID when there is one - the caller uses it to scope the --open-expect
+    sample to that form's subtree.
+
+    Evidence is ranked per mention, strongest first:
+      1. a VISIBLE sID match (hard identity from the lsfusion-form attr) ->
+         match;
+      2. a HIDDEN sID match -> open-inactive, and EVERY weaker channel is
+         skipped for this mention - including its circumstantial candidates:
+         when the mentioned form is PROVABLY open-but-hidden, neither a
+         caption coincidence on the active tab nor an unrelated visible
+         auto form may upgrade the verdict (exact identity beats
+         guesswork);
+      3. for class mentions, a visible auto form (_FORM_<n>) -> 'probable',
+         NOT 'match': auto forms open only through EDIT/LIST-style actions,
+         but which class one belongs to is not exposed in the DOM, so an
+         unrelated startup EDIT could look identical. The caller pins it by
+         scoping --open-expect into that very form's subtree; without such
+         confirmation the report presents it as circumstantial;
+      4. exact active-tab caption equality: for a BARE form mention ->
+         match (captions never carry a namespace, so a qualified form
+         mention gets no caption channel); for a CLASS mention ->
+         'probable' only - a caption cannot prove which class the form
+         serves any more than an auto-form sID can (an unrelated startup
+         form captioned like the class would look identical), but it is
+         the only trace when the class's edit form is a custom named form
+         captioned after the class. When exactly one top-level form is
+         visible, its sID scopes the --open-expect pin;
+      5. exact inactive-tab caption equality -> open-inactive;
+      6. weakest, for class mentions: a HIDDEN auto form -> open-inactive.
+         Ranked BELOW captions - an unrelated leftover auto form must not
+         suppress a healthy caption signal of a custom edit form."""
+    if not mentions or state is None:
+        return "unknown", "", "", ""
+    vis, hid = state["visible_forms"], state["hidden_forms"]
+    active = state["active_tab"]
+    inactive_tabs = [t for t in state["tabs"] if t != (active or "")]
+    verdict = "not-open"
+    probable = None
+    for m in mentions:
+        name, is_cls = m["name"], m["kind"] == "class"
+        sid_vis = next((s for s in vis if _name_matches_sid(name, s)), None)
+        if sid_vis is not None:
+            return "match", name, f"sID {sid_vis}", sid_vis
+        if any(_name_matches_sid(name, s) for s in hid):
+            verdict = "open-inactive"
+            continue
+        if is_cls and probable is None:
+            auto_vis = next((s for s in vis
+                             if s.casefold().startswith("_form_")), None)
+            if auto_vis is not None:
+                probable = (name,
+                            f"auto-generated form {auto_vis} is on screen "
+                            "(its class is not exposed in the DOM)", auto_vis)
+        by_caption = is_cls or "." not in name
+        if by_caption and _name_matches_caption(name, active):
+            if not is_cls:
+                return "match", name, f"active tab caption '{active}'", ""
+            if probable is None:
+                probable = (name,
+                            f"the active tab's caption '{active}' equals the "
+                            "class name (captions cannot prove which class "
+                            "the form serves)",
+                            vis[0] if len(vis) == 1 else "")
+            continue
+        if by_caption and any(_name_matches_caption(name, t)
+                              for t in inactive_tabs):
+            verdict = "open-inactive"
+            continue
+        if is_cls and any(s.casefold().startswith("_form_") for s in hid):
+            verdict = "open-inactive"
+    if probable is not None:
+        return "probable", probable[0], probable[1], probable[2]
+    return verdict, "", "", ""
 
 
 # edit:<caption>=><value> target lookup. The platform's own wiring makes the
@@ -257,21 +484,78 @@ def _classify_click_error(msg: str):
     """Classify a failed Playwright click from its timeout message.
 
     The message embeds the whole actionability call log, which distinguishes
-    three very different situations that used to be reported identically:
-    the text matched nothing ('not_found'), the element was found but another
-    element swallowed the pointer ('intercepted' — loading glass, sliding
-    panel, hover popup), or the element exists with its text CSS-hidden
-    ('not_visible' — e.g. an icon-only navbar entry, whose caption lives in
-    textContent but not on screen). Returns (reason, blocked_by) where
-    blocked_by is the intercepting element's printed form when known."""
+    situations that used to be reported identically: the text matched
+    nothing ('not_found'), the element was found but another element
+    swallowed the pointer ('intercepted' — loading glass, sliding panel,
+    hover popup), the element was found but stayed DISABLED
+    ('not_enabled' — for native lsFusion controls usually a SERVER-side
+    state: DISABLEIF / readonly, commonly because a just-typed value was
+    never committed; custom components may also disable client-side), or
+    the element exists with its text CSS-hidden ('not_visible' — e.g. an
+    icon-only navbar entry, whose caption lives in textContent but not on
+    screen). Returns (reason, blocked_by) where blocked_by is the
+    intercepting element's printed form when known."""
     if "locator resolved to" not in msg:
         return "not_found", ""
-    if "intercepts pointer events" in msg:
+    # Playwright appends a log line per actionability RETRY, so one log can
+    # carry SEVERAL blocker kinds over time (disabled -> covered -> ...).
+    # Classify by the LAST observed blocker - the state the wait actually
+    # died on - not by a fixed priority over the whole text.
+    last_reason, last_pos = "actionability", -1
+    for reason, marker in (("intercepted", "intercepts pointer events"),
+                           ("not_enabled", "element is not enabled"),
+                           ("not_visible", "element is not visible")):
+        pos = msg.rfind(marker)
+        if pos > last_pos:
+            last_pos = pos
+            last_reason = reason
+    if last_reason == "intercepted":
         hits = re.findall(r"-\s+(<.+>)\s+intercepts pointer events", msg)
         return "intercepted", (hits[-1] if hits else "")
-    if "element is not visible" in msg:
-        return "not_visible", ""
-    return "actionability", ""
+    return last_reason, ""
+
+
+def _describe_do_action_failure(verb: str, sel: str, err) -> str:
+    """One actionable line for a failed -Do click/dblclick/hover instead of
+    Playwright's bare 'Timeout 15000ms exceeded'. The element was already
+    resolved VISIBLE by _resolve_visible, so the interesting part is WHY it
+    never became actionable — the same classification the text-based --click
+    gets. The not-enabled case gets the lsFusion reading (reported cost of
+    its absence: two blind retries on a button that a server-side DISABLEIF
+    held disabled because the value typed before it was never committed)."""
+    msg = str(err)
+    reason, blocked_by = _classify_click_error(msg)
+    first = msg.split("\n")[0]
+    if reason == "not_enabled":
+        # "through the whole wait" only when disabled was the ONLY blocker
+        # ever logged - a mixed log (covered / hidden / unstable, then
+        # disabled, ...) must not overclaim.
+        only_disabled = ("intercepts pointer events" not in msg
+                         and "element is not visible" not in msg
+                         and "element is not stable" not in msg)
+        span = ("through the whole wait" if only_disabled
+                else "when the wait expired (earlier retries saw other states)")
+        return (f"{verb} on {sel!r}: element found and visible but DISABLED "
+                f"{span} ({first}). For native lsFusion controls that "
+                "usually means a SERVER-side state (DISABLEIF / readonly) - "
+                "typical cause: a value typed just before was never "
+                "committed (multiline editors commit on BLUR, not plain "
+                "Enter - edit: handles that), so the server still sees the "
+                "old state; CUSTOM/React components may also disable purely "
+                "client-side")
+    if reason == "intercepted":
+        return (f"{verb} on {sel!r}: element found but another element "
+                f"intercepts the pointer: {blocked_by or 'unknown overlay'} "
+                "(loading glass / sliding panel / popup on top) - retry, or "
+                "dismiss/wait the overlay out first")
+    if reason == "not_visible":
+        return (f"{verb} on {sel!r}: element became hidden while waiting "
+                f"({first}) - the page changed under the step")
+    if reason == "not_found":
+        return (f"{verb} on {sel!r}: element disappeared while waiting "
+                f"({first})")
+    return (f"{verb} on {sel!r}: element resolved but never became "
+            f"actionable ({first})")
 
 
 # Captions an agent can actually target with --click, harvested from the live
@@ -416,7 +700,11 @@ def main() -> int:
                     help="with --open-script-file: wait for this text before "
                          "the screenshot - matched as visible text OR as a "
                          "visible input's value (form fields hold text in "
-                         "the value attribute, not in a text node)")
+                         "the value attribute, not in a text node); the "
+                         "result is cross-checked against the form actually "
+                         "on screen (active tab / visible lsfusion-form "
+                         "sIDs), and when the script's form is identified "
+                         "the sample is scoped to that form's DOM subtree")
     ap.add_argument("--click", default="",
                     help="after landing, click element(s) by visible text and "
                          "screenshot the result; chain with '>' for tab-then-"
@@ -438,15 +726,25 @@ def main() -> int:
                          "the other), mouse:down|up|move@x,y[,steps], "
                          "fill:<selector>=><value>, type:<selector>=><value>, "
                          "edit:<panel caption or selector>=><value> (lsFusion "
-                         "in-place editor: dblclick the cell, type, Enter), "
-                         "press:<key>, eval:<js>, wait:<ms>. <selector> is any "
+                         "in-place editor: dblclick the cell, type, then "
+                         "commit - Enter for single-line editors, BLUR for "
+                         "multiline textarea/rich-text ones where Enter is a "
+                         "newline), "
+                         "press:<key>, eval:<js>, wait:<ms>, "
+                         "assert-count:<selector>=><n> (exactly n visible "
+                         "matches), assert-text:<selector>=><substring> "
+                         "(some visible match's text or input value contains "
+                         "it, case-insensitive; both assertions poll up to "
+                         "5 s). <selector> is any "
                          "Playwright selector (css, text=..., :has-text(...)), "
                          "which is what reaches buttons/inputs inside CUSTOM "
                          "(React) components that the text-based --click "
-                         "cannot hit; selectors resolve to the first VISIBLE "
-                         "match (hidden docked-tab duplicates are skipped and "
-                         "reported); hover/drag/dnd/click selectors accept an "
-                         "@x,y offset from the element's top-left corner")
+                         "cannot hit; interaction verbs resolve to the first "
+                         "VISIBLE match (hidden docked-tab duplicates are "
+                         "skipped and reported) while the assert-* verbs "
+                         "consider ALL visible matches; hover/drag/dnd/click "
+                         "selectors accept an @x,y offset from the element's "
+                         "top-left corner")
     ap.add_argument("--do-file", default="",
                     help="UTF-8 file with a JSON array of --do steps. The "
                          "robust transport for steps carrying quotes/spaces "
@@ -519,6 +817,17 @@ def main() -> int:
             "expect": args.open_expect.strip(),
             "expect_found": False,
             "expect_where": "",   # text | input-value
+            "expect_scope": "",   # form (scoped to the matched form) | page
+            "expect_found_elsewhere": False,  # scoped miss, but on the page
+            # DOM ground truth after the open - what is really on screen
+            "active_tab": None,   # caption of the active forms-strip tab
+            "open_tabs": [],      # all forms-strip tab captions
+            "visible_forms": [],  # sIDs of on-screen top-level [lsfusion-form]s
+            "hidden_forms": [],   # sIDs of open-but-hidden (inactive docked) forms
+            "script_forms": [],   # forms/classes the script mentions
+            "form_match": "",     # match | probable | open-inactive | not-open | unknown
+            "form_matched": "",   # the mention behind a match/probable verdict
+            "form_basis": "",     # the evidence behind the match
             "error": None,
         },
         "click": {
@@ -737,6 +1046,90 @@ def main() -> int:
                         else:
                             result["open"]["error"] = f"open flow failed: {e}"
                     result["open"]["landed_url"] = page.url
+                    # Cross-check: is the form the script names the one on
+                    # screen? (--open-expect alone is satisfiable by the same
+                    # text in any grid of any form - see _FORM_STATE_JS.)
+                    mentions = _extract_script_forms(open_script)
+                    result["open"]["script_forms"] = mentions
+                    if not result["open"]["error"]:
+                        state = _collect_form_state(page)
+                        verdict, matched, basis, basis_sid = \
+                            _judge_open_form(mentions, state)
+                        if mentions:
+                            # Poll before trusting the verdict. Bad verdicts
+                            # re-read for up to 15 s: the pending action's
+                            # form can open well after networkidle (cold form
+                            # builds; the expect wait returning early on text
+                            # that pre-existed elsewhere). A positive verdict
+                            # (match/probable) counts only when CONFIRMED by
+                            # a second snapshot >= 1.2 s later, so a startup
+                            # action that re-activates its own form right
+                            # after ours flips the verdict instead of hiding
+                            # behind an early snapshot; an unconfirmable
+                            # positive (DOM unreadable through the deadline -
+                            # transient evaluation failures just retry)
+                            # degrades to 'unknown', never silently stands.
+                            # Healthy runs pay one 1.2 s confirmation; the
+                            # screenshot below is taken after the last
+                            # snapshot either way, so the PNG shows the
+                            # state that was judged.
+                            deadline = time.time() + 15
+                            positive = ("match", "probable")
+                            streak = 1 if verdict in positive else 0
+                            confirmed = False
+                            while time.time() < deadline:
+                                page.wait_for_timeout(1200 if streak else 800)
+                                state2 = _collect_form_state(page)
+                                if state2 is None:
+                                    continue
+                                state = state2
+                                verdict, matched, basis, basis_sid = \
+                                    _judge_open_form(mentions, state2)
+                                if verdict in positive:
+                                    streak += 1
+                                    if streak >= 2:
+                                        confirmed = True
+                                        break
+                                else:
+                                    streak = 0
+                            if verdict in positive and not confirmed:
+                                verdict, matched, basis, basis_sid = \
+                                    "unknown", "", "", ""
+                        if state is not None:
+                            result["open"]["active_tab"] = state["active_tab"]
+                            result["open"]["open_tabs"] = state["tabs"]
+                            result["open"]["visible_forms"] = state["visible_forms"]
+                            result["open"]["hidden_forms"] = state["hidden_forms"]
+                        result["open"]["form_match"] = verdict
+                        result["open"]["form_matched"] = matched
+                        result["open"]["form_basis"] = basis
+                        # The AUTHORITATIVE expect sample - re-taken now that
+                        # the form state is settled and judged, because the
+                        # wait above may have returned on text that belonged
+                        # to a state that later changed. When the match names
+                        # a concrete form element, the sample is scoped to
+                        # THAT form's subtree: text visible elsewhere on the
+                        # page (another form's grid - the measured false
+                        # positive) no longer counts, and is reported
+                        # separately as found-elsewhere.
+                        if result["open"]["expect"]:
+                            scope_sid = (basis_sid
+                                         if verdict in ("match", "probable")
+                                         else "")
+                            result["open"]["expect_scope"] = \
+                                "form" if scope_sid else "page"
+                            exp = result["open"]["expect"]
+                            deadline = time.time() + (8 if scope_sid else 0)
+                            while True:
+                                where = _expect_probe(page, exp, scope_sid)
+                                if where or time.time() >= deadline:
+                                    break
+                                page.wait_for_timeout(500)
+                            result["open"]["expect_found"] = bool(where)
+                            result["open"]["expect_where"] = where
+                            if scope_sid and not where:
+                                result["open"]["expect_found_elsewhere"] = \
+                                    bool(_expect_probe(page, exp))
                     page.screenshot(path=str(open_png))
 
                 # Optional click-through: navigate to a specific form by the
@@ -949,12 +1342,19 @@ def main() -> int:
                                 kw = {"timeout": 15000}
                                 if pos:
                                     kw["position"] = pos
-                                if verb == "click":
-                                    loc.click(**kw)
-                                elif verb == "dblclick":
-                                    loc.dblclick(**kw)
-                                else:
-                                    loc.hover(**kw)
+                                try:
+                                    if verb == "click":
+                                        loc.click(**kw)
+                                    elif verb == "dblclick":
+                                        loc.dblclick(**kw)
+                                    else:
+                                        loc.hover(**kw)
+                                except (PWTimeout, PWError) as e:
+                                    # Classify instead of surfacing the bare
+                                    # first line ('Timeout 15000ms exceeded').
+                                    raise ValueError(
+                                        _describe_do_action_failure(
+                                            verb, sel, e))
                                 try:
                                     pt = _loc_point(loc, pos)
                                     if pt:
@@ -1111,7 +1511,9 @@ def main() -> int:
                                 # viewport-fragile. Recipe: find the value cell
                                 # (caption → its label's for= id, the
                                 # platform's own wiring), dblclick to open the
-                                # editor, select-all, type, Enter.
+                                # editor, select-all, type, then commit -
+                                # Enter for single-line editors, BLUR for
+                                # multiline ones (see the commit block below).
                                 if "=>" not in rest:
                                     raise ValueError(
                                         "edit needs 'edit:<caption or "
@@ -1186,12 +1588,149 @@ def main() -> int:
                                 if editor != "select":
                                     page.keyboard.press("Control+a")
                                 page.keyboard.type(value, delay=30)
-                                page.keyboard.press("Enter")
+                                # Commit. MULTILINE editors (textarea = TEXT
+                                # properties; contenteditable = rich text)
+                                # treat plain Enter as a NEWLINE - the value
+                                # then never reaches the server and e.g. a
+                                # DISABLEIF on it stays on. Their reliable
+                                # commit is BLUR (measured on a live TEXT
+                                # panel editor: Shift+Enter does NOT close
+                                # the plain textarea editor - only the
+                                # RichText editor implements the
+                                # RequestEmbeddedCellEditor Shift+Enter
+                                # chord - while a focus loss commits every
+                                # editor kind).
+                                if editor in ("textarea", "contenteditable"):
+                                    page.evaluate(
+                                        "() => { const a = document.activeElement;"
+                                        " if (a && a.blur) a.blur(); }")
+                                else:
+                                    page.keyboard.press("Enter")
                                 page.wait_for_timeout(400)
                                 prev = step["detail"]
+                                commit_note = (
+                                    " (multiline - committed by BLUR; plain "
+                                    "Enter would insert a newline)"
+                                    if editor in ("textarea", "contenteditable")
+                                    else "")
                                 step["detail"] = (
                                     (prev + "; " if prev else "")
-                                    + f"edited via <{editor}> in-place editor")
+                                    + f"edited via <{editor}> in-place editor"
+                                    + commit_note)
+                            elif verb in ("assert-count", "assert-text"):
+                                # Native in-page assertions - the -Do chain
+                                # stops on failure and verify exits strict, so
+                                # a broken expectation cannot pass silently.
+                                # assert-count:<selector>=><n> - exactly n
+                                # VISIBLE matches; assert-text:<selector>=>
+                                # <substring> - some visible match's text (or
+                                # input value) contains the substring,
+                                # case-insensitive. Both poll up to 5 s so a
+                                # render that lags the previous action does
+                                # not fail spuriously.
+                                if "=>" not in rest:
+                                    raise ValueError(
+                                        f"{verb} needs '{verb}:<selector>=>"
+                                        + ("<count>'" if verb == "assert-count"
+                                           else "<substring>'"))
+                                sel, _, want = rest.partition("=>")
+                                sel = sel.strip()
+                                if not sel:
+                                    raise ValueError(f"no selector in {verb} step")
+                                # Both assertions consider ALL visible
+                                # matches (unlike the interaction verbs'
+                                # first-visible rule). Persistent PWErrors
+                                # (bad selector, dead page) re-raise after
+                                # three strikes - same fail-fast contract as
+                                # _resolve_visible; a transient
+                                # mid-navigation evaluation failure retries.
+                                deadline_a = time.time() + 5
+                                bad = 0
+                                if verb == "assert-count":
+                                    try:
+                                        want_n = int(want.strip())
+                                    except ValueError:
+                                        raise ValueError(
+                                            "assert-count needs an integer "
+                                            f"after '=>', got {want.strip()!r}")
+                                    if want_n < 0:
+                                        raise ValueError(
+                                            "assert-count needs a count >= 0, "
+                                            f"got {want_n}")
+                                    got = None
+                                    while True:
+                                        try:
+                                            got = page.locator(sel).locator(
+                                                "visible=true").count()
+                                            bad = 0
+                                        except PWError:
+                                            bad += 1
+                                            if bad >= 3:
+                                                raise
+                                            got = None
+                                        if got == want_n or time.time() >= deadline_a:
+                                            break
+                                        page.wait_for_timeout(400)
+                                    if got != want_n:
+                                        raise ValueError(
+                                            "assert-count failed: "
+                                            f"{'unreadable' if got is None else got}"
+                                            f" visible match(es) of {sel!r}, "
+                                            f"expected {want_n}")
+                                    step["detail"] = (
+                                        f"{got} visible match(es) - as expected")
+                                else:
+                                    needle = want.strip()
+                                    if not needle:
+                                        raise ValueError(
+                                            "assert-text needs a non-empty "
+                                            "substring after '=>'")
+                                    nl = needle.casefold()
+                                    found = False
+                                    texts = []
+                                    while True:
+                                        try:
+                                            vis_loc = page.locator(sel).locator(
+                                                "visible=true")
+                                            # One round-trip each for ALL
+                                            # matches - no per-element calls,
+                                            # no match cap. Form controls
+                                            # hold text in value, not in a
+                                            # text node, so values are
+                                            # collected too.
+                                            inner = vis_loc.all_inner_texts()
+                                            vals = vis_loc.evaluate_all(
+                                                "els => els.map(e => "
+                                                "(e && e.value != null) ? "
+                                                "String(e.value) : '')")
+                                            texts = [
+                                                " ".join((t + " " + v).split())
+                                                for t, v in zip(
+                                                    inner,
+                                                    list(vals) + [""] * max(
+                                                        0, len(inner) - len(vals)))]
+                                            bad = 0
+                                        except PWError:
+                                            bad += 1
+                                            if bad >= 3:
+                                                raise
+                                            texts = []
+                                        found = any(nl in x.casefold()
+                                                    for x in texts)
+                                        if found or time.time() >= deadline_a:
+                                            break
+                                        page.wait_for_timeout(400)
+                                    if not found:
+                                        shown = ("; ".join(
+                                            repr(x[:60]) for x in texts[:3])
+                                            or "(no visible matches)")
+                                        raise ValueError(
+                                            f"assert-text failed: none of "
+                                            f"{len(texts)} visible match(es) "
+                                            f"of {sel!r} contains {needle!r}; "
+                                            f"found: {shown}")
+                                    step["detail"] = (
+                                        f"text {needle!r} present - as expected")
                             elif verb == "press":
                                 page.keyboard.press(rest.strip())
                             elif verb == "eval":
@@ -1204,7 +1743,7 @@ def main() -> int:
                                 raise ValueError(
                                     f"unknown verb {verb!r} - use click/dblclick/"
                                     "hover/drag/dnd/mouse/fill/type/edit/press/"
-                                    "eval/wait")
+                                    "eval/wait/assert-count/assert-text")
                             step["ok"] = True
                         except (PWTimeout, PWError, ValueError) as e:
                             step["detail"] = str(e).split("\n")[0]
