@@ -128,8 +128,8 @@ def _any_visible(loc) -> bool:
 
 # --open-expect fallback: text inside <input>/<textarea>/<select> is an
 # element VALUE, not a text node, so text locators never see it — a healthy
-# settings form full of inputs used to report "NOT found" on the very value
-# it displayed. Checks visible form controls' values (and the selected
+# settings form full of inputs would otherwise report "NOT found" on the very
+# value it displays. Checks visible form controls' values (and the selected
 # option's label) for a case-insensitive substring match. Visibility mirrors
 # Playwright's: a real box AND not visibility:hidden (which keeps its layout
 # rect, so a rect check alone would pass hidden inputs of inactive forms).
@@ -484,7 +484,7 @@ def _classify_click_error(msg: str):
     """Classify a failed Playwright click from its timeout message.
 
     The message embeds the whole actionability call log, which distinguishes
-    situations that used to be reported identically: the text matched
+    situations that would otherwise be reported identically: the text matched
     nothing ('not_found'), the element was found but another element
     swallowed the pointer ('intercepted' — loading glass, sliding panel,
     hover popup), the element was found but stayed DISABLED
@@ -1110,7 +1110,7 @@ def main() -> int:
                         # a concrete form element, the sample is scoped to
                         # THAT form's subtree: text visible elsewhere on the
                         # page (another form's grid - the measured false
-                        # positive) no longer counts, and is reported
+                        # positive) does not count, and is reported
                         # separately as found-elsewhere.
                         if result["open"]["expect"]:
                             scope_sid = (basis_sid

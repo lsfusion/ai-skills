@@ -158,7 +158,7 @@ function Read-SettingsString($key) {
 # shared default database ("lsfusion"). Insidious because lsfdev's own
 # readers (Get-Content) DO strip the BOM, so setup/status keep reporting the
 # right name while the JVM disagrees. Re-writing through this helper also
-# heals files damaged by earlier skill versions or BOM-adding editors.
+# heals files damaged by BOM-adding editors.
 function Write-PropertiesFile([string]$file, [string[]]$lines) {
     [IO.File]::WriteAllText($file, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
@@ -554,7 +554,8 @@ function Resolve-Version([string]$requested) {
 
 function Get-ProjectPathHash([string]$projectDir, [int]$hexChars) {
     # Deterministic per-path hex tail: same path -> same value. Seeds the
-    # derived app id (and the legacy db name, and the derived port set).
+    # derived app id (and the New-DbName fallback shape, and the derived
+    # port set).
     $md5 = [System.Security.Cryptography.MD5]::Create()
     $hashBytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($projectDir.ToLower()))
     $md5.Dispose()
@@ -574,8 +575,8 @@ function New-AppId([string]$projectDir) {
 }
 
 function New-DbName([string]$projectDir) {
-    # LEGACY per-project database name (pre-app-id skill versions). Kept only
-    # so setup can recognize auto-generated names from older installs (the
+    # Alternative auto-generated database-name shape that existing installs
+    # may carry. Kept only so setup can recognize such names (the
     # repo-committed db.name check). New setups name the database after the
     # app id instead - see New-AppId and the resolution in Cmd-Setup.
     $leaf = ((Split-Path $projectDir -Leaf).ToLower() -replace '[^a-z0-9]', '_')
@@ -596,8 +597,7 @@ function Test-ContextSafe([string]$name) {
 # is deployed as <db.name>.war and the UI lives at /<db.name>/ - no separate
 # key to keep in sync. ROOT (context /) in two cases: db.name is not a safe
 # context name (expert -DbName choices stay unrestricted), or the install
-# still has a legacy ROOT.war deployment (pre-app-context skill versions) that
-# the next setup will migrate.
+# still has a ROOT.war deployment that the next setup will migrate.
 function Get-AppContext($cfg) {
     $name = "$($cfg.dbName)"
     if (-not (Test-ContextSafe $name)) { return "ROOT" }
@@ -635,13 +635,11 @@ function Get-ZipBuildDate([string]$path) {
     } catch { return $null }
 }
 
-# Whether this platform build understands settings.dryRun: the Spring wiring
-# for it (<entry key="dryRun" .../> in the jar's root lsfusion.xml) exists
-# only in 7.0-SNAPSHOT builds since 2026-07-30 (first carrying build
-# 20260730.203938-1179, verified against the .m2 build history). On an older
-# build the -D flag is silently IGNORED and a "dry run" would come up as a
-# REAL server - against the project's actual database and ports. $null =
-# could not inspect (rely on the runtime guard then).
+# Whether this platform build understands settings.dryRun: checks the Spring
+# wiring for it (<entry key="dryRun" .../> in the jar's root lsfusion.xml).
+# On a build without it the -D flag is silently IGNORED and a "dry run"
+# would come up as a REAL server - against the project's actual database and
+# ports. $null = could not inspect (rely on the runtime guard then).
 function Test-JarSupportsDryRun([string]$jarPath) {
     if (-not ($jarPath -and (Test-Path $jarPath))) { return $null }
     try {
@@ -859,7 +857,7 @@ function Ensure-Database($cfg) {
 
 # Lightstart must never run against a database the init marker does not
 # actually certify. The marker's CONTENT is the db.name it was written for
-# (empty on legacy installs). Clear it - forcing the next start to be a full
+# (may be empty on existing installs). Clear it - forcing the next start to be a full
 # one - when the database was just found missing and (re)created (external
 # drop, wiped cluster), or when db.name now points at a different database
 # than the marker certifies. Call right after Ensure-Database. Residual gap:
@@ -877,9 +875,8 @@ function Sync-InitMarker($cfg) {
         # where PS 5.1 Get-Content would decode a BOM-less file as ANSI and
         # mangle a non-ASCII db.name into a perpetual false repoint. -cne
         # because PostgreSQL database names are case-sensitive. An EMPTY
-        # marker (legacy installs, or unreadable) is adopted as matching on
-        # purpose: it was fully trusted before content existed, and failing
-        # it would surprise every existing install with a full start.
+        # marker (or an unreadable one) is adopted as matching on purpose:
+        # failing it would surprise an existing install with a full start.
         $initializedFor = ""
         try { $initializedFor = ("" + [IO.File]::ReadAllText($marker)).Trim().TrimStart([char]0xFEFF) } catch { }
         if ($initializedFor -and ($initializedFor -cne "$($cfg.dbName)")) {
@@ -1177,8 +1174,8 @@ function Cmd-Setup {
     # the shared platform-default database ("lsfusion"), silently orphaning this
     # project's data. The file the server actually reads is conf/settings.properties
     # (Spring `file:conf/settings.properties` in lsfusion.xml) in BOTH Maven and
-    # non-Maven modes, with the project-root settings.properties as a legacy
-    # mirror. So settings.properties — NOT config.json, NOT the per-project
+    # non-Maven modes, with the project-root settings.properties as a
+    # human-readable mirror. So settings.properties — NOT config.json, NOT the per-project
     # auto-name — is the source of truth. Resolve strongest-first: an explicit
     # -DbName, else the name already persisted in settings.properties (preserved
     # VERBATIM), else whatever Pick produced (config.json cache, or the
@@ -1307,9 +1304,9 @@ function Cmd-Setup {
 
     # --- Tomcat + client war ---
     if (-not $NoWeb) {
-        # Drop any leftover war download (older skill versions kept it) - the
-        # war only needs to exist as Tomcat's ROOT.war; a second ~250 MB copy
-        # is pure waste.
+        # Drop any leftover war download - the war only needs to exist as
+        # Tomcat's deployed <app id>.war; a second ~250 MB copy is pure
+        # waste.
         Remove-Item (Join-Path $StateDir "lsfusion-client-*.war") -Force -ErrorAction SilentlyContinue
 
         $tomcatHome = Join-Path $StateDir "tomcat"
@@ -1317,7 +1314,7 @@ function Cmd-Setup {
         # The war is deployed under the app id (= db.name), so Tomcat serves
         # the UI at the /<db.name> context path. A db.name that is not a valid
         # context name (expert -DbName choices are unrestricted) falls back to
-        # the context root, i.e. the pre-app-id ROOT.war layout.
+        # the context root (deployed as ROOT.war).
         $ctxName = $cfg.dbName
         if (-not (Test-ContextSafe $ctxName)) {
             Warn "db.name '$ctxName' is not usable as a Tomcat context/war name - deploying the web client at the context root (/) instead."
@@ -1489,8 +1486,8 @@ function Cmd-Setup {
         if ($ScriptBound.ContainsKey("RmiPort")       -or $cfg.rmiPort       -ne 7652) { Apply-SettingsOverride $confSettings "rmi.port"       $cfg.rmiPort       $true | Out-Null }
         if ($ScriptBound.ContainsKey("HttpPort")      -or $cfg.httpPort      -ne 7651) { Apply-SettingsOverride $confSettings "http.port"      $cfg.httpPort      $true | Out-Null }
         if ($ScriptBound.ContainsKey("WebSocketPort") -or $cfg.webSocketPort -ne 8887) { Apply-SettingsOverride $confSettings "webSocket.port" $cfg.webSocketPort $true | Out-Null }
-        # A stale root settings.properties from an older skill run is dead weight
-        # in Maven mode (never read) and only confuses - drop it, but only if we
+        # A stale project-root settings.properties is dead weight in Maven
+        # mode (never read) and only confuses - drop it, but only if we
         # generated it (carries our marker); never touch a hand-written root file.
         $rootSettings = Join-Path $ProjectDir "settings.properties"
         if ((Test-Path $rootSettings) -and ((Get-Content $rootSettings -Raw -Encoding UTF8) -match 'generated by lsfdev\.ps1')) {
@@ -1502,7 +1499,7 @@ function Cmd-Setup {
     # Non-Maven layout. The file the server reads at RUNTIME is still
     # conf/settings.properties (Spring `file:conf/settings.properties`, relative
     # to the JVM cwd = project root); the project-root settings.properties is a
-    # human-readable MIRROR that older lsfdev versions wrote. We keep the mirror
+    # human-readable MIRROR. We keep the mirror
     # in sync here and assert the authoritative conf/ copy further below. db.name
     # was already resolved authoritatively (settings.properties first) before the
     # config was saved, so $cfg.dbName is the value to persist - written
@@ -1513,7 +1510,7 @@ function Cmd-Setup {
         # resolved db.name plus any db.* the caller passed explicitly. This is
         # what stops a plain re-setup from dropping db.name AND makes
         # `setup -DbName <x>` (without -Force) update the file too, instead of
-        # silently changing only config.json (the two used to drift apart here).
+        # silently changing only config.json (the two must never drift apart).
         Set-SettingsProperty $settings "db.name" $cfg.dbName
         if ($ScriptBound.ContainsKey("DbServer"))      { Set-SettingsProperty $settings "db.server"      $cfg.dbServer }
         if ($ScriptBound.ContainsKey("DbUser"))        { Set-SettingsProperty $settings "db.user"        $cfg.dbUser }
@@ -1638,16 +1635,13 @@ function Resolve-LaunchMode($cfg) {
 # `file:conf/settings.properties`, relative to the working dir) - exist and
 # carry the resolved db.name before EVERY launch, not only at setup: db.name
 # has no safe default (a missing key silently sends the server to the shared
-# 'lsfusion' database), and configs written by older skill versions could
-# keep the name only in config.json. Bootstrap the file from the root mirror
+# 'lsfusion' database), and the name may otherwise live only in
+# config.json. Bootstrap the file from the root mirror
 # first so its other keys (db.password etc.) survive. Idempotent when the
 # file is already right (Load-Config read the file's own value back into
 # $cfg), and the rewrite also re-encodes a BOM-damaged file that the JVM
 # would otherwise mis-parse (see Write-PropertiesFile). Shared by
-# start-server AND dryrun - the dry run's DB-adapter connect must aim at the
-# same database a real start would (finding: without this, a project whose
-# settings live only in the root mirror had its dry run silently target the
-# default DB).
+# start-server AND dryrun, so both launches read identical settings.
 function Sync-ConfSettings($cfg) {
     # settings.properties can live at the project root (scaffolded / non-Maven
     # projects) OR in conf/ (Maven projects). Only warn when neither exists.
@@ -1979,13 +1973,9 @@ function Cmd-StartServer {
 # (schema sync, RMI, Action API, WebSocket), so the run binds NO ports
 # (measured: zero LISTENING sockets) and executes safely next to a live
 # server - it never stops, restarts or otherwise touches the running
-# instance, its schema, or the init marker. DB behavior is split by build
-# (all measured): since 2026-08-03 (platform d98398f) a dry run opens NO
-# DB connection at all - no PostgreSQL needed; first-wave builds
-# (20260730.203938 .. 2026-08-02) still connected during the logic phase
-# (DBManager.initReflectionEvents), created the configured database EMPTY
-# if missing, and retried an unreachable server forever - detected and
-# killed below as a backstop (the jar gate cannot tell the builds apart).
+# instance, its schema, or the init marker. A dry run opens NO DB
+# connection at all - no PostgreSQL needed (measured: zero sockets; a
+# missing database is not created, an unreachable server is a non-event).
 function Cmd-DryRun {
     Head "Dry run (compile + check the logic - no ports, no schema sync)"
     $cfg = Get-ConfigOrFail
@@ -1997,9 +1987,9 @@ function Cmd-DryRun {
     $dryPidFile = Join-Path $StateDir "dryrun.pid"
     if (Test-Path $dryPidFile) { Stop-Tracked $dryPidFile @() "Previous dry run" }
 
-    # Same conf/settings.properties bootstrap as start-server: the dry run's
-    # DB-adapter connect (and its create-if-missing) must aim at the project's
-    # configured database, not the platform defaults.
+    # Same conf/settings.properties bootstrap as start-server, so the
+    # dry-run JVM reads exactly the settings a real start would (and a
+    # BOM-damaged file is healed the same way).
     Sync-ConfSettings $cfg
     Report-ProjectLsfFiles
     $cp = Build-ServerClasspath $cfg $mode $java ".lsfusion-dev\dryrun-classes"
@@ -2012,10 +2002,10 @@ function Cmd-DryRun {
     if ($support -eq $true) {
         Info "Platform build supports dryRun (verified in the server jar)."
     } elseif ($support -eq $false) {
-        Bad "This platform build does not know settings.dryRun - it needs a 7.0-SNAPSHOT build from 2026-07-30 on (first carrying build 20260730.203938)."
+        Bad "This platform build does not support settings.dryRun - update the platform to a current 7.0-SNAPSHOT."
         if ($mode.UseMaven) { Info "Update the Maven-resolved snapshot (mvn -U -DskipTests compile), then re-run dryrun." }
         else { Info "Refresh the downloaded jar: delete '$jarPath' and re-run setup (it refetches missing artifacts)." }
-        throw "dry run not supported by this platform build (an old build silently ignores the flag and starts for real)."
+        throw "dry run not supported by this platform build (the flag would be silently ignored and a real server would start)."
     } else {
         Warn "Could not inspect the server jar for dryRun support - relying on the runtime guard (the run is killed if it starts for real)."
     }
@@ -2084,14 +2074,12 @@ function Cmd-DryRun {
         # startup marker appears instead of letting it run.
         $log = (Read-FileText $dryOut) + "`n" + (Read-FileText $dryErr)
         if ($log -match "Server has successfully started") { $verdict = "real-start"; break }
-        # First-wave-build backstop (2026-07-30 .. 08-02; fixed by platform
-        # d98398f on 2026-08-03): those builds still connect to PostgreSQL
-        # during the logic phase, and an unreachable server puts them into
-        # an ENDLESS once-a-second retry loop (measured: 180 s of
-        # 'Connection ... refused' with zero progress; source: only
-        # SQLSTATE 08001/57P03 retry; other connect errors abort startup on
-        # their own). Diagnose in seconds, not minutes; on current builds
-        # this pattern never fires.
+        # Backstop: a platform build that DOES connect to PostgreSQL during
+        # the logic phase turns an unreachable server into an ENDLESS
+        # once-a-second retry loop (source: only SQLSTATE 08001/57P03
+        # retry; other connect errors abort startup on their own). Diagnose
+        # in seconds, not minutes; a current build opens no DB connection,
+        # so this never fires there.
         if (@([regex]::Matches($log, "ERROR StartLogger - (Connection to .* refused|The connection attempt failed)")).Count -ge 3) { $verdict = "db-unreachable"; break }
     }
     # The 2 s poll granularity can time the loop out in the same tick the
@@ -2108,13 +2096,13 @@ function Cmd-DryRun {
     $tailErr = Tail-Text (Read-FileText $dryErr) 30
     if ($verdict -eq "real-start") {
         Bad "The platform IGNORED settings.dryRun and started a REAL server - it has been killed (PID $($proc.Id))."
-        Info "This build predates dryRun (needs a 7.0-SNAPSHOT build from 2026-07-30 on, first carrying 20260730.203938). Update the platform, or validate via precheck + restart."
+        Info "This platform build does not support dryRun. Update the platform to a current 7.0-SNAPSHOT, or validate via precheck + restart."
         exit 1
     }
     if ($verdict -eq "db-unreachable") {
         Bad "PostgreSQL is unreachable - the dry-run JVM has been killed (this platform build would retry the connection forever)."
         $tailOut | Select-Object -Last 3 | ForEach-Object { Write-Host "    $_" }
-        Info "This build (2026-07-30..08-02) still connects to the DB during a dry run. Best fix: update the platform to a 2026-08-03+ 7.0-SNAPSHOT (dry runs then touch no DB at all); otherwise fix db.server in conf/settings.properties or start PostgreSQL, and re-run."
+        Info "This platform build still connects to the DB during a dry run. Best fix: update the platform to a current 7.0-SNAPSHOT (dry runs then touch no DB at all); otherwise fix db.server in conf/settings.properties or start PostgreSQL, and re-run."
         exit 1
     }
     if ($verdict -eq "timeout") {
@@ -2244,7 +2232,7 @@ function Cmd-StartWeb {
         if ($proc.HasExited) { break }
         # Readiness = a 2xx/3xx answer ONLY. An error status must keep
         # polling: a Tomcat whose WAR failed to deploy serves 404s on a
-        # perfectly bound port, and that used to read as "up".
+        # perfectly bound port, and that must not read as "up".
         $code = Get-HttpProbeStatus $webUrl
         if ($code -ge 200 -and $code -lt 400) { $up = $true; break }
     }
@@ -2368,7 +2356,7 @@ function Cmd-Status {
     if (Test-Path $TomcatPid) { [int]::TryParse((Get-Content $TomcatPid -Raw -Encoding UTF8).Trim(), [ref]$tPid) | Out-Null }
     # Positive ownership, not just "PID alive + port open": Tomcat keeps
     # running when its HTTP connector fails to bind, so a foreign listener
-    # plus our idle JVM used to read as healthy here.
+    # plus our idle JVM would otherwise read as healthy here.
     $webOwners = @(Get-PortPids $web)
     $webUrlS = Get-WebUrl $cfg
     if ((Process-Alive $tPid) -and (Test-PortOpen $web) -and (($webOwners -contains $tPid) -or -not $webOwners.Count)) {
@@ -2826,10 +2814,9 @@ function Cmd-Verify {
 }
 
 # Basic-auth headers for the /eval* endpoints. The header is attached ONLY
-# when a non-empty password is configured: devmode lets a no-header request
-# through as the anonymous user on every platform build, while Basic auth
-# with an empty password was observed rejected by at least one snapshot-era
-# build (see the fuller rationale in Cmd-Api).
+# when a non-empty password is configured: devmode auto-auth covers a
+# no-header request, while any header present triggers a real credential
+# check (see the fuller rationale in Cmd-Api).
 function Get-EvalAuthHeaders($cfg) {
     $apiUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
     $apiPass = if ($ScriptBound.ContainsKey("AdminPassword")) { $AdminPassword } else { $cfg.adminPassword }
@@ -3058,8 +3045,8 @@ function Remove-DepthStatements([string]$s, [string]$startPattern) {
 # Blanks module headers, META...END definition blocks, @-instantiation
 # statements and EXTEND FORM statements; whatever remains is the surface eval
 # genuinely compiles. Residual=$false + any construct flag => a "restart-only"
-# file (the main-file shape that used to burn a cycle: all META + EXTEND FORM,
-# where precheck could catch neither ambiguity nor a constraint error).
+# file (the typical main-file shape: all META + EXTEND FORM, where eval can
+# catch neither ambiguity nor a constraint error).
 # Deliberately conservative: nested METAs / inline @usages / DESIGN leave
 # residue, and the file then just takes the normal eval path.
 function Get-EvalCoverage([string]$structShadow) {
@@ -3302,8 +3289,9 @@ function Cmd-Precheck {
                 Warn "$leaf - brackets look unbalanced outside comments/strings ($($balanceNotes -join '; ')) - if the restart fails with a parse error, start here (META fragments can legitimately unbalance, so this alone is not a FAIL)."
             }
             if ((-not $cov.Residual) -and ($cov.HasMeta -or $cov.HasUsage -or $cov.HasExtend)) {
-                # The main-file shape that used to burn a precheck cycle: all
-                # META definitions / @-instantiations / EXTEND FORM. eval can
+                # The main-file shape that would otherwise burn a precheck
+                # cycle: all META definitions / @-instantiations / EXTEND
+                # FORM. eval can
                 # compile NONE of that, so posting it yields either a hollow
                 # PASS or a misleading compiler-crash report - say the truth
                 # upfront instead.
@@ -3454,19 +3442,16 @@ function Cmd-Api {
     # Authentication. The local dev server is ALWAYS launched in devmode (see
     # Cmd-StartServer), and devmode lets a request with NO Authorization header
     # through as the anonymous user. With an Authorization header present the
-    # server runs a real credential check instead: current builds (verified on
-    # 7.0-SNAPSHOT, 2026-06) accept Basic auth for 'admin' with an
-    # EMPTY password too, but at least one snapshot-era build was observed
-    # rejecting it with HTTP 401 - the no-header form has no such history, so
-    # we attach the header ONLY when a non-empty password is actually
-    # configured (admin password rotated, or a real account set up).
+    # server runs a real credential check instead - so we attach the header
+    # ONLY when a non-empty password is actually configured (admin password
+    # rotated, or a real account set up).
     # An explicitly-passed -AdminUser/-AdminPassword on the 'api' call
     # overrides whatever setup stored in config.json.
     $headers = Get-EvalAuthHeaders $cfg
     if ($headers.Count) {
         Info "Authenticating with Basic auth (password configured)."
     } else {
-        Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent (the form that works on every platform build)."
+        Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent."
     }
     # The script travels as a percent-encoded query parameter for small
     # payloads: EscapeDataString emits the UTF-8 bytes as %XX, which the
@@ -3512,8 +3497,8 @@ function Cmd-Api {
         if ($bytes.Length) { Write-Host ([System.Text.Encoding]::UTF8.GetString($bytes)) }
         else {
             $recipe = "APPLY; IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');"
-            # The full explanation is identical on every call, and a seeding
-            # loop of a dozen api calls used to print all 9 lines a dozen
+            # The full explanation is identical on every call - a seeding
+            # loop of a dozen api calls would print all 9 lines a dozen
             # times. Print it once per session - marker file, refreshed on
             # every empty-body call, so "session" = a cluster of api activity
             # with no 6-hour gap - then compress to the actionable core.
@@ -3696,24 +3681,18 @@ version and dies on every plugin update.
                  module (parse, metacode expansion, name resolution vs the
                  real REQUIRE graph, EXTEND FORM - everything a restart
                  checks at LOAD time) and exits before the DB sync. Binds NO
-                 ports, syncs NO schema, runs safely NEXT TO a live server
-                 (never stops or touches it). On 2026-08-03+ builds it opens
-                 NO DB connection at all (no PostgreSQL needed); first-wave
-                 builds (2026-07-30..08-02) still connected, created a
-                 missing database empty, and hung on an unreachable server -
-                 that hang is detected and reported in seconds. Covers
+                 ports, syncs NO schema, opens NO DB connection at all (no
+                 PostgreSQL needed), runs safely NEXT TO a live server
+                 (never stops or touches it). Covers
                  precheck's blind spots (missing REQUIRE, EXTEND FORM /
                  restart-only files) at the cost of a JVM boot instead of
                  milliseconds. -TopModule <M> forces logics.topModule for
                  this run only, limiting the check to the REQUIRE closure
                  (faster on many-module projects); a comma-separated list
-                 (quote it: -TopModule "A,B") works on 2026-08-03+ builds.
+                 is allowed (quote it: -TopModule "A,B").
                  Exit code 0 = logic OK, 1 = validation failed (one semantic
                  error per run, like a restart; parse errors come batched).
-                 Requires a 7.0-SNAPSHOT build from 2026-07-30 on (first
-                 carrying build 20260730.203938; older builds are refused -
-                 they'd ignore the flag and start for real). The restart is
-                 still what APPLIES the schema.
+                 The restart is still what APPLIES the schema.
   versions       List lsFusion versions on download.lsfusion.org and aliases.
 
 Common options:
@@ -3733,9 +3712,9 @@ Common options:
   -TopModule <name>     Top lsFusion module to load. For 'dryrun': forces
                         logics.topModule for that run only (-D outranks the
                         project's lsfusion.properties), limiting the check to
-                        that module's REQUIRE closure + system modules. On
-                        2026-08-03+ builds a comma-separated list is allowed
-                        (union of closures) - quote it: -TopModule "A,B".
+                        that module's REQUIRE closure + system modules. A
+                        comma-separated list is allowed (union of closures) -
+                        quote it: -TopModule "A,B".
   -RmiPort <port>       App-server RMI port (default 7652). Set per project to
                         run several servers/configs at once.
   -HttpPort <port>      App-server HTTP / Action API port (default 7651).
@@ -3765,8 +3744,8 @@ Common options:
   -OpenExpect <text>    'verify': with -OpenScript, wait for this text on the
                         opened form and report whether it appeared. Matches
                         visible text nodes AND the values of visible inputs
-                        (a form field's content is an input VALUE, not text -
-                        it used to false-negative); the report says which
+                        (a form field's content is an input VALUE, not
+                        text); the report says which
                         kind matched. The open is cross-checked against the
                         DOM: the report prints the form really on screen
                         (active tab + lsfusion-form sIDs), WARNs when it is
@@ -3805,9 +3784,9 @@ Common options:
                         draggable UI, use dnd:.
                         Interaction verbs resolve selectors to the FIRST
                         VISIBLE match: the web client keeps whole duplicate
-                        toolbars of inactive docked tabs in the DOM, so a
-                        bare first-match click used to hang on a hidden
-                        copy - hidden matches are now skipped and reported
+                        toolbars of inactive docked tabs in the DOM, and a
+                        hidden duplicate often matches first - hidden
+                        matches are skipped and reported
                         ('3 matched, 1 visible - using the first visible');
                         if every match is hidden the step fails with that
                         diagnosis. The assert-* verbs instead consider ALL
@@ -3921,8 +3900,7 @@ Common options:
 # When installed as a plugin, this script's real path carries the PLUGIN
 # VERSION (...\plugins\cache\<marketplace>\lsfusion-ai-skills\<version>\
 # skills\lsfusion-dev\scripts\lsfdev.ps1), so every plugin update kills any
-# remembered absolute path (measured: a session memory pointing at 0.1.18
-# failed after the cache moved to 0.1.20). Every run therefore maintains a
+# remembered absolute path. Every run therefore maintains a
 # tiny forwarder at a VERSION-INDEPENDENT path:
 #
 #   %LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1

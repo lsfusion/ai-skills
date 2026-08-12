@@ -105,13 +105,13 @@ structured data use `EXPORT FROM ...;` — both are detailed in "Getting
 values back" below.
 
 **Access control — `enableAPI` is the master gate; `@@api`/`@@noauth` are
-per-action overrides.** The `enableAPI` working parameter (default **`0`**
-since platform v7; **`2`** under devmode) decides who may reach the Action
+per-action overrides.** The `enableAPI` working parameter (default **`0`**;
+**`2`** under devmode) decides who may reach the Action
 API at all:
 
 - `2` — anonymous allowed (dev / sandbox only; never production)
 - `1` — **any authenticated user may call any action**
-- `0` (the v7 default) — allowed only for: `@@noauth` actions, authenticated
+- `0` (the default) — allowed only for: `@@noauth` actions, authenticated
   requests to `@@api` actions, and authenticated users who have access to the
   `System.interpreter` navigator form
 
@@ -146,8 +146,8 @@ to get wrong:
 
 | Server state | What to send | Why |
 |---|---|---|
-| **Devmode ON** (local dev install, `-Dlsfusion.server.devmode=true`) | `curl` **without `-u`** — no `Authorization` header at all | Server auto-authenticates as `admin` only when it sees **no** header. Works on every platform version. |
-| **Devmode OFF** (production, deployed via lsfusion-deploy) | `curl -u admin:` (empty password) | API requires auth; `admin:` sends Basic with empty password, server validates and accepts. `admin` reaches `/eval/action` even at the v7 default `enableAPI=0` because it has `System.interpreter` access — a **non-admin** user would be refused there (see access control above). |
+| **Devmode ON** (local dev install, `-Dlsfusion.server.devmode=true`) | `curl` **without `-u`** — no `Authorization` header at all | Server auto-authenticates as `admin` only when it sees **no** header. |
+| **Devmode OFF** (production, deployed via lsfusion-deploy) | `curl -u admin:` (empty password) | API requires auth; `admin:` sends Basic with empty password, server validates and accepts. `admin` reaches `/eval/action` even at the default `enableAPI=0` because it has `System.interpreter` access — a **non-admin** user would be refused there (see access control above). |
 | **Admin password rotated** | `curl -u admin:<real password>` | Self-explanatory |
 
 **The trap:** "no header" ≠ "header with empty password". `curl` without
@@ -156,17 +156,15 @@ Devmode-auto-auth fires **only** when the server sees no header; with a
 header present the server runs a real credential check on what you sent.
 `-u admin:<wrong-guess>` therefore returns `HTTP 401` even in devmode —
 don't try `-u admin:fusion` or `-u admin:admin` "just in case". An
-**empty-password** Basic (`-u admin:`) is accepted by current builds (200
-verified on 7.0-SNAPSHOT, 2026-06; the empty password matches
-the default admin account), though at least one snapshot-era build has been
-observed rejecting it with 401. The no-header form has no such history —
-make it your default for devmode, and fall back to a real password only if
-the user supplies one.
+**empty-password** Basic (`-u admin:`) is accepted (verified 200 on
+7.0-SNAPSHOT; the empty password matches the default admin account) —
+but make the no-header form your default for devmode, and fall back to a
+real password only if the user supplies one.
 
 ### Production security: never raise `enableAPI` to reach `/eval/action`
 
 `/eval/action` runs **arbitrary** lsFusion code. The platform's hardening
-default is `enableAPI=0` (since v7), under which the endpoint is reachable
+default is `enableAPI=0`, under which the endpoint is reachable
 only by `System.interpreter`-privileged users (e.g. `admin`) — that is the
 state you want in production. If a non-admin's `/eval/action` call is being
 refused, the fix is **not** to set `enableAPI=1`: that flips on arbitrary
@@ -189,7 +187,7 @@ corrupted, because it is **not the HTTP transport**: with the server JVM on
 a UTF-8 default encoding (lsfusion-dev always passes
 `-Dfile.encoding=UTF-8`; the lsfusion-deploy skill's locale preflight
 ensures it on servers), Cyrillic survives POST bodies and query strings
-alike — verified **byte-for-byte on 7.0-SNAPSHOT** (2026-06),
+alike — verified **byte-for-byte on 7.0-SNAPSHOT**,
 on the app-server port and the web port. The corruptions that do happen are
 **client-side, on Windows**:
 
@@ -365,19 +363,16 @@ catches the typos first, cheaply. (For comparison, measured on
 that reports a single name error.)
 
 **Full-fidelity alternative on a local dev box: `lsfdev.ps1 dryrun`**
-(lsfusion-dev skill; 7.0-SNAPSHOT builds since 2026-07-30,
-`20260730.203938` on). It launches
+(lsfusion-dev skill). It launches
 the server JVM with `-Dsettings.dryRun=true`, which loads and checks the
 **whole project** exactly as a restart would — real `REQUIRE` graph
 (missing-REQUIRE caught), `EXTEND FORM`, META instantiation, the entire
 restart-only class — then exits before the DB sync: no ports bound, the
-running server untouched, ~9 s of JVM on a 772-module project
-(`-TopModule` narrows the scope further; comma-separated list on
-2026-08-03+ builds). It needs the sources and the platform jar locally
-— on 2026-08-03+ builds **no PostgreSQL at all** (older first-wave
-builds still connected to it) — so for a **remote** server eval stays
-the only lint; use eval per-edit (milliseconds), `dryrun` as the
-pre-restart gate.
+running server untouched, **no PostgreSQL at all**, ~9 s of JVM on a
+772-module project (`-TopModule` narrows the scope further;
+comma-separated list allowed). It needs the sources and the platform jar
+locally, so for a **remote** server eval stays the only lint; use eval
+per-edit (milliseconds), `dryrun` as the pre-restart gate.
 
 ### Getting values back
 
@@ -444,7 +439,7 @@ comes back in the body instead of an ambiguous empty 200.
 
 ### Common recipes
 
-Each answers in the response body (verified live on 7.0-SNAPSHOT, 2026-06).
+Each answers in the response body (verified live on 7.0-SNAPSHOT).
 Any scalar `EXPORT` form can be shortened to `RETURN <the same expr>;`.
 
 ```lsf
@@ -593,11 +588,7 @@ section in Part 1 if anything is unclear.
 The API is part of the platform's **`ClasspathFileTools`** server (the stack
 trace on a `400`-shaped error mentions
 `lsfusion.server.physics.admin.files.ClasspathFileTools`) and is bundled
-with the standard package on platform builds from **mid-2026 onwards**
-(7.0-SNAPSHOT released 2026-05-26 was the first build to ship it locally
-on this skill's test host). On older builds `POST /files/list` returns
-`HTTP 405` because the path isn't mapped — that's the signal to upgrade
-the platform via the lsfusion-deploy skill.
+with the standard package.
 
 ### Paths in the classpath
 

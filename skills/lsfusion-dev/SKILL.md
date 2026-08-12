@@ -75,9 +75,8 @@ only that path in session memories / notes**. The reason: when the skill is
 installed as a **plugin** (the usual case), the real script lives under the
 plugin cache at
 `C:\Users\<user>\.claude\plugins\cache\lsfusion\lsfusion-ai-skills\<ver>\skills\lsfusion-dev\scripts\lsfdev.ps1`
-— a path that **embeds the plugin version and dies on every plugin update**
-(measured: a remembered `…\0.1.18\…` path failed with "does not exist" after
-the cache moved to `0.1.20`). A remembered stable path never rots this way.
+— a path that **embeds the plugin version and dies on every plugin update**.
+A remembered stable path never rots this way.
 
 **First call on a fresh machine (no shim yet): resolve the real script path —
 it is often not `.claude/skills/…`.** The relative path above holds only for
@@ -216,7 +215,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
-| `dryrun` | **Full-fidelity validation of the whole project without starting it** (7.0-SNAPSHOT builds since 2026-07-30, first carrying build `20260730.203938`; older builds are refused — the command inspects the jar). Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets) and never touches the running server, so it validates safely **next to a live instance**. On builds since **2026-08-03** it opens **no DB connection at all** — no PostgreSQL needed; the first-wave builds (2026-07-30…08-02) still connected and created a missing DB, and an unreachable server hung them (the command diagnoses that in seconds). `-TopModule <M>` (comma-separated list allowed on 2026-08-03+ builds — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
+| `dryrun` | **Full-fidelity validation of the whole project without starting it.** Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets), opens **no DB connection at all** — no PostgreSQL needed — and never touches the running server, so it validates safely **next to a live instance**. `-TopModule <M>` (comma-separated list allowed — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
@@ -482,8 +481,7 @@ alias resolves within the 7.x line. **Default to `-Version 7`** — the latest
 available (currently `7.0-SNAPSHOT`) and rolls forward to the 7.0 stable
 release once it ships. Pick it when the user gives no version cue: 7.x
 carries the newest platform behaviour the skill is tuned for (for instance,
-headless `verify` relies on 7.0's automatic tooltip suppression instead of a
-workaround).
+headless `verify` relies on 7.0's automatic tooltip suppression).
 
 Because the latest 7.x is a SNAPSHOT today, **mention once** to the user that
 SNAPSHOT builds can change daily, sometimes break, and may not be available
@@ -494,9 +492,9 @@ Switch off the default **only** when the user clearly asks for it — e.g.
 "stable", a specific 7.x tag (like `7.0-SNAPSHOT`), or when the project
 itself pins a version (its `pom.xml` parent declares a specific version, or
 its README requires it). In that case pass `-Version <alias-or-tag>`. If the
-cue is ambiguous, **ask** rather than guessing. If a project pins a pre-7
-platform, surface that to the user before setup instead of proceeding: the
-skill's recipes assume 7.x, and older platforms are out of its scope.
+cue is ambiguous, **ask** rather than guessing. If the pinned version is
+outside the 7.x line, surface that to the user before setup — the skill
+targets 7.x.
 
 Which exact version each alias resolves to is **not stable** — it depends on
 what the download server currently publishes. Always run `lsfdev.ps1 versions`
@@ -659,7 +657,7 @@ db.name"*). `status` shows the same at a glance as `Database: <name>
 language** — the server JVM inherits the OS locale **silently** (verified
 on a pl-PL host: Polish web UI, Polish log dates, Polish system captions;
 the script-compiler `[error]` texts stay English, so errors give no hint).
-`setup`, `check` and every server start now print a warning with the fix
+`setup`, `check` and every server start print a warning with the fix
 when the host locale is non-English and the JVMs don't pin one. The
 resolution chain, strongest first:
 
@@ -817,10 +815,7 @@ raw-curl form for remote servers.
 
 **Between `precheck` and the restart sits `dryrun` — the full project
 check without starting anything.** It launches the server JVM with
-`-Dsettings.dryRun=true` (7.0-SNAPSHOT builds since 2026-07-30, first
-carrying build `20260730.203938` — the command inspects the jar and
-refuses older ones, where the flag would be silently ignored and the
-run would come up as a real server): the whole logic —
+`-Dsettings.dryRun=true`: the whole logic —
 modules, classes, properties, actions, forms — is parsed,
 metacode-expanded, name-resolved and finalized exactly as at a restart,
 then the JVM exits **before the DB sync** instead of starting services.
@@ -855,22 +850,15 @@ What makes it different from a restart (all measured):
 - **~3–4× cheaper on the JVM phase and DB-independent in outcome**:
   772-module project ≈ 9 s of JVM (a restart's full cycle is 26–41 s+
   and holds the DB while it runs).
-- **No PostgreSQL needed — on current builds.** Since the 2026-08-03
-  builds a dry run opens **no DB connection at all** (measured: zero
-  sockets; an unreachable server and a missing database are both
-  non-events). The first-wave builds (2026-07-30…08-02) still connected
-  during the logic phase, **created the configured database (empty)
-  when missing**, and retried an unreachable server forever — the
-  command detects that pattern and reports `PostgreSQL is unreachable`
-  in seconds; the cure is updating the platform (or fixing
-  `db.server`), not raising the timeout.
+- **No PostgreSQL needed.** A dry run opens **no DB connection at all**
+  (measured: zero sockets; an unreachable server and a missing database
+  are both non-events).
 
 **`-TopModule <M>` limits the checked scope to M's `REQUIRE` closure**
 (plus system modules) by forcing `logics.topModule` for that run only —
-the project's `lsfusion.properties` is not touched. On 2026-08-03+
-builds the value may be a **comma-separated list** (`-TopModule
-"Sales,Purchase"` — quote it so PowerShell passes one string); the
-union of the closures is checked. On the measured 772-module project
+the project's `lsfusion.properties` is not touched. The value may be a
+**comma-separated list** (`-TopModule "Sales,Purchase"` — quote it so
+PowerShell passes one string); the union of the closures is checked. On the measured 772-module project
 the closure of a leaf module was 11 modules and the JVM phase dropped
 from ~9 s to ~4 s. Two hard caveats, both measured: modules **outside
 the closure are not checked at all** (not even parsed), and
@@ -890,9 +878,8 @@ right before a restart** (a failed restart costs 26–41 s *and* downtime;
 a failed dryrun costs ~10–40 s and nothing else); for **restart-only
 files** (`EXTEND FORM` / all-META modules) where precheck proves
 nothing; to catch a **missing `REQUIRE`** precheck structurally cannot;
-and for CI-style "does this branch even load" checks — on 2026-08-03+
-builds that box needs **no PostgreSQL at all** (first-wave builds
-needed a reachable one).
+and for CI-style "does this branch even load" checks — that box needs
+**no PostgreSQL at all**.
 
 **Web resources (JS / CSS / images) need NO restart in devmode — any page
 load picks them up; browser cache is NOT a factor.** Files under
@@ -1045,8 +1032,7 @@ checking the unit-test output.
      reports found / not-found — that's your assertion; without it you just
      get the screenshot. It matches **visible text nodes AND the values of
      visible inputs** (a form field's content is an input `value`, not a
-     text node — the value-only case used to false-negative on perfectly
-     healthy forms), and the report says which kind matched: a plain
+     text node), and the report says which kind matched: a plain
      "visible" for text, "as the VALUE of a visible input" for field
      content.
    - **The open itself is cross-checked against the DOM.** The report
@@ -1183,13 +1169,12 @@ checking the unit-test output.
    (the `assert-*` verbs consider **all** visible matches). The web client
    keeps the full DOM of inactive docked tabs — toolbars included — so a
    selector like `button:has-text("Zapisz")` routinely matches a hidden
-   duplicate first; the old first-match behavior then timed out with no
-   hint. Hidden matches are now skipped automatically and reported in the
-   step result (`2 matched, 1 visible - using the first visible`); when
-   **every** match is hidden the step fails with exactly that diagnosis
+   duplicate first. Hidden matches are skipped automatically and reported
+   in the step result (`2 matched, 1 visible - using the first visible`);
+   when **every** match is hidden the step fails with exactly that diagnosis
    (scope the selector or close the other tabs), and a selector that can't
-   be parsed fails fast with Playwright's own parse error. You no longer
-   need to append `:visible` by hand, though it remains valid.
+   be parsed fails fast with Playwright's own parse error. Appending
+   `:visible` by hand is unnecessary, though it remains valid.
 
    ```
    lsfdev.ps1 verify -Click "Расписание" -Do "edit:Комментарий=>Иванов", "drag:.gantt-task-a=>.gantt-task-b", "click:button:has-text('Поставить')"

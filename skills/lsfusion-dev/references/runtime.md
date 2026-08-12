@@ -146,8 +146,8 @@ carries no `Authorization` header at all** — a request with a header gets a
 real credential check (a wrong password is **HTTP 401** even in devmode).
 That is why the `api` command sends **no** header unless a non-empty admin
 password is configured (`-AdminPassword` at setup, or stored in
-`config.json`). Full rule table and build history: the **lsfusion-eval**
-skill's auth section.
+`config.json`). Full rule table: the **lsfusion-eval** skill's auth
+section.
 
 The three `-Ddb.denyDrop{Modules,Tables,Properties}=false` flags let the
 schema sync remove modules, tables, and columns that disappear between
@@ -185,9 +185,8 @@ lightstart skips the Reflection sync those lookups read from; see
 `org.apache.catalina.startup.Bootstrap` directly (so the skill owns the PID).
 The war is deployed as `webapps/<app id>.war` — the app id being `db.name` —
 so the UI is at `http://localhost:8080/<app id>/`; the root `/` serves a
-one-line redirect there (projects set up by pre-app-id skill versions keep
-`ROOT.war` at `/` until the next `setup`, which renames the war in place — no
-re-download; a `db.name` that is not context-safe also stays at `/`). The
+one-line redirect there (a `db.name` that is not context-safe stays at `/`
+instead). The
 web client connects to the application server over RMI on `localhost:7652` by
 default — no extra configuration is needed when everything runs locally with
 default ports.
@@ -243,7 +242,7 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | `Connection refused` / `could not connect` to the DB | PostgreSQL is down. Start the PostgreSQL service, re-run `start-server`. |
 | `password authentication failed` | Wrong `db.password`. Re-run `setup -DbPassword <correct> -Force`, or edit `settings.properties`. |
 | `database "..." does not exist` and it is not auto-created | Create the database named by `db.name` in `settings.properties`: `createdb -U postgres <db.name>` (or via pgAdmin), then `restart`. |
-| Server silently ignores `db.name` (or another first-line key) and uses the shared default DB `lsfusion`, although `settings.properties` names another | A **UTF-8 BOM** at the start of `conf/settings.properties` — Java's properties loader does not strip it, so the first key reads as `﻿db.name`. Written by BOM-adding editors and by pre-2026-07 skill versions (PowerShell `Set-Content -Encoding UTF8`); lsfdev's own readers strip the BOM, so old `setup`/`status` still reported the intended name. Current skill versions triple-guard this: properties are written BOM-less (re-running `setup` — or any `start` — heals the file), `-Ddb.name` on the launch line outranks the file anyway, and after start the skill verifies the real binding via `pg_stat_activity` (`DATABASE MISMATCH` if not). If you hit this on an old install: the server may have been creating its schema in `lsfusion` all along — decide consciously whether to keep pointing there (`setup -DbName lsfusion`) or re-sync into the intended DB. |
+| Server silently ignores `db.name` (or another first-line key) and uses the shared default DB `lsfusion`, although `settings.properties` names another | A **UTF-8 BOM** at the start of `conf/settings.properties` — Java's properties loader does not strip it, so the first key reads as `﻿db.name`. Written by BOM-adding editors (e.g. PowerShell `Set-Content -Encoding UTF8`). lsfdev triple-guards this: properties are written BOM-less (re-running `setup` — or any `start` — heals the file), `-Ddb.name` on the launch line outranks the file anyway, and after start the skill verifies the real binding via `pg_stat_activity` (`DATABASE MISMATCH` if not). If you hit this: the server may have been creating its schema in `lsfusion` all along — decide consciously whether to keep pointing there (`setup -DbName lsfusion`) or re-sync into the intended DB. |
 | `pg_hba.conf` / authentication method rejected | PostgreSQL must allow `md5`/`scram`/`trust` for the user. Edit `pg_hba.conf` and reload PostgreSQL. |
 | `error parsing`, `syntax error`, `expecting ...` | An `.lsf` syntax error. Read the file/line in the message, fix it with `lsfusion_retrieve_docs`, then `restart`. |
 | `module ... not found` | A `REQUIRE`d module name is wrong or missing. Check module names. |
@@ -255,7 +254,7 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | Scheduler task saved with an **empty action**; `actionCanonicalName('My.action[]')` returns NULL for an action that exists in code | Lightstart skipped the Reflection sync, so actions added since the last full start have no `Reflection.Action` row — the lookup silently returns NULL. Run **one** `restart -FullStart`, then re-create/re-pick the action (see [Lightstart](#lightstart)). |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
-| `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong (or, on some snapshot-era builds, empty) credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
+| `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
 
 ## Changing the lsFusion version
 
@@ -352,10 +351,9 @@ lightstart skips (table-view layout, security-policy reload).
 
 ## Dry run {#dryrun}
 
-Platform mechanics behind `lsfdev.ps1 dryrun` (setting `settings.dryRun`,
-in 7.0-SNAPSHOT since build `7.0-20260730.203938-1179`; the platform docs
-list it under Working parameters). All facts below are measured on
-2026-07-31 builds unless marked as source-derived.
+Platform mechanics behind `lsfdev.ps1 dryrun` (setting `settings.dryRun`;
+the platform docs list it under Working parameters). All facts below are
+measured unless marked as source-derived.
 
 **Lifecycle cutoff.** Server startup fires lifecycle listeners in a fixed
 order: `BusinessLogics` (order 100, the whole logical model — parse,
@@ -377,57 +375,23 @@ with no port juggling; no schema sync, no Reflection sync, no init-marker
 implications; a 772-module project completes the JVM phase in ~9 s where
 its restart takes 26–41 s+.
 
-**DB connection under dryRun — fixed on 2026-08-03; two behavior
-generations exist.** The jar gate cannot tell them apart (`lsfusion.xml`
-is identical), so know both:
-
-- **First-wave builds (`20260730.203938` … 2026-08-02)** did open 2
-  PostgreSQL connections during the *logic* phase: the
-  `DBManager.initReflectionEvents()` init task (the `Initializing
-  reflection events` log line) runs before the lifecycle cutoff and
-  called `ensureDB`, which **created a missing database** (empty —
-  0 tables) and, on an unreachable server, **retried forever** ~1/s
-  (`ERROR StartLogger - Connection to <host> refused`, no exit — dead
-  exit-code for CI). Source-derived scope of the retry: only SQLSTATE
-  08001 / 57P03 (`Connection to X refused`, `The connection attempt
-  failed`); other connect errors (a genuinely rejected password) are
-  thrown immediately and surface via the exit-code /
-  missing-success-marker path. On a dev box whose pg_hba trusts
-  localhost, a wrong `db.password` is invisible (measured).
-- **Builds since 2026-08-03** (platform commit `d98398f`, *Skip
-  DBManager.initReflectionEvents under dryRun*): the task returns early
-  — measured on the 2026-08-03 download build: an unreachable
-  PostgreSQL **passes** in ~5 s, the dry-run JVM opens **zero sockets
-  of any kind**, and a missing database is **NOT created**. "Validate
-  without a live database" now holds literally — no DBMS needed. (The
-  skip also means DB-stored user property overrides —
-  logging/materialized/notnull — are absent from the dry-run model;
-  irrelevant for load-time validation.)
-
-`lsfdev.ps1 dryrun` keeps its unreachable-DB watcher as a backstop for
-first-wave builds: on them it kills the JVM with a `PostgreSQL is
-unreachable` verdict in ~10 s instead of hanging to the timeout; on
-current builds the pattern simply never fires.
-
-**Version gate.** The Spring wiring for the setting (`<entry
-key="dryRun" .../>` in the jar's root `lsfusion.xml`) exists only in
-7.0-SNAPSHOT builds from `20260730.203938` on. On any older build the
-`-Dsettings.dryRun=true` flag is **silently ignored** and the "dry run"
-boots a REAL server — against the project's actual database and ports.
-`lsfdev.ps1 dryrun` therefore (1) inspects the server jar's
-`lsfusion.xml` up front and refuses unsupported builds, and (2) as a
-backstop for uninspectable jars, kills the JVM the moment
-`Server has successfully started` appears in the log.
+**No DB connection under dryRun (measured).** The DB-touching init tasks
+(e.g. `DBManager.initReflectionEvents()`) return early under `dryRun`: the
+dry-run JVM opens **zero sockets of any kind**, a missing database is
+**not created**, and an unreachable PostgreSQL is a non-event — "validate
+without a live database" holds literally, no DBMS needed. (The skip also
+means DB-stored user property overrides — logging/materialized/notnull —
+are absent from the dry-run model; irrelevant for load-time validation.)
 
 **Scope and `topModule` (measured).** Module scope is the `REQUIRE`
 closure of `logics.topModule` (plus system modules) — same as a real
 start. `dryrun -TopModule <M>` overrides it per-run via
 `-Dlogics.topModule` (a `-D` outranks the project's
-`lsfusion.properties`). Since the 2026-08-03 builds (platform commit
-`68ce253`) the value may be a **comma-separated list** — the union of
-the closures is loaded; quote it (`-TopModule "Sales,Purchase"`) so
-PowerShell passes one string (measured: an unknown name anywhere in the
-list fails with `Module 'X' not found`). Everything outside the closure
+`lsfusion.properties`). The value may be a **comma-separated list** —
+the union of the closures is loaded; quote it (`-TopModule
+"Sales,Purchase"`) so PowerShell passes one string (measured: an unknown
+name anywhere in the list fails with `Module 'X' not found`). Everything
+outside the closure
 is dropped **before parsing** — a module outside the closure contributes
 nothing, not even syntax errors — and dependents of the listed modules
 are not loaded either.
