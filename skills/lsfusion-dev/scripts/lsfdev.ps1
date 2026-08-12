@@ -3463,6 +3463,11 @@ function Cmd-Api {
     $useBody = ($enc.Length -gt 60000)
     $uri = if ($useBody) { "http://localhost:$($cfg.httpPort)/eval/action" }
            else { "http://localhost:$($cfg.httpPort)/eval/action?script=$enc" }
+    # HTTP wait: an explicitly passed -Timeout bounds the HTTP call too -
+    # long-running actions (migrations, recalculations) legitimately hold
+    # the line open for minutes. Without it the defaults stay short so a
+    # wedged server fails fast: 30 s (query form) / 60 s (body form).
+    $httpTimeout = if ($ScriptBound.ContainsKey("Timeout")) { [int]$Timeout } elseif ($useBody) { 60 } else { 30 }
     # Do NOT echo the encoded URI: EscapeDataString turns every non-ASCII char
     # into %XX%XX (a Cyrillic seed script inflates ~9x into kilobytes of %D0..
     # noise in the transcript). Print the endpoint, the source, and a short
@@ -3485,10 +3490,10 @@ function Cmd-Api {
         if ($useBody) {
             $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
                 -ContentType "application/x-www-form-urlencoded; charset=UTF-8" `
-                -Body ([Text.Encoding]::UTF8.GetBytes("script=$enc")) -UseBasicParsing -TimeoutSec 60
+                -Body ([Text.Encoding]::UTF8.GetBytes("script=$enc")) -UseBasicParsing -TimeoutSec $httpTimeout
         } else {
             $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
-                -UseBasicParsing -TimeoutSec 30
+                -UseBasicParsing -TimeoutSec $httpTimeout
         }
         Ok "HTTP $($resp.StatusCode)"
         # Decode the response body explicitly as UTF-8 so non-ASCII output
@@ -3522,15 +3527,29 @@ function Cmd-Api {
             New-Item -ItemType File -Force -Path $hintMarker | Out-Null
         }
     } catch {
-        $errResp = $_.Exception.Response
-        $statusTag = ""
-        if ($errResp) { try { $statusTag = " (HTTP $([int]$errResp.StatusCode))" } catch { } }
-        Bad "API call failed$($statusTag): $($_.Exception.Message)"
-        # The 500 body carries the actual parse/type error from the server -
-        # the whole diagnosis.
-        $errBody = Get-ErrorResponseBody $_
-        if ($errBody) { Write-Host $errBody }
-        else { Info "(the server sent no error body)" }
+        # Classify a CLIENT-side timeout first, via WebExceptionStatus (the
+        # exception MESSAGE is localized - never match its text). A timeout
+        # here is NOT a server verdict: /eval/action does not cancel the
+        # action when the client goes away, so it keeps running server-side
+        # and may yet finish and APPLY - the nastiest misread is a "failed"
+        # call that actually committed and then gets blindly re-run.
+        $webEx = $_.Exception
+        while ($webEx -and -not ($webEx -is [System.Net.WebException])) { $webEx = $webEx.InnerException }
+        if ($webEx -and $webEx.Status -eq [System.Net.WebExceptionStatus]::Timeout) {
+            Bad "No HTTP response within $httpTimeout s - the CLIENT gave up waiting; this says nothing about the server."
+            Warn "The action is likely STILL RUNNING and may yet finish and APPLY its changes. Do not treat this as failure, do not restart the server, and do NOT re-run a mutation script unchecked - it could apply twice."
+            Info "Check first: 'lsfdev.ps1 log' until the action finishes, then re-read state with a read-only api call (RETURN/EXPORT). For long actions pass -Timeout <seconds> (bounds this HTTP wait); raise the outer tool-call timeout to match."
+        } else {
+            $errResp = $_.Exception.Response
+            $statusTag = ""
+            if ($errResp) { try { $statusTag = " (HTTP $([int]$errResp.StatusCode))" } catch { } }
+            Bad "API call failed$($statusTag): $($_.Exception.Message)"
+            # The 500 body carries the actual parse/type error from the server -
+            # the whole diagnosis.
+            $errBody = Get-ErrorResponseBody $_
+            if ($errBody) { Write-Host $errBody }
+            else { Info "(the server sent no error body)" }
+        }
     }
 
     # Surface MESSAGE ... NOWAIT output ("Server message: ..." log lines)
@@ -3658,6 +3677,11 @@ version and dies on every plugin update.
   api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
                  Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
                  ACTION code only - to lint declarations use precheck.
+                 Long-running action? Pass -Timeout <s> - it bounds the HTTP
+                 wait (default 30 s; 60 s when a large script is sent as a
+                 POST body). A client timeout is NOT a server verdict: the
+                 action keeps running and may still apply - check 'log' /
+                 re-read state, never blindly re-run.
   precheck       Sub-second syntax + name check of .lsf files against the
                  RUNNING dev server, before paying for a restart (which
                  reports name errors one at a time). -Files 'a.lsf','b.lsf'
@@ -3722,7 +3746,8 @@ Common options:
                         when running several servers - it is always bound.
   -WebPort <port>       Tomcat HTTP port (default 8080).
   -ShutdownPort <port>  Tomcat shutdown port (default 8005).
-  -Timeout <seconds>    Startup wait (default 180).
+  -Timeout <seconds>    Startup wait (default 180). For 'api' an explicit
+                        value also bounds the HTTP wait (see 'api' above).
   -JvmArgs "<args>"     Extra app-server JVM args, persisted at setup
                         (e.g. -JvmArgs "-Duser.language=ru -Xmx4g"; appended
                         after defaults, so a user -Xmx wins).

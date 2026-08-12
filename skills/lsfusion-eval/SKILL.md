@@ -237,6 +237,15 @@ Always pass `-w '\nHTTP %{http_code}\n'` in introspection calls — the response
 body is often empty (see "Reading the response" below), so the status code is
 your real signal.
 
+**Client timeout ≠ server failure.** `/eval/action` does not cancel the
+action when the HTTP client goes away: if the client gives up waiting on a
+long-running script (`curl --max-time`, PowerShell `-TimeoutSec`, a proxy
+limit), the server **keeps executing it** and may still `APPLY`. Treat a
+client-side timeout as *outcome unknown* — check the server log and re-read
+the data with a read-only call before doing anything else; re-running the
+mutation script on reflex can apply it **twice**. For genuinely long actions
+raise the client timeout instead (locally, `lsfdev.ps1 api -Timeout <s>`).
+
 **The `script=...` body is lsFusion source.** Everything that this skill
 documents is the HTTP wrapper — endpoints, auth, content-type, response
 codes, file-API parameters. The contents of `script=` is real lsFusion
@@ -262,7 +271,7 @@ is part of the workflow.
 The canonical "is this name in the running schema?" check against
 `/eval/action` is
 `EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF MyClass o IS MyClass), 0);`
-(or the `RETURN` one-liner on 7.0+) — a 500 "not found" answers *no*, a 200
+(or the `RETURN` one-liner) — a 500 "not found" answers *no*, a 200
 with the count in the body answers *yes* (and tells you how many). Don't use
 `MESSAGE` for this: it yields the same empty 200 as half a dozen failure
 modes.
