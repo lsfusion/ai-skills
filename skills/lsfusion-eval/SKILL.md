@@ -432,6 +432,14 @@ EXPORT JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
 #   EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Item i IS Item), 0);
 ```
 
+**A missing JSON key means NULL, not a failed export.** `EXPORT JSON` simply
+**omits** a key whose value is NULL for that object: with `EXPORT JSON FROM
+a = f(X x), b = g(x)`, an object where `g` is NULL comes back as
+`{"a": ...}` — no `"b"` at all. Don't read absent keys as "the calculation
+didn't run" — the row is there, the value is just NULL (not yet computed, or
+genuinely empty). To keep the key present regardless, make the value
+non-NULL explicitly: `b = OVERRIDE g(x), 0` (or `''`).
+
 **Don't wrap `EXPORT` in `NEWSESSION { ... }`.** The export lands in a
 session-local property (`exportFile()`), which the HTTP layer reads *after*
 the action finishes; a surrounding `NEWSESSION` throws that property away on

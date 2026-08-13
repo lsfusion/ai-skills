@@ -20,8 +20,8 @@ param(
     [string]$DbName = "lsfusion",
     [string]$DbUser = "postgres",
     [string]$DbPassword = "",
-    [string]$AdminUser = "admin",
-    [string]$AdminPassword = "",
+    [Alias("User")][string]$AdminUser = "admin",
+    [Alias("Password")][string]$AdminPassword = "",
     [string]$TopModule = "",
     [string]$Url = "",
     [string]$OpenScript = "",
@@ -57,7 +57,12 @@ param(
     [switch]$Force,
     [switch]$NoWeb,
     [switch]$FullStart,
-    [switch]$RefreshWar
+    [switch]$RefreshWar,
+    # Run the server WITHOUT devmode: real login form in the web UI,
+    # credentialed Action API - the switch for acceptance-testing auth and
+    # role-based UI. On 'setup' it is persisted (undo: -NoDevMode:$false);
+    # on start/start-server/restart it applies to that run only.
+    [switch]$NoDevMode
 )
 
 $ErrorActionPreference = "Stop"
@@ -1125,6 +1130,11 @@ function Cmd-Setup {
         dbPassword    = (Pick "dbPassword" "DbPassword" "")
         adminUser     = (Pick "adminUser" "AdminUser" "admin")
         adminPassword = (Pick "adminPassword" "AdminPassword" "")
+        # Persisted devmode state (default ON). -NoDevMode is a switch with
+        # inverted sense, so Pick cannot map it directly.
+        devMode       = $(if ($ScriptBound.ContainsKey("NoDevMode")) { -not [bool]$NoDevMode }
+                          elseif ($existing -and ($existing.PSObject.Properties.Name -contains "devMode")) { [bool]$existing.devMode }
+                          else { $true })
         topModule     = (Pick "topModule" "TopModule" "")
         jvmArgs       = (Pick "jvmArgs" "JvmArgs" "")
         tomcatOpts    = (Pick "tomcatOpts" "TomcatOpts" "")
@@ -1133,6 +1143,12 @@ function Cmd-Setup {
         webSocketPort = (Pick "webSocketPort" "WebSocketPort" 8887)
         webPort       = (Pick "webPort" "WebPort" 8080)
         shutdownPort  = (Pick "shutdownPort" "ShutdownPort" 8005)
+    }
+    if (-not $cfg.devMode) {
+        $devNote = if ($ScriptBound.ContainsKey("NoDevMode")) { "persisted" } else { "kept from config" }
+        Info "Dev mode OFF ($devNote): the server will enforce real authentication - login form in the web UI, credentialed Action API (default account: admin, empty password). Re-enable with: setup -NoDevMode:`$false"
+    } elseif ($ScriptBound.ContainsKey("NoDevMode")) {
+        Info "Dev mode ON (persisted)."
     }
     # --- App id resolution: db.name IS the app id -------------------------------
     # One short identifier, chosen when the application is created, covers both:
@@ -1813,33 +1829,46 @@ function Cmd-StartServer {
 
     $cp = Build-ServerClasspath $cfg $mode $java
 
-    # Development JVM options. devmode is always on for local development.
-    # lightstart makes restarts much faster; schema sync and business logic
-    # still run under it. What it skips is the Reflection metadata sync and
-    # the user-side prefs reload (runtime.md#lightstart), so it is dropped on
-    # the first launch (fresh DB gets the full initial sync in one go) and
-    # whenever -FullStart is passed (the fix when actions referenced by
-    # canonical name - scheduler tasks etc. - were added since the last full
-    # start).
+    # Development JVM options. devmode is ON by default; setup -NoDevMode
+    # persists it OFF, and -NoDevMode on start/start-server/restart forces
+    # it OFF for THIS run only (config untouched) - the acceptance-testing
+    # switch: with devmode off the web client shows the real login form and
+    # the Action API demands credentials. lightstart makes restarts much
+    # faster; schema sync and business logic still run under it. What it
+    # skips is the Reflection metadata sync and the user-side prefs reload
+    # (runtime.md#lightstart), so it is dropped on the first launch (fresh
+    # DB gets the full initial sync in one go) and whenever -FullStart is
+    # passed (the fix when actions referenced by canonical name - scheduler
+    # tasks etc. - were added since the last full start).
     $initMarker = Join-Path $StateDir "server-initialized.flag"
     $firstStart = -not (Test-Path $initMarker)
     $lightStart = (-not $firstStart) -and (-not $FullStart)
-    $devArgs = @("-Dlsfusion.server.devmode=true",
-                 # In dev mode it is normal for the schema to shift between
-                 # runs (platform upgrades, REQUIRE-graph changes, edited
-                 # CLASS / DATA properties). Let the sync drop now-unused
-                 # modules, tables, and properties instead of refusing to
-                 # start; production deployments override these in their
-                 # own settings.properties.
+    $devMode = if ($ScriptBound.ContainsKey("NoDevMode")) { -not [bool]$NoDevMode }
+               elseif ($cfg.PSObject.Properties.Name -contains 'devMode') { [bool]$cfg.devMode }
+               else { $true }
+    $devArgs = @("-Dlsfusion.server.devmode=$(if ($devMode) { 'true' } else { 'false' })",
+                 # Whatever the devmode state, it is normal for a LOCAL
+                 # schema to shift between runs (platform upgrades,
+                 # REQUIRE-graph changes, edited CLASS / DATA properties).
+                 # Let the sync drop now-unused modules, tables, and
+                 # properties instead of refusing to start; production
+                 # deployments override these in their own
+                 # settings.properties.
                  "-Ddb.denyDropModules=false",
                  "-Ddb.denyDropTables=false",
                  "-Ddb.denyDropProperties=false")
+    $devModeLabel = if ($devMode) { "Dev mode ON" }
+                    else { "Dev mode OFF (auth enforced: login form + credentialed API)" }
+    if (-not $devMode -and $ScriptBound.ContainsKey("NoDevMode") -and
+        -not (($cfg.PSObject.Properties.Name -contains 'devMode') -and -not $cfg.devMode)) {
+        $devModeLabel += " [this run only - persist with setup -NoDevMode]"
+    }
     if ($lightStart) {
+        Info "$devModeLabel, light start ON (fast restart)."
         $devArgs += "-Dlsfusion.server.lightstart=true"
-        Info "Dev mode ON, light start ON (fast restart)."
     } else {
         $reason = if ($firstStart) { "first launch" } else { "-FullStart requested" }
-        Info "Dev mode ON, light start OFF ($reason - full start incl. Reflection/prefs sync)."
+        Info "$devModeLabel, light start OFF ($reason - full start incl. Reflection/prefs sync)."
     }
     # db.* ALSO go on the command line as -D system properties, mirroring the
     # values just resolved from settings.properties. The file stays the source
@@ -1869,6 +1898,17 @@ function Cmd-StartServer {
     if ($cfg.PSObject.Properties.Name -contains 'jvmArgs' -and $cfg.jvmArgs) {
         $extraJvm = @("$($cfg.jvmArgs)" -split '\s+' | Where-Object { $_ })
         Info "Extra JVM args: $($extraJvm -join ' ')"
+    }
+    # One-shot -JvmArgs on start/start-server/restart: appended AFTER the
+    # persisted set for THIS run only - config.json is untouched (setup is
+    # the persisting path). Lets you flip one flag without a setup+restart
+    # round-trip.
+    if ($ScriptBound.ContainsKey("JvmArgs")) {
+        $oneShotJvm = @("$JvmArgs" -split '\s+' | Where-Object { $_ })
+        if ($oneShotJvm.Count) {
+            $extraJvm += $oneShotJvm
+            Info "One-shot JVM args (this run only, not persisted): $($oneShotJvm -join ' ')"
+        }
     }
     Show-LocaleAdvice $cfg -Brief
     $jvmArgs = @() + (Add-Opens $java.Major) + $devArgs + $dbArgs + @(
@@ -2031,6 +2071,14 @@ function Cmd-DryRun {
     if ($cfg.PSObject.Properties.Name -contains 'jvmArgs' -and $cfg.jvmArgs) {
         $extraJvm = @("$($cfg.jvmArgs)" -split '\s+' | Where-Object { $_ })
         Info "Extra JVM args: $($extraJvm -join ' ')"
+    }
+    # One-shot -JvmArgs, same contract as start/restart: this run only.
+    if ($ScriptBound.ContainsKey("JvmArgs")) {
+        $oneShotJvm = @("$JvmArgs" -split '\s+' | Where-Object { $_ })
+        if ($oneShotJvm.Count) {
+            $extraJvm += $oneShotJvm
+            Info "One-shot JVM args (this run only, not persisted): $($oneShotJvm -join ' ')"
+        }
     }
     # devmode mirrors the real dev launch (same compile semantics); db.* and
     # the denyDrop flags are omitted on purpose - the DB phase never runs.
@@ -2372,6 +2420,11 @@ function Cmd-Status {
     elseif (Test-PortOpen $web) { Warn "Web client    : something is on web port $web (PID file stale)" }
     else { Info "Web client    : stopped" }
 
+    # Only surfaced when OFF - devmode ON is the unremarkable default.
+    if (Test-ServerDevmodeOff $cfg) {
+        Info "Dev mode      : OFF (auth enforced - login form in the web UI; verify/api send credentials automatically, override with -User/-Password)"
+    }
+
     # Silent when war/server build dates agree (the healthy case).
     Test-WarServerBuildDrift $cfg
 }
@@ -2467,7 +2520,13 @@ function Cmd-Verify {
 
     Info "Browser: Playwright Chromium (headless)"
     Info "Target : $target"
-    Info "Login  : user '$($cfg.adminUser)', $(if ($cfg.adminPassword) { 'password from config' } else { 'empty password' })"
+    # Credentials for the login form (exercised only when devmode is off -
+    # devmode auto-authenticates and renders no form). -User/-Password
+    # (aliases of -AdminUser/-AdminPassword) override the config values -
+    # the way to verify the UI as a specific role.
+    $vUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
+    $vPass = if ($ScriptBound.ContainsKey("AdminPassword")) { $AdminPassword } else { $cfg.adminPassword }
+    Info "Login  : user '$vUser', $(if ($vPass) { 'password given' } else { 'empty password' })$(if ((-not $ScriptBound.ContainsKey("Url")) -and (Test-ServerDevmodeOff $cfg)) { ' (devmode off - the real login form will be exercised)' })"
 
     # Resolve the direct-open script (mirrors api's -Script/-ScriptFile pair:
     # -OpenScriptFile is the robust channel for non-ASCII text). The text is
@@ -2544,7 +2603,7 @@ function Cmd-Verify {
     $reloadArgs = @()
     if ($Reload) { $reloadArgs = @("--reload") }
     $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
-        "--user=$(ConvertTo-NativeArg $cfg.adminUser)" "--password=$(ConvertTo-NativeArg $cfg.adminPassword)" `
+        "--user=$(ConvertTo-NativeArg $vUser)" "--password=$(ConvertTo-NativeArg $vPass)" `
         "--click=$(ConvertTo-NativeArg $Click)" "--double-click=$(ConvertTo-NativeArg $DoubleClick)" `
         "--open-script-file=$(ConvertTo-NativeArg $openFileArg)" "--open-expect=$(ConvertTo-NativeArg $OpenExpect)" `
         --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
@@ -2779,11 +2838,18 @@ function Cmd-Verify {
     Info "Open the PNGs with the Read tool to see what was rendered."
 
     if ($r.login_attempted) {
-        if ($r.logged_in) { Ok "Login flow succeeded - the authenticated screenshot shows the app." }
+        if ($r.logged_in) { Ok "Login flow succeeded as '$vUser' - the authenticated screenshot shows the app." }
         else {
-            Warn "Login was attempted but the password field is still visible - check credentials and the login screenshot."
+            Warn "Login was attempted but the password field is still visible - check credentials (-User/-Password) and the login screenshot."
             $checkFails.Add("login failed")
         }
+    } elseif ((-not $ScriptBound.ContainsKey("Url")) -and (Test-ServerDevmodeOff $cfg)) {
+        # The LOCAL server runs devmode-off, so a login form was EXPECTED -
+        # not seeing one is a failure of the promised login flow, not a pass.
+        # (An explicit -Url targets a foreign server whose devmode state the
+        # local launch line says nothing about - no expectation there.)
+        Warn "No login form appeared although the server runs with devmode OFF - the page may not have rendered; check verify-login.png and the error above."
+        $checkFails.Add("no login form (devmode off)")
     } else {
         Ok "No login form on the landing page - devmode auto-authenticated as '$($cfg.adminUser)', the screenshot shows the running app."
     }
@@ -2813,15 +2879,33 @@ function Cmd-Verify {
     }
 }
 
-# Basic-auth headers for the /eval* endpoints. The header is attached ONLY
-# when a non-empty password is configured: devmode auto-auth covers a
-# no-header request, while any header present triggers a real credential
-# check (see the fuller rationale in Cmd-Api).
+# Whether the last-launched server runs with devmode OFF. The actual launch
+# line is the authority (it survives a one-shot 'restart -NoDevMode' that
+# config.json knows nothing about); the persisted config field is the
+# fallback when no launch has happened yet. For duplicated -D flags the
+# JVM honors the LAST occurrence, so read the last devmode= on the line -
+# that also resolves a persisted -JvmArgs override correctly.
+function Test-ServerDevmodeOff($cfg) {
+    $launchFile = Join-Path $StateDir "launch-cmd.txt"
+    if (Test-Path $launchFile) {
+        $line = "$(Get-Content -Raw -Encoding UTF8 $launchFile)"
+        $dm = [regex]::Matches($line, 'lsfusion\.server\.devmode=(true|false)')
+        if ($dm.Count) { return ($dm[$dm.Count - 1].Groups[1].Value -eq 'false') }
+    }
+    return (($cfg.PSObject.Properties.Name -contains 'devMode') -and -not $cfg.devMode)
+}
+
+# Basic-auth headers for the /eval* endpoints. In devmode the header is
+# attached ONLY when credentials were configured or explicitly passed:
+# devmode auto-auth covers a no-header request, while any header present
+# triggers a real credential check (see the fuller rationale in Cmd-Api).
+# With devmode OFF the API always demands credentials, so the header is
+# attached even with the default empty password (admin:).
 function Get-EvalAuthHeaders($cfg) {
     $apiUser = if ($ScriptBound.ContainsKey("AdminUser"))     { $AdminUser }     else { $cfg.adminUser }
     $apiPass = if ($ScriptBound.ContainsKey("AdminPassword")) { $AdminPassword } else { $cfg.adminPassword }
     $headers = @{}
-    if ($apiPass) {
+    if ($apiPass -or $ScriptBound.ContainsKey("AdminUser") -or $ScriptBound.ContainsKey("AdminPassword") -or (Test-ServerDevmodeOff $cfg)) {
         $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($apiUser):$($apiPass)"))
         $headers["Authorization"] = "Basic $auth"
     }
@@ -3439,17 +3523,19 @@ function Cmd-Api {
         throw "Provide lsFusion action code via -Script `"<code>`" or -ScriptFile `"<path>`" (uses the EVAL ACTION endpoint). For any non-ASCII text prefer -ScriptFile, which is read as UTF-8 from disk."
     }
 
-    # Authentication. The local dev server is ALWAYS launched in devmode (see
-    # Cmd-StartServer), and devmode lets a request with NO Authorization header
-    # through as the anonymous user. With an Authorization header present the
-    # server runs a real credential check instead - so we attach the header
-    # ONLY when a non-empty password is actually configured (admin password
-    # rotated, or a real account set up).
-    # An explicitly-passed -AdminUser/-AdminPassword on the 'api' call
-    # overrides whatever setup stored in config.json.
+    # Authentication. In devmode (the default) a request with NO Authorization
+    # header is auto-authenticated, and a header present triggers a real
+    # credential check - so the header is attached only when credentials are
+    # configured or explicitly passed. With devmode OFF (setup -NoDevMode /
+    # restart -NoDevMode) the API always requires credentials, so the Basic
+    # header is attached even with the default empty password (admin:).
+    # An explicitly-passed -User/-Password (aliases of -AdminUser/
+    # -AdminPassword) on the 'api' call overrides whatever setup stored in
+    # config.json - the way to call as a specific account.
     $headers = Get-EvalAuthHeaders $cfg
     if ($headers.Count) {
-        Info "Authenticating with Basic auth (password configured)."
+        $hdrUser = if ($ScriptBound.ContainsKey("AdminUser")) { $AdminUser } else { $cfg.adminUser }
+        Info "Authenticating with Basic auth as '$hdrUser'$(if (Test-ServerDevmodeOff $cfg) { ' (devmode off - credentials required)' })."
     } else {
         Info "Calling anonymously (devmode auto-auth) - no admin password set, so no Basic header is sent."
     }
@@ -3662,21 +3748,31 @@ version and dies on every plugin update.
   clone          Clone an existing lsFusion project from a Git repository.
   check          Detect Java, PostgreSQL, Python, git and Maven.
   setup          Download server jar, client war, Tomcat; write settings.properties.
+                 -NoDevMode persists devmode OFF (real login form +
+                 credentialed API - the auth/role acceptance switch;
+                 undo: -NoDevMode:`$false).
   start-server   Start the application server and report a startup verdict.
   start-web      Start Tomcat with the web client.
   start          start-server then start-web.
   restart        stop then start (use after editing .lsf files).
+                 -NoDevMode and -JvmArgs "<flags>" apply to THIS run only
+                 (config untouched) - flip a flag without re-running setup.
   stop           Stop the application server and Tomcat.
   status         Show running processes and ports.
   log            Print the server log tail and a verdict.
   verify         Playwright (headless Chromium) screenshot + DOM dump of the web UI.
                  -OpenScript "SHOW <form> DOCKED;" opens a form directly (no
                  navigator clicking, parameterizable); -Click/-DoubleClick
-                 click through the navigator like a user would.
+                 click through the navigator like a user would. With devmode
+                 off it logs in through the real form - -User/-Password picks
+                 the account (default: admin, empty password).
   open           Open the web UI in the default browser.
   api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
                  Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
                  ACTION code only - to lint declarations use precheck.
+                 With devmode off, credentials are sent automatically
+                 (admin/empty by default; -User/-Password to call as a
+                 specific account).
                  Long-running action? Pass -Timeout <s> - it bounds the HTTP
                  wait (default 30 s; 60 s when a large script is sent as a
                  POST body). A client timeout is NOT a server verdict: the
@@ -3750,9 +3846,21 @@ Common options:
                         value also bounds the HTTP wait (see 'api' above).
   -JvmArgs "<args>"     Extra app-server JVM args, persisted at setup
                         (e.g. -JvmArgs "-Duser.language=ru -Xmx4g"; appended
-                        after defaults, so a user -Xmx wins).
+                        after defaults, so a user -Xmx wins). On start /
+                        start-server / restart / dryrun: applied to that run
+                        only, NOT persisted (appended after the persisted set).
   -TomcatOpts "<args>"  Extra Tomcat JVM args (CATALINA_OPTS analog),
                         persisted at setup.
+  -NoDevMode            Run the server WITHOUT devmode: real login form,
+                        credentialed Action API - for acceptance-testing auth
+                        and role-based UI. Persisted on 'setup' (undo with
+                        -NoDevMode:`$false), one-shot on start/start-server/
+                        restart. verify and api then send credentials
+                        automatically (admin/empty password by default).
+  -User <name>          Account for 'verify' (login form) and 'api' (Basic
+                        auth); alias of -AdminUser. Default: admin.
+  -Password <pwd>       Its password; alias of -AdminPassword. Default: empty
+                        (the fresh-install admin password).
   -Url <url>            Target URL for 'verify'.
   -OpenScript <code>    'verify' only: open a form DIRECTLY by navigating to
                         /eval/action?script=<code> - no navigator clicking.

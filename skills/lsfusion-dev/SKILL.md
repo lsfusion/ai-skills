@@ -222,7 +222,12 @@ its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbNa
 (`7` — default; `stable`; `dev`/`snapshot`; or an exact tag — see below), `-TomcatVersion`, `-TopModule`, `-RmiPort`, `-HttpPort`,
 `-WebSocketPort`, `-WebPort`, `-ShutdownPort`, `-JvmArgs` / `-TomcatOpts`
 (extra JVM flags for the app server / Tomcat, persisted at setup — e.g.
-`-JvmArgs "-Duser.language=ru -Xmx4g"`), `-FullStart`, `-RefreshWar` (setup:
+`-JvmArgs "-Duser.language=ru -Xmx4g"`; on `start`/`start-server`/
+`restart`/`dryrun` an explicit `-JvmArgs` is a one-shot for that run, not
+persisted),
+`-NoDevMode` (real auth for acceptance tests — see step 4), `-User` /
+`-Password` (the account `verify` logs in with and `api` calls as),
+`-FullStart`, `-RefreshWar` (setup:
 re-download the client war at the same version — the `-SNAPSHOT`
 war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
@@ -624,18 +629,41 @@ exits 1.
 `.lsf` syntax errors surface here, in the server log. Read them carefully and
 correct the code with help from `lsfusion_retrieve_docs`.
 
-**Dev-mode startup.** For local development the server always starts with
-`-Dlsfusion.server.devmode=true` plus the three dev-only drop flags
+**Dev-mode startup.** By default the server starts with
+`-Dlsfusion.server.devmode=true` plus the three drop flags
 `-Ddb.denyDrop{Modules,Tables,Properties}=false`. The drop flags let the
 schema sync remove modules/tables/columns that disappear from the
 `REQUIRE` graph (or shrink when a platform upgrade ships a different
 module set), instead of aborting startup with *"Dropping modules /
-tables / properties is restricted by settings"*. Production deployments
-override these in their own `settings.properties`. One side effect worth
-remembering: **in devmode lsFusion auto-authenticates as `admin`, so the
-web client opens directly on the navigator and the login form never
-appears** — both for the user's browser tab and for the headless `verify`
-run. (The default credentials matter only outside devmode.)
+tables / properties is restricted by settings"*; production deployments
+override these in their own `settings.properties`, and locally they stay
+on regardless of the devmode switch below (local schemas legitimately
+shift between runs). One side effect worth remembering: **in devmode
+lsFusion auto-authenticates as `admin`, so the web client opens directly
+on the navigator and the login form never appears** — both for the user's
+browser tab and for the headless `verify` run.
+
+**That auto-auth means devmode cannot verify auth or roles — switch to
+`-NoDevMode` for that class of checks.** "Login/logout works" and "role X
+is not offered form Y" are typical acceptance requirements for a business
+app, and under devmode everything runs as the full-rights `admin`. To
+exercise them:
+
+- `restart -NoDevMode` — devmode off for **this run only** (config
+  untouched); `setup -NoDevMode` persists the choice
+  (`setup -NoDevMode:$false` re-enables). With devmode off the web client
+  shows the **real login form** and the Action API **requires
+  credentials**.
+- `verify` logs in through that form automatically; `-User <login>
+  -Password <pwd>` picks the account (default `admin` / empty password) —
+  so "role X sees the right UI" is checked by verifying **as that role's
+  user**.
+- `api` sends Basic credentials automatically when the server runs
+  devmode-off (same `-User`/`-Password` to call as a specific account) —
+  no 401 to debug.
+- One-shot JVM flags follow the same pattern: `restart -JvmArgs "..."`
+  applies extra flags to that run only; `setup -JvmArgs "..."` persists
+  them.
 
 **Database binding is pinned and then verified — read the verdict.** The
 launch line also carries `-Ddb.name` (plus `-Ddb.server`/`-Ddb.user`/
@@ -984,8 +1012,9 @@ checking the unit-test output.
 
    `verify` drives **Playwright** (headless Chromium) to:
    - screenshot the landing page → `.lsfusion-dev/verify-login.png`,
-   - **if a login form is present**, log in as `admin` (empty password by
-     default) and screenshot the result → `.lsfusion-dev/verify-app.png`,
+   - **if a login form is present** (devmode off), log in — credentials
+     from `-User` / `-Password`, default `admin` / empty — and screenshot
+     the result → `.lsfusion-dev/verify-app.png`,
    - dump the final DOM → `verify-dom.html` and the browser console →
      `verify-console.txt`.
 
@@ -1384,10 +1413,10 @@ the screenshot is for you, `open` is for the user.
 In **devmode** (the skill's default) lsFusion auto-authenticates as `admin`,
 so the browser lands straight on the navigator — no login screen, no
 credentials needed. Mention this in your reply when you surface the URL,
-especially if the user was expecting a sign-in page. If devmode is ever
-disabled (or the user points the skill at a production server), the default
-account is **`admin`** with **no password** (blank password field) — state
-this explicitly so the user can sign in. After the first login the user can
+especially if the user was expecting a sign-in page. If devmode is off
+(`-NoDevMode`, or the user points the skill at a production server), the
+default account is **`admin`** with **no password** (blank password field) —
+state this explicitly so the user can sign in. After the first login the user can
 change the password and add other users.
 
 ## Working with an existing project

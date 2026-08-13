@@ -134,12 +134,19 @@ server. Values with whitespace can't survive argument joining and stay
 file-only; ports are deliberately file-only (safe defaults, no silent-fallback
 history).
 
-**Development JVM options.** `-Dlsfusion.server.devmode=true` is always set for
-local development. Beyond turning on dev-friendly behaviour, **devmode also
+**Development JVM options.** `-Dlsfusion.server.devmode=true` is set by
+default for local development; `setup -NoDevMode` persists it off
+(config field `devMode`), and `-NoDevMode` on `start`/`start-server`/
+`restart` turns it off for that run only — the launch line in
+`.lsfusion-dev/launch-cmd.txt` is the authority on what the running server
+actually got. Beyond turning on dev-friendly behaviour, **devmode also
 auto-authenticates the user as `admin`** — the web client opens straight on
 the navigator with no login form, both in the user's browser and in headless
-`verify` runs. Outside devmode the default credentials (`admin` / empty
-password) apply and the login form is rendered as usual.
+`verify` runs. With devmode off the default credentials (`admin` / empty
+password) apply and the login form is rendered as usual — `verify` logs in
+through it and `api` sends Basic credentials automatically, with
+`-User`/`-Password` (aliases of `-AdminUser`/`-AdminPassword`) selecting
+the account.
 
 Devmode auth has one trap: auto-auth applies **only to a request that
 carries no `Authorization` header at all** — a request with a header gets a
@@ -217,7 +224,10 @@ Extra **JVM flags** are not settings.properties keys — pass them once via
 `setup -JvmArgs "-Duser.language=ru -Xmx4g"` (app server) and/or
 `-TomcatOpts "..."` (web client); they persist in `.lsfusion-dev/config.json`
 and are appended after the built-in defaults on every start, so a user
-`-Xmx` overrides the default `-Xmx2g`.
+`-Xmx` overrides the default `-Xmx2g`. An explicit `-JvmArgs` on
+`start`/`start-server`/`restart`/`dryrun` is applied to **that run only**
+(appended after the persisted set, config untouched) — the way to flip one
+flag without a `setup` round-trip.
 
 To change ports: `stop` first, then re-run `setup` with the port flags
 (`-RmiPort` / `-HttpPort` / `-WebSocketPort` / `-WebPort` / `-ShutdownPort`)
@@ -254,7 +264,7 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | Scheduler task saved with an **empty action**; `actionCanonicalName('My.action[]')` returns NULL for an action that exists in code | Lightstart skipped the Reflection sync, so actions added since the last full start have no `Reflection.Action` row — the lookup silently returns NULL. Run **one** `restart -FullStart`, then re-create/re-pick the action (see [Lightstart](#lightstart)). |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
-| `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (it omits the header unless a password is set). If you call `/eval/action` by hand, drop `-u admin:` and send no auth — or pass `-u admin:<real password>` only if the admin password was actually rotated. |
+| `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (in devmode it omits the header unless credentials are configured; when the server runs devmode-off it always sends them). If you call `/eval/action` by hand: against a devmode server, drop `-u admin:` and send no auth; against a devmode-off server, send `-u admin:` (or the real account) — and pass `-u admin:<real password>` only if the admin password was actually rotated. |
 
 ## Changing the lsFusion version
 

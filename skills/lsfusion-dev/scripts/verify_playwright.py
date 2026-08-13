@@ -35,6 +35,8 @@ except ImportError:
 # Buttons tried in order to submit the login form. The lsFusion web client
 # typically renders a single visible button on the login screen; the fallback
 # selectors and an Enter-press cover translated captions and variations.
+# Resolved inside the login <form> when one exists (page-wide otherwise), so
+# the generic button:visible fallback cannot click an unrelated control.
 SUBMIT_SELECTORS = [
     'button[type="submit"]:visible',
     'input[type="submit"]:visible',
@@ -947,38 +949,88 @@ def main() -> int:
                 # If a password field is visible we treat the page as a login
                 # form and try to authenticate; otherwise we skip straight to
                 # the second screenshot (already-authenticated / non-login page).
-                if page.locator('input[type="password"]:visible').count() > 0:
+                # With devmode off the web client redirects to /login and
+                # renders the form SPA-style, so the password field can appear
+                # a beat AFTER document load - when the URL says /login, wait
+                # for the form to render instead of sampling once (measured
+                # miss: an instant count() on a still-rendering login page
+                # aborted the promised login flow with a locator timeout).
+                pwd_sel = 'input[type="password"]'
+                pwd_visible = page.locator(f"{pwd_sel}:visible").count() > 0
+                if not pwd_visible and page.url.split("?")[0].split("#")[0].rstrip("/").endswith("/login"):
+                    try:
+                        page.wait_for_selector(f"{pwd_sel}:visible", timeout=45000)
+                        pwd_visible = True
+                    except PWTimeout:
+                        result["error"] = ("login page did not render its form: the URL is /login "
+                                           "but no password field became visible within 45 s")
+                    # Re-shoot now that the page had time to render - the
+                    # first shot may show a blank/loading login page.
+                    page.screenshot(path=str(login_png))
+                if pwd_visible:
                     result["login_attempted"] = True
                     try:
-                        text_in = page.locator('input[type="text"]:visible').first
-                        text_in.wait_for(timeout=5000)
+                        # Scope every lookup to the form that owns the password
+                        # field: a page-wide first-visible input can hit an
+                        # unrelated control, and a page-wide button:visible can
+                        # click a language switcher instead of submit.
+                        form = page.locator(f"form:has({pwd_sel})")
+                        scope = form.first if form.count() > 0 else page
+                        text_in = scope.locator('input[type="text"]:visible').first
+                        text_in.wait_for(timeout=15000)
                         text_in.fill(args.user)
+                        pwd_in = scope.locator(f"{pwd_sel}:visible").first
                         if args.password:
-                            page.locator('input[type="password"]:visible').first.fill(args.password)
+                            pwd_in.fill(args.password)
 
                         clicked = False
                         for sel in SUBMIT_SELECTORS:
                             try:
-                                page.locator(sel).first.click(timeout=2000)
+                                scope.locator(sel).first.click(timeout=2000)
                                 clicked = True
                                 break
                             except PWError:
                                 continue
                         if not clicked:
-                            text_in.press("Enter")
+                            # A submit click can raise even though it FIRED
+                            # (the form navigates away mid-click and the
+                            # element detaches - measured: url already /main,
+                            # zero login inputs left), so judge by outcome:
+                            # fall back to Enter only while the form is still
+                            # on screen, and tolerate it vanishing mid-press.
+                            try:
+                                if page.locator(f"{pwd_sel}:visible").count() > 0:
+                                    # Enter in the password field is the
+                                    # conventional submit; bounded so a truly
+                                    # stuck form fails fast.
+                                    pwd_in.press("Enter", timeout=10000)
+                            except PWError:
+                                pass
 
+                        # The app is in when the password field goes away -
+                        # wait for that signal directly, then let the SPA
+                        # settle before judging.
+                        try:
+                            page.wait_for_selector(f"{pwd_sel}:visible", state="hidden", timeout=20000)
+                        except PWTimeout:
+                            pass
                         try:
                             page.wait_for_load_state("networkidle", timeout=15000)
                         except PWTimeout:
                             pass
-                        # Even with networkidle, the SPA may still be wiring up
-                        # the navigator UI - give it a small extra beat.
                         time.sleep(2)
 
-                        still_login = page.locator('input[type="password"]:visible').count() > 0
+                        still_login = page.locator(f"{pwd_sel}:visible").count() > 0
                         result["logged_in"] = not still_login
+                        if still_login:
+                            result["error"] = (f"login flow failed: the login form is still on screen "
+                                               f"after submitting as '{args.user}' - wrong credentials? "
+                                               "(default account: admin with an empty password)")
                     except PWError as e:
-                        result["error"] = f"login flow failed: {e}"
+                        n_text = page.locator('input[type="text"]:visible').count()
+                        n_pwd = page.locator(f"{pwd_sel}:visible").count()
+                        result["error"] = (f"login flow failed: {e} (url: {page.url}; visible inputs "
+                                           f"now: {n_text} text, {n_pwd} password)")
 
                 page.screenshot(path=str(app_png))
 
