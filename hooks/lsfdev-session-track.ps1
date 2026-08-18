@@ -4,9 +4,11 @@
 # lsFusion dev instance, appends the invocation's absolute -ProjectDir to a per-session
 # ledger in %TEMP% and removes that dir from other sessions' ledgers (whoever
 # (re)started a project last owns it). The companion SessionEnd hook
-# (lsfdev-session-stop.ps1) stops exactly the instances in the ledger, so parallel
-# Claude sessions and servers started outside lsfdev (e.g. from the IDE) are never
-# touched.
+# (lsfdev-session-stop.ps1) turns the ledger into a deferred stop of exactly those
+# instances - executed by lsfdev-session-gc.ps1 after a grace period unless the
+# session is resumed (lsfdev-session-start.ps1) - so parallel Claude sessions and
+# servers started outside lsfdev (e.g. from the IDE) are never touched, and a
+# session whose CLI process was merely recycled keeps its servers.
 #
 # Three layers keep false ownership out (a false claim would stop someone else's server):
 # - Output gate: lsfdev.ps1 prints "Previous application server|Tomcat
@@ -125,20 +127,30 @@ foreach ($cmd in $ast.FindAll({ param($n) $n -is [CommandAst] }, $true)) {
 $uniq = @($found | Sort-Object -Unique)                                 # case-insensitive
 if ($uniq.Count -ne 1) { exit 0 }                                       # none, or ambiguous - skip
 $dir = $uniq[0]
-$ledger = Join-Path $env:TEMP ('claude-lsfdev-' + $in.session_id + '.txt')
 
-Add-Content -LiteralPath $ledger -Value $dir -Encoding UTF8
-# Take-over: drop this dir from other sessions' ledgers. An unsynchronized rewrite
-# can lose a line another session appends in the same instant; two sessions
-# (re)starting the same project simultaneously is not worth file locking.
-Get-ChildItem -Path $env:TEMP -Filter 'claude-lsfdev-*.txt' |
-    Where-Object { $_.FullName -ne $ledger } | ForEach-Object {
-        try {
-            $lines = @(Get-Content -LiteralPath $_.FullName -Encoding UTF8 -ErrorAction Stop)
-            $rest = @($lines -ne $dir)
-            if ($rest.Count -eq $lines.Count) { return }
-            if ($rest.Count) { Set-Content -LiteralPath $_.FullName -Value $rest -Encoding UTF8 -ErrorAction Stop }
-            else { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
-        } catch { }
+# Ledger bookkeeping is shared with the SessionStart / SessionEnd / GC hooks
+# (file formats and helpers in lsfdev-session-common.ps1). Fail-open if the
+# helper file is missing: an untracked start merely outlives the session.
+try { . (Join-Path $PSScriptRoot 'lsfdev-session-common.ps1') } catch { exit 0 }
+$sid = [string]$in.session_id
+$ledger = Get-LedgerPath $sid
+
+# The live ledger carries '# cwd=<session cwd>' so that sibling sessions in
+# the same folder (/clear, a second conversation on the project) can find and
+# share the claim; Add-LedgerDirs writes the header when it creates the file.
+Add-LedgerDirs $sid @($dir) ([string]$in.cwd)
+Write-HookLog 'track' "session $sid (re)started $dir - owned by this session now"
+
+# Take-over: drop this dir from other sessions' live ledgers AND pending stops
+# (whoever (re)started a project last owns it; a due pending stop of an older
+# session must not touch the newer session's server). An unsynchronized
+# rewrite can lose a line another session appends in the same instant; two
+# sessions (re)starting the same project simultaneously is not worth file
+# locking.
+foreach ($f in @(Get-LiveLedgers) + @(Get-PendingFiles)) {
+    if ($f.FullName -ieq $ledger) { continue }
+    if (Remove-DirFromLedgerFile $f.FullName $dir) {
+        Write-HookLog 'track' "session $sid took $dir over from $($f.Name)"
     }
+}
 exit 0

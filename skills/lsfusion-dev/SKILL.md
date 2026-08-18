@@ -208,8 +208,9 @@ a running `verify -Session` browser, or anything else that happened before.
 | `start-web` | Start Tomcat with the web client; wait until the UI responds. |
 | `start` | `start-server` then `start-web`. |
 | `restart` | Stop everything, then `start`. Use this after editing `.lsf` files. |
-| `stop` | Stop the application server and Tomcat. |
-| `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server). |
+| `stop` | Stop the application server and Tomcat — of **this project only** (its pid files, and its ports only when the process carries the project's `-Dlsfdev.project=` marker). |
+| `keep-running` | Exempt this project from the **session-end auto-stop** (the plugin's hooks stop the servers a Claude session started ~60 min after that session's process ended without being resumed — see [Servers, sessions and other processes on the box](#servers-sessions-and-other-processes-on-the-box)). `-Off` re-enables it. |
+| `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server); `Auto-stop: OFF` when `keep-running` is set. |
 | `log` | Print the tail of the server log and flag errors. |
 | `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
 | `open` | Open the web UI in the user's default browser. |
@@ -403,6 +404,78 @@ repoint at a different database you must say so explicitly with `-DbName`.
 over the per-project default — every clone of the repo then points at the
 same database. `setup` warns when it first sees this; pass
 `setup -DbName <unique> -Force` to give the instance its own DB.
+
+### Servers, sessions and other processes on the box
+
+Several Claude sessions routinely run **sibling lsFusion projects at the same
+time** on one machine (`C:\Test\projA` and `C:\Test\projB`, an IDE-launched
+platform server, …). Their JVMs look identical to yours — same jar, same
+main class `BusinessLogicsBootstrap` / `Bootstrap` — and they die just as
+easily. Rules that follow from real incidents:
+
+- **Never kill `java` / `powershell` / `chrome` / `python` by name or by
+  command-line pattern** — no `Get-Process java | Stop-Process`, no
+  `taskkill /IM java.exe`, no `Where-Object CommandLine -match
+  'BusinessLogicsBootstrap'|'lsfdev'|'ms-playwright'`. Every measured "the
+  server died mid-work" that was not a Windows reboot came down to a
+  neighbouring session doing exactly this: one session's *"stop the BLB"*
+  pattern kill took the app servers of two other projects down four times in
+  an hour (each time leaving their Tomcats up — the tell-tale signature),
+  and a *"kill stray java"* sweep killed a sibling's fresh server + Tomcat.
+  Stop only **your** project, only via `lsfdev.ps1 stop` / `restart
+  -ProjectDir <yours>`: it kills its own pid-file processes and, on the
+  project's ports, only a process whose command line carries
+  **`-Dlsfdev.project=<that project dir>`** (every server and Tomcat JVM
+  lsfdev launches gets that marker; anything else is reported, not
+  killed). Need to know whose JVM something is? Read that marker from its
+  command line (`Get-CimInstance Win32_Process -Filter "ProcessId=<pid>" |
+  Select CommandLine`) — never guess from the port or the age.
+- **The agent's shell tool kills the whole process tree of a shell it
+  stops** (a background task ended with TaskStop, an aborted command, a
+  torn-down session). Since 0.1.34 `start`/`restart` launch the JVMs
+  **detached** through a short-lived hidden trampoline (their parent exits
+  at once, so a tree walk from the tool shell no longer reaches them —
+  measured: `taskkill /T /F` on the launching shell leaves both JVMs
+  running). Anything *else* you spawn from a backgrounded shell still dies
+  with it; and on plugin builds before 0.1.34, a TaskStop of a backgrounded
+  `restart …; verify …` command is exactly what took the server and Tomcat
+  down (measured 2026-08-17). Either way: keep `start`/`restart` in the
+  foreground (below) instead of parking them in background tasks.
+- **Session-end auto-stop — what the plugin's hooks do, and do not do.** The
+  plugin remembers which projects a Claude session (re)started (a per-session
+  ledger in `%TEMP%\claude-lsfdev-<session id>.txt`, written by a PostToolUse
+  hook that recognizes the canonical `lsfdev.ps1 start|restart -ProjectDir
+  "<abs path>"` call). When that session's CLI process ends, a SessionEnd
+  hook does **not** stop them on the spot: it schedules the stop for **60 min
+  later** (`LSFDEV_STOP_GRACE_MIN` overrides; `0` = immediate) and cancels
+  it if the session is **resumed** — or a new session starts **in the same
+  folder** — before then. The desktop app suspends an idle session's process
+  (~15 min after the last turn, measured) and resumes it when the user comes
+  back, so "process ended" is a very poor proxy for "the user is done"; the
+  pre-0.1.34 hook stopped servers right there, which is how a server "died
+  silently" while its Tomcat lived on. If the stop does fire, the next
+  session start in that folder gets a one-line note saying so (what was
+  stopped, when, why, and the `start` command). Projects owned by another
+  live session are never touched, and `lsfdev.ps1 keep-running -ProjectDir
+  <dir>` exempts a project completely (`-Off` re-enables; `status` shows
+  `Auto-stop: OFF`). Servers started **outside** lsfdev (IDE, a hand-typed
+  java command) are invisible to the hooks. **Every hook decision is logged**
+  in `%TEMP%\claude-lsfdev-hooks.log` — read it before theorizing.
+- **A server "died silently"? Establish the killer before working around
+  it.** Check, in this order: `lsfdev.ps1 status` (what is up now);
+  `%TEMP%\claude-lsfdev-hooks.log` (did the auto-stop fire?); the tail of
+  `.lsfusion-dev/server.out.log` (a JVM that was terminated stops mid-line
+  with no shutdown message; a *graceful* shutdown prints `Server is
+  stopping…` — that is a Windows shutdown/logoff or a Ctrl+C, not a kill);
+  the last `Change current time snapshots` line (logged every 30 min — it
+  brackets the time of death); `.lsfusion-dev/tomcat/logs/catalina.*.log`
+  (`Stopping ProtocolHandler` = graceful stop of Tomcat too = the whole
+  machine went down — check the System event log for id 1074 / 42);
+  and, when only the app server died while Tomcat survived, the transcripts
+  of the *other* sessions on the box for the pattern kills above. Do not
+  "fix" it by killing anything, and do not invent WMI/`Start-Process`
+  workarounds around lsfdev — the servers are already detached from the
+  tool tree, and the hooks are the only thing that stops them by design.
 
 ## Standard workflow
 
@@ -753,6 +826,18 @@ written to `.lsfusion-dev/launch-cmd.txt`, not echoed). Let it run in the
 foreground and read the verdict it prints. If you really do want to background
 a long first-time sync, do it deliberately (the shell tool's
 `run_in_background`), not as an accidental side effect of a pipe.
+
+One more reason to keep it out of background tasks: **stopping a background
+task kills that shell's whole process tree.** The JVMs themselves are safe
+since 0.1.34 (`start`/`restart` launch them detached — measured to survive a
+`taskkill /T` of the launching shell), but a `verify` browser, a `python`
+helper or anything else that command spawned is not, and on older plugin
+builds a TaskStop of a backgrounded `restart …; verify …` took the app server
+and Tomcat down with it (measured 2026-08-17). If a start did land in the
+background, let it finish or read its output file — don't TaskStop it and
+then wonder why the server is gone; the how-to-tell-what-killed-it checklist
+is in [Servers, sessions and other processes on the
+box](#servers-sessions-and-other-processes-on-the-box).
 
 **Refresh PostgreSQL statistics after a first start or a big schema change —
 call `analyzeDBAction()`.** lsFusion emits large, join-heavy SQL. On a

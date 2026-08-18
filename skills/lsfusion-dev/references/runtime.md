@@ -20,6 +20,14 @@ configuration, or when you need to change ports/versions.
     ├── server.out.log / server.err.log
     ├── tomcat.out.log
     ├── server.pid / tomcat.pid
+    ├── launch-cmd.txt            the full java command line of the last start
+    ├── launch-server.json / launch-tomcat.json (+ .result)
+    │                             the last launch specs handed to the detached
+    │                             trampoline scripts/launch-jvm.ps1 (the JVMs are
+    │                             started outside the tool shell's process tree
+    │                             so a stopped/aborted tool call can't kill them;
+    │                             .result = "ok" or the reason for the in-tree
+    │                             fallback)
     ├── server-initialized.flag   marker (content: the db.name it certifies);
     │                             light start is used once it exists. Cleared
     │                             on version switch, when the DB had to be
@@ -227,7 +235,10 @@ and are appended after the built-in defaults on every start, so a user
 `-Xmx` overrides the default `-Xmx2g`. An explicit `-JvmArgs` on
 `start`/`start-server`/`restart`/`dryrun` is applied to **that run only**
 (appended after the persisted set, config untouched) — the way to flip one
-flag without a `setup` round-trip.
+flag without a `setup` round-trip. Two more skill-level switches live in
+`config.json` only: `devMode` (`setup -NoDevMode`) and `keepRunning`
+(`lsfdev.ps1 keep-running` — exempts the project from the plugin's
+session-end auto-stop; `-Off` removes it).
 
 To change ports: `stop` first, then re-run `setup` with the port flags
 (`-RmiPort` / `-HttpPort` / `-WebSocketPort` / `-WebPort` / `-ShutdownPort`)
@@ -263,6 +274,7 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | **Every** form open fails with `invalid stream header` (or `StreamCorruptedException` / `InvalidClassException`), web UI otherwise loads | The client war and the server jar come from **different builds** of the same `-SNAPSHOT` version — RMI serialization mismatch. Typical in Maven projects: Maven updated the server snapshot, the war stayed from an older `setup`. `status` / `start-web` print both build dates and the remedy for the stale side: server newer → `setup -RefreshWar`; war newer → `mvn -U -DskipTests compile` + `restart` (Maven-resolved server), or delete `.lsfusion-dev/lsfusion-server-<ver>.jar` and re-run `setup` (skill-downloaded server). |
 | Scheduler task saved with an **empty action**; `actionCanonicalName('My.action[]')` returns NULL for an action that exists in code | Lightstart skipped the Reflection sync, so actions added since the last full start have no `Reflection.Action` row — the lookup silently returns NULL. Run **one** `restart -FullStart`, then re-create/re-pick the action (see [Lightstart](#lightstart)). |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
+| The app server (and maybe Tomcat) is **gone** although nothing in your session stopped it — no error, `server.out.log` just ends | Something killed the JVM. Establish the killer before working around it (checklist in SKILL.md, *Servers, sessions and other processes on the box*): `%TEMP%\claude-lsfdev-hooks.log` says whether the plugin's **session-end auto-stop** fired (it stops the projects a session started once that session's CLI process ended and was not resumed for `LSFDEV_STOP_GRACE_MIN` = 60 min; a resumed session cancels it, and the next session start reports it; `lsfdev.ps1 keep-running` opts a project out); a **graceful** end (`Server is stopping…`, Tomcat's `Stopping ProtocolHandler`) is a Windows shutdown/logoff or Ctrl+C, not a kill; an abrupt end with the Tomcat still up is the signature of another session's `Get-Process java … | Stop-Process` sweep — grep the other sessions' transcripts. The JVMs are launched detached from the tool shell (0.1.34+), so a stopped/aborted tool call is not a suspect anymore. Fix = `restart`, never a pattern kill of your own. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |
 | `api` returns **HTTP 401 Unauthorized** | A credentialed request with wrong credentials hit the devmode server — devmode auto-auth only covers requests with **no** `Authorization` header. The `api` command handles this automatically (in devmode it omits the header unless credentials are configured; when the server runs devmode-off it always sends them). If you call `/eval/action` by hand: against a devmode server, drop `-u admin:` and send no auth; against a devmode-off server, send `-u admin:` (or the real account) — and pass `-u admin:<real password>` only if the admin password was actually rotated. |
 

@@ -6,7 +6,7 @@
     powershell -ExecutionPolicy Bypass -File lsfdev.ps1 <command> [options]
 
   Commands: check setup start-server start-web start restart stop status
-            log verify open api precheck dryrun help
+            log verify open api precheck dryrun keep-running help
 #>
 [CmdletBinding()]
 param(
@@ -62,7 +62,9 @@ param(
     # credentialed Action API - the switch for acceptance-testing auth and
     # role-based UI. On 'setup' it is persisted (undo: -NoDevMode:$false);
     # on start/start-server/restart it applies to that run only.
-    [switch]$NoDevMode
+    [switch]$NoDevMode,
+    # 'keep-running -Off': re-enable the session-end auto-stop for the project.
+    [switch]$Off
 )
 
 $ErrorActionPreference = "Stop"
@@ -951,6 +953,55 @@ function Stop-Tracked([string]$pidFile, [int[]]$ports, [string]$label) {
     # "Previous application server|Tomcat stopped|was not running" in the tool
     # output as proof that a start/restart really touched this project's processes.
     if ($killed) { Ok "$label stopped." } else { Info "$label was not running." }
+}
+
+# Start a JVM DETACHED from this shell's process tree, via the short-lived
+# hidden trampoline scripts\launch-jvm.ps1: the JVM's parent exits at once, so
+# a tree kill of the tool shell (a background task ended with TaskStop, an
+# aborted command, a torn-down session - the agent's shell tool kills the whole
+# tree, measured) no longer takes the server down with it. Redirection, working
+# directory and pid-file semantics are unchanged; the trampoline inherits this
+# shell's environment. Falls back to a direct (in-tree) launch when the
+# trampoline is missing or does not report back within 20 s. Returns an object
+# with .Id / .HasExited (a real Process when the JVM is alive; a stub with
+# HasExited=$true when it died before it could be observed - callers then read
+# the log tail as for any failed start).
+function Start-DetachedJvm([string]$exe, [string[]]$jvmArgs, [string]$workDir, [string]$outFile, [string]$errFile, [string]$pidFile, [string]$label) {
+    $tramp = Join-Path $PSScriptRoot "launch-jvm.ps1"
+    $spec = Join-Path $StateDir "launch-$label.json"
+    $result = Join-Path $StateDir "launch-$label.result"
+    Remove-Item $result, $pidFile -Force -ErrorAction SilentlyContinue
+    if (Test-Path $tramp) {
+        $why = ""
+        try {
+            @{ exe = $exe; args = @($jvmArgs); workDir = $workDir; out = $outFile; err = $errFile; pidFile = $pidFile; resultFile = $result } |
+                ConvertTo-Json -Depth 4 | Set-Content -Path $spec -Encoding UTF8
+            Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList @(
+                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+                '-File', ('"' + $tramp + '"'), '-Spec', ('"' + $spec + '"')) | Out-Null
+            $deadline = (Get-Date).AddSeconds(20)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path $result)) { Start-Sleep -Milliseconds 100 }
+            $res = if (Test-Path $result) { (Get-Content $result -Raw -Encoding UTF8).Trim() } else { "no answer from the launcher within 20 s" }
+            if ($res -eq "ok") {
+                $procId = 0
+                if (Test-Path $pidFile) { [int]::TryParse((Get-Content $pidFile -Raw -Encoding UTF8).Trim(), [ref]$procId) | Out-Null }
+                if ($procId) {
+                    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+                    if ($p) { return $p }
+                    # Launched but already gone (died within the first moments):
+                    # a stub the callers' HasExited checks read as a failed start.
+                    return [pscustomobject]@{ Id = $procId; HasExited = $true }
+                }
+                $why = "launcher reported ok but wrote no pid"
+            } else { $why = $res }
+        } catch { $why = $_.Exception.Message }
+        Warn "Detached launch unavailable ($why) - launching in this shell's process tree instead (a tree kill of the shell would then take the JVM down)."
+    }
+    $sp = @{ FilePath = $exe; WorkingDirectory = $workDir; RedirectStandardOutput = $outFile; RedirectStandardError = $errFile; NoNewWindow = $true; PassThru = $true }
+    if ($jvmArgs.Count) { $sp.ArgumentList = $jvmArgs }
+    $p = Start-Process @sp
+    $p.Id | Set-Content $pidFile
+    return $p
 }
 
 function Patch-TomcatPorts($tomcatHome, $webPort, $shutdownPort) {
@@ -1928,10 +1979,9 @@ function Cmd-StartServer {
     "$($java.Path) $($jvmArgs -join ' ')" | Set-Content -Path $launchCmdFile -Encoding UTF8
     Info "Launching java ($(($cp -split ';').Count) classpath entries; full command line: $launchCmdFile)"
     Remove-Item $ServerOut, $ServerErr -ErrorAction SilentlyContinue
-    $proc = Start-Process -FilePath $java.Path -ArgumentList $jvmArgs `
-        -WorkingDirectory $ProjectDir -RedirectStandardOutput $ServerOut `
-        -RedirectStandardError $ServerErr -NoNewWindow -PassThru
-    $proc.Id | Set-Content $ServerPid
+    # Detached from this shell's process tree (see Start-DetachedJvm): the
+    # server must survive the tool call, a TaskStop and the CLI process.
+    $proc = Start-DetachedJvm $java.Path $jvmArgs $ProjectDir $ServerOut $ServerErr $ServerPid "server"
     Info "PID $($proc.Id). Waiting up to $Timeout s for startup..."
 
     $deadline = (Get-Date).AddSeconds($Timeout)
@@ -2266,10 +2316,8 @@ function Cmd-StartWeb {
         "org.apache.catalina.startup.Bootstrap", "start"
     )
     Remove-Item $TomcatOut -ErrorAction SilentlyContinue
-    $proc = Start-Process -FilePath $java.Path -ArgumentList $jvmArgs `
-        -WorkingDirectory $tomcatHome -RedirectStandardOutput $TomcatOut `
-        -RedirectStandardError (Join-Path $StateDir "tomcat.err.log") -NoNewWindow -PassThru
-    $proc.Id | Set-Content $TomcatPid
+    # Detached from this shell's process tree, like the app server.
+    $proc = Start-DetachedJvm $java.Path $jvmArgs $tomcatHome $TomcatOut (Join-Path $StateDir "tomcat.err.log") $TomcatPid "tomcat"
     $webUrl = Get-WebUrl $cfg
     Info "PID $($proc.Id). Waiting for the web UI at $webUrl ..."
 
@@ -2424,9 +2472,37 @@ function Cmd-Status {
     if (Test-ServerDevmodeOff $cfg) {
         Info "Dev mode      : OFF (auth enforced - login form in the web UI; verify/api send credentials automatically, override with -User/-Password)"
     }
+    # Only surfaced when set - the session-end auto-stop is the default.
+    if (Test-KeepRunningSet $cfg) {
+        Info "Auto-stop     : OFF (keep-running is set - the servers stay up when the Claude session ends; 'keep-running -Off' re-enables the auto-stop)"
+    }
 
     # Silent when war/server build dates agree (the healthy case).
     Test-WarServerBuildDrift $cfg
+}
+
+function Test-KeepRunningSet($cfg) {
+    return [bool]($cfg -and ($cfg.PSObject.Properties.Name -contains 'keepRunning') -and $cfg.keepRunning)
+}
+
+# Session-end auto-stop opt-out. The lsfusion-dev plugin's hooks stop the
+# servers a Claude session started once that session's CLI process has ended
+# and was not resumed within a grace period (60 min by default,
+# LSFDEV_STOP_GRACE_MIN overrides). keepRunning=true in config.json exempts
+# THIS project: the hooks leave it alone (an explicit 'stop' still stops it).
+function Cmd-KeepRunning {
+    Head "Session-end auto-stop"
+    $cfg = Get-ConfigOrFail
+    if ($Off) {
+        if ($cfg.PSObject.Properties.Name -contains 'keepRunning') { $cfg.PSObject.Properties.Remove('keepRunning') }
+        Save-Config $cfg
+        Ok "keep-running is OFF for $ProjectDir - the servers a Claude session starts here are stopped again once that session's process has ended for the grace period (default 60 min; LSFDEV_STOP_GRACE_MIN)."
+    } else {
+        $cfg | Add-Member -NotePropertyName keepRunning -NotePropertyValue $true -Force
+        Save-Config $cfg
+        Ok "keep-running is ON for $ProjectDir - the session-end auto-stop leaves this project's servers running (until an explicit 'stop'/'restart' or a reboot). Undo with: keep-running -Off"
+    }
+    Info "Hook decisions are logged in $(Join-Path $(if ($env:TEMP) { $env:TEMP } else { [IO.Path]::GetTempPath() }) 'claude-lsfdev-hooks.log')."
 }
 
 # Some platform log lines are ERROR-level noise, not failures - explain them
@@ -3758,6 +3834,15 @@ version and dies on every plugin update.
                  -NoDevMode and -JvmArgs "<flags>" apply to THIS run only
                  (config untouched) - flip a flag without re-running setup.
   stop           Stop the application server and Tomcat.
+  keep-running   Exempt this project from the session-end auto-stop. The
+                 plugin's hooks stop the servers a Claude session started
+                 once that session's CLI process has ended and was NOT
+                 resumed within a grace period (60 min; env
+                 LSFDEV_STOP_GRACE_MIN overrides, 0 = immediate) - a
+                 recycled/idle-suspended session that comes back keeps them.
+                 With keep-running set they stay up until an explicit
+                 stop/restart. -Off re-enables the auto-stop. Every hook
+                 decision is logged in %TEMP%\claude-lsfdev-hooks.log.
   status         Show running processes and ports.
   log            Print the server log tail and a verdict.
   verify         Playwright (headless Chromium) screenshot + DOM dump of the web UI.
@@ -4026,6 +4111,7 @@ Common options:
                         (Maven updated the server, the war stayed) and forms
                         fail with 'invalid stream header'; start-web/status
                         warn when they detect that drift.
+  -Off                  keep-running only: re-enable the session-end auto-stop.
 "@
 }
 
@@ -4159,6 +4245,7 @@ try {
             Stop-Tracked $TomcatPid $webPorts "Tomcat"
             if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
         }
+        "keep-running" { Cmd-KeepRunning }
         "dryrun"       { Cmd-DryRun }
         "dry-run"      { Cmd-DryRun }
         "status"       { Cmd-Status }
