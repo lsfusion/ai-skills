@@ -212,9 +212,9 @@ a running `verify -Session` browser, or anything else that happened before.
 | `keep-running` | Exempt this project from the **session-end auto-stop** (the plugin's hooks stop the servers a Claude session started ~60 min after that session's process ended without being resumed — see [Servers, sessions and other processes on the box](#servers-sessions-and-other-processes-on-the-box)). `-Off` re-enables it. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server); `Auto-stop: OFF` when `keep-running` is set. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. |
 | `open` | Open the web UI in the user's default browser. |
-| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. |
+| `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. Exit codes are trustworthy: **0** = HTTP success, **1** = request failed (HTTP error / connection refused), **3** = client timeout (no verdict — deliberately distinct from 1). |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
 | `dryrun` | **Full-fidelity validation of the whole project without starting it.** Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets), opens **no DB connection at all** — no PostgreSQL needed — and never touches the running server, so it validates safely **next to a live instance**. `-TopModule <M>` (comma-separated list allowed — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
 
@@ -263,7 +263,7 @@ no-pipe note in step 4), so don't inflate it "just in case":
 | `start` / `restart` — routine edit→restart cycle (lightstart) | 300 s |
 | `start-server` — first start on this DB, or major-version upgrade (raise the inner `-Timeout` to 300 as well) | 600 s |
 | `verify` — first ever run (installs Playwright + Chromium, ~120 MB) | 300 s |
-| `verify` — later runs | default (300 s when `-OpenScript`/`-Click` hits the *first* open of a heavy form right after a restart — the lazy form build alone can take 40 s) |
+| `verify` — later runs | **240 s minimum** — the outer timeout must EXCEED the 180 s watchdog budget (`-Timeout <s>` changes it; keep outer ≈ budget + 60 s), or the outer kill fires first and eats the hung-step diagnosis. The command self-terminates on a hang and reports the hung step, so never park it in the background to "wait out" a hang |
 | `dryrun` | default (Maven compile / staging + a 4–10 s JVM phase even at 772 modules; the command's own watchdog kills hung runs, so the inner `-Timeout` rarely matters) |
 
 Rule of thumb: outer timeout ≈ the script's inner `-Timeout` (default 180 s)
@@ -697,7 +697,12 @@ returns one of three verdicts:
 never answered HTTP all exit 1 (after printing their diagnostics), and the
 combined `start`/`restart` stops before Tomcat when the app server did not
 come up. Automation can trust `$LASTEXITCODE`; an unknown command name also
-exits 1.
+exits 1. One nuance on `start-web`: exit 1 with the "STILL RUNNING" WARN
+means **readiness was not confirmed within `-Timeout`** (honored in full,
+default 180 s — there is no internal cap), NOT that Tomcat is broken — it is
+left running and often finishes moments later; `status` re-checks cheaply.
+War **deploy** (~15 s in catalina.log) is not readiness: the app answers its
+first 200 tens of seconds after that on a loaded machine.
 
 `.lsf` syntax errors surface here, in the server log. Read them carefully and
 correct the code with help from `lsfusion_retrieve_docs`.
@@ -1315,6 +1320,16 @@ checking the unit-test output.
    `[WARN]` lines. `-AllowWarnings` restores report-only exit 0; tool-level
    errors (missing python, bad usage) exit 1 either way. Browser console
    errors are reported but never flip the exit code (apps log noise there).
+
+   **A hung page cannot hang `verify`.** The whole Playwright run sits under
+   a watchdog (default 180 s; `-Timeout <s>` sets the budget). On overrun
+   the run is tree-killed and the report names the hung step (`open-wait:
+   <form> is rendering`, `do 2/5: …`) plus the browser-console tail — the
+   signature of a form that wedges the web client's renderer, which is an
+   app bug to fix, not a Playwright/Chromium/machine problem. Exit is 1
+   (tool failure; `-AllowWarnings` does not soften it), artifacts written
+   before the hang stay on disk, and in `-Session` mode the session browser
+   is closed too (it held the wedged page and would poison the next call).
 
    **Iterating on a multi-step scenario? Add `-Session`.** By default every
    `verify` run starts a fresh browser and pays the navigation (and the slow

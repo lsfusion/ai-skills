@@ -204,7 +204,12 @@ one-line redirect there (a `db.name` that is not context-safe stays at `/`
 instead). The
 web client connects to the application server over RMI on `localhost:7652` by
 default — no extra configuration is needed when everything runs locally with
-default ports.
+default ports. The readiness probe waits the full `-Timeout` (default 180 s)
+for a 2xx/3xx answer; note that the war *deploy* line in catalina.log
+(~15 s) is **not** readiness — the app's first 200 typically lands tens of
+seconds later, longer on a loaded machine. A run that ends with the
+"STILL RUNNING" WARN + exit 1 means "not confirmed in time", not "broken":
+Tomcat keeps deploying and `status` usually flips to OK shortly.
 
 ## settings.properties keys
 

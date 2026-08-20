@@ -684,8 +684,14 @@ def _acquire_session(p, port: int, args, out_dir: Path):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", required=True)
-    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--url", default="")
+    ap.add_argument("--output-dir", default="")
+    ap.add_argument("--args-file", default="",
+                    help="UTF-8 JSON object with parameters by attribute name "
+                         "(url, user, click, ...); values override the argv "
+                         "ones - the quoting-proof channel the PowerShell "
+                         "caller uses now that the helper runs under a "
+                         "watchdog via Start-Process")
     ap.add_argument("--user", default="admin")
     ap.add_argument("--password", default="")
     ap.add_argument("--timeout", type=int, default=30000,
@@ -774,6 +780,24 @@ def main() -> int:
                          "side language negotiation)")
     args = ap.parse_args()
 
+    # --args-file: all parameters as one JSON object. The PowerShell caller
+    # switched to this channel wholesale: it launches the helper through
+    # Start-Process (so a hung run can be tree-killed by the watchdog), and
+    # PS 5.1 cannot reliably quote arbitrary selector/script text across that
+    # boundary - a file cannot be corrupted by argv quoting (the --do-file
+    # lesson, generalized).
+    if args.args_file:
+        try:
+            spec = json.loads(Path(args.args_file).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
+            print(json.dumps({"error": f"cannot read --args-file: {e}"}))
+            return 2
+        for k, v in spec.items():
+            setattr(args, k, v)
+    if not args.url or not args.output_dir:
+        print(json.dumps({"error": "--url and --output-dir are required (directly or via --args-file)"}))
+        return 2
+
     if args.do_file:
         loaded = json.loads(Path(args.do_file).read_text(encoding="utf-8-sig"))
         if isinstance(loaded, str):
@@ -790,11 +814,26 @@ def main() -> int:
     do_png       = out_dir / "verify-do.png"
     dom_path     = out_dir / "verify-dom.html"
     console_path = out_dir / "verify-console.txt"
+    phase_path   = out_dir / "verify-phase.txt"
 
     # Wipe previous artefacts so callers can rely on file presence.
-    for p in (login_png, app_png, open_png, click_png, dblclick_png, do_png, dom_path, console_path):
+    for p in (login_png, app_png, open_png, click_png, dblclick_png, do_png, dom_path, console_path, phase_path):
         if p.exists():
             p.unlink()
+
+    # Breadcrumb for the PowerShell watchdog: which step was in flight when a
+    # wedged web client (blocked renderer - a real lsFusion failure mode)
+    # forced a tree kill. Playwright's title()/content()/evaluate() have no
+    # timeout at all, so without this the kill message could not name the
+    # hung phase. Overwritten in place before every potentially-unbounded
+    # step; the final JSON still ends with phase "done".
+    run_t0 = time.time()
+    def _phase(desc: str) -> None:
+        try:
+            phase_path.write_text(f"{int(time.time() - run_t0)}s\t{desc}",
+                                  encoding="utf-8")
+        except OSError:
+            pass
 
     open_script = ""
     if args.open_script_file:
@@ -883,9 +922,11 @@ def main() -> int:
                 # Persistent-session mode: attach to the long-lived browser
                 # (spawning it on first use). NOTE: --locale has no effect
                 # here - the context already exists.
+                _phase("session-connect: attaching to the persistent CDP browser")
                 browser, page, _ = _acquire_session(p, args.session_port,
                                                     args, out_dir)
             else:
+                _phase("browser-launch")
                 browser = p.chromium.launch(headless=True)
             try:
                 if page is None:
@@ -901,7 +942,19 @@ def main() -> int:
                         ctx_kwargs["locale"] = args.locale.strip()
                     context = browser.new_context(**ctx_kwargs)
                     page = context.new_page()
-                page.on("console", lambda m: console_lines.append(f"[{m.type}] {m.text}"))
+                def _on_console(m):
+                    line = f"[{m.type}] {m.text}"
+                    console_lines.append(line)
+                    # Mirror to disk immediately: a watchdog-killed run never
+                    # reaches _finish(), and the start-of-run wipe has already
+                    # destroyed the PREVIOUS console dump - without this a
+                    # hang leaves zero console evidence behind.
+                    try:
+                        with console_path.open("a", encoding="utf-8") as cf:
+                            cf.write(line + "\n")
+                    except OSError:
+                        pass
+                page.on("console", _on_console)
 
                 # In session mode a page that is already anywhere on the app is
                 # continued as-is - no reload, so the open form / JS state from
@@ -931,6 +984,7 @@ def main() -> int:
                 if already_there:
                     result["session"]["navigated"] = False
                 else:
+                    _phase(f"navigate: {args.url}")
                     try:
                         page.goto(args.url, wait_until="load", timeout=args.timeout)
                     except PWError as e:
@@ -943,6 +997,7 @@ def main() -> int:
                     except PWTimeout:
                         pass
 
+                _phase("initial screenshot + login-form detection")
                 result["title"] = page.title()
                 page.screenshot(path=str(login_png))
 
@@ -968,6 +1023,7 @@ def main() -> int:
                     # first shot may show a blank/loading login page.
                     page.screenshot(path=str(login_png))
                 if pwd_visible:
+                    _phase("login: submitting the login form")
                     result["login_attempted"] = True
                     try:
                         # Scope every lookup to the form that owns the password
@@ -1049,6 +1105,7 @@ def main() -> int:
                 if result["open"]["requested"]:
                     base = args.url if args.url.endswith("/") else args.url + "/"
                     eval_url = urljoin(base, "eval/action") + "?script=" + quote(open_script)
+                    _phase(f"open-script: {open_script[:80]}")
                     try:
                         page.goto(eval_url, wait_until="load", timeout=args.timeout)
                         try:
@@ -1064,6 +1121,10 @@ def main() -> int:
                                 raise
                         # Same generous settle as the click-through: the first
                         # open of a form after a restart is lazy and slow.
+                        # THIS is where a form that wedges the client hangs
+                        # (blocked renderer answers no protocol call) - the
+                        # phase note makes the watchdog kill name the form.
+                        _phase(f"open-wait: form of '{open_script[:60]}' is rendering")
                         try:
                             page.wait_for_selector("text=Loading", state="detached", timeout=60000)
                         except PWTimeout:
@@ -1189,6 +1250,7 @@ def main() -> int:
                 # with generous waits - the FIRST open of a form after a
                 # restart takes 10-40 s while the server lazily builds it.
                 if result["click"]["requested"]:
+                    _phase(f"click: {args.click[:80]}")
                     segments = [s.strip() for s in args.click.split(">") if s.strip()]
                     seg = ""
                     try:
@@ -1284,6 +1346,7 @@ def main() -> int:
                 # through.
                 if result["double_click"]["requested"]:
                     dbl = args.double_click.strip()
+                    _phase(f"double-click: {dbl[:80]}")
                     try:
                         # Same locator discipline as the click-through: exact
                         # first, substring only when the exact text matched
@@ -1383,6 +1446,7 @@ def main() -> int:
                     for raw in args.do_actions:
                         step = {"action": raw, "ok": False, "detail": ""}
                         result["do"]["steps"].append(step)
+                        _phase(f"do {len(result['do']['steps'])}/{len(args.do_actions)}: {raw[:80]}")
                         try:
                             verb, _, rest = raw.partition(":")
                             verb = verb.strip().lower()
@@ -1808,6 +1872,7 @@ def main() -> int:
                     page.wait_for_timeout(800)
                     page.screenshot(path=str(do_png))
 
+                _phase("dom-dump + final state")
                 if not dom_failure_dumped:
                     dom_path.write_text(page.content(), encoding="utf-8")
 
@@ -1820,6 +1885,10 @@ def main() -> int:
     except PWError as e:
         result["error"] = f"playwright error: {e}"
 
+    # "finalizing", not "done": _finish still rewrites the console file and
+    # prints the JSON - a kill landing in that window must not read as a
+    # hang at a completed run.
+    _phase("finalizing: writing the report")
     return _finish(result, console_lines, console_path)
 
 

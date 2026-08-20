@@ -120,6 +120,36 @@ function Tail-Text([string]$text, [int]$n) {
     return $arr[($arr.Count - $n)..($arr.Count - 1)]
 }
 
+# Problem-lines-only tail over several log texts: ERROR/WARNING/exception
+# lines, deduplicated across the sources (tomcat.out and catalina.log overlap
+# almost entirely), capped, with monster lines truncated (a single
+# java.library.path INFO line is ~1.5 KB). Used where a log excerpt is a
+# COURTESY (Tomcat alive, just not confirmed ready) - full dumps stay for
+# real failures.
+function Get-ProblemTail([string[]]$texts, [int]$cap = 15) {
+    $seen = @{}
+    $out = @()
+    foreach ($t in $texts) {
+        if (-not $t) { continue }
+        foreach ($l in ($t -split "`r?`n")) {
+            if ($l -notmatch 'ERROR|SEVERE|FATAL|WARN|Exception|^\s+at\s') { continue }
+            # An INFO-level line whose free text merely contains 'warning'
+            # (TLD scanner and friends) is not a problem line.
+            if ($l -match '\bINFO\b' -and $l -notmatch 'Exception') { continue }
+            $k = $l.Trim()
+            if (-not $k -or $seen.ContainsKey($k)) { continue }
+            $seen[$k] = $true
+            if ($k.Length -gt 240) { $k = $k.Substring(0, 240) + " ... [+$($k.Length - 240) chars]" }
+            $out += $k
+        }
+    }
+    if ($out.Count -gt $cap) { $out = $out[($out.Count - $cap)..($out.Count - 1)] }
+    # Plain return, NO unary comma: the callers wrap the call in @(...), and a
+    # comma-wrapped array survives that as ONE element - measured: an empty
+    # result then counts as 1 "problem" and multi-line results print joined.
+    return $out
+}
+
 # Read an integer key (e.g. rmi.port) from the project's settings.properties.
 # Checks conf/settings.properties first (the file the server actually reads at
 # runtime, and where Maven-mode overrides land) then the project-root file.
@@ -355,17 +385,6 @@ function Find-Python {
         if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path $exe)) { return $exe }
     }
     return $null
-}
-
-# Escape an argument for a native process spawned by PowerShell 5.1, which
-# builds the child command line WITHOUT escaping embedded double quotes - a
-# -Do step like  eval:createElement("input")  otherwise reaches python as
-# createElement(input). MSVCRT parsing rules: double every backslash run that
-# sits immediately before a '"', then escape the '"' itself. (An argument
-# ENDING in backslashes that also contains whitespace remains a known PS 5.1
-# edge - avoid trailing backslashes in selectors/JS.)
-function ConvertTo-NativeArg([string]$s) {
-    return ($s -replace '(\\*)"', '$1$1\"')
 }
 
 function Test-PlaywrightInstalled([string]$pyExe) {
@@ -2316,21 +2335,38 @@ function Cmd-StartWeb {
         "org.apache.catalina.startup.Bootstrap", "start"
     )
     Remove-Item $TomcatOut -ErrorAction SilentlyContinue
+    # Snapshot the newest catalina log BEFORE launching: it is a persistent
+    # per-day file (tomcat.out and tomcat.err are recreated per start), so a
+    # failure tail must only consider what THIS start appended - old runs'
+    # WARN/ERROR lines otherwise resurface as current problems.
+    $preCatFile = ""; $preCatChars = 0
+    $preCat = Get-ChildItem (Join-Path $tomcatHome "logs") -Filter "catalina*.log" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($preCat) { $preCatFile = $preCat.FullName; $preCatChars = (Read-FileText $preCat.FullName).Length }
     # Detached from this shell's process tree, like the app server.
     $proc = Start-DetachedJvm $java.Path $jvmArgs $tomcatHome $TomcatOut (Join-Path $StateDir "tomcat.err.log") $TomcatPid "tomcat"
     $webUrl = Get-WebUrl $cfg
     Info "PID $($proc.Id). Waiting for the web UI at $webUrl ..."
 
-    $deadline = (Get-Date).AddSeconds([Math]::Min($Timeout, 120))
+    # Honor the FULL -Timeout (default 180 s). The old Min($Timeout, 120) cap
+    # silently ignored bigger explicit values, while measured readiness of a
+    # real app is 45-150+ s AFTER the ~15 s war deploy on a loaded machine -
+    # the cap manufactured false "did not respond" WARNs + exit 1 on healthy
+    # starts (12 times in one reported session, ~40 log lines each).
+    $deadline = (Get-Date).AddSeconds($Timeout)
     $up = $false
+    $lastCode = 0
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 3
         if ($proc.HasExited) { break }
         # Readiness = a 2xx/3xx answer ONLY. An error status must keep
         # polling: a Tomcat whose WAR failed to deploy serves 404s on a
-        # perfectly bound port, and that must not read as "up".
+        # perfectly bound port, and that must not read as "up". The last
+        # error status is kept - "404 the whole time" and "never answered"
+        # are different diagnoses and must not print the same message.
         $code = Get-HttpProbeStatus $webUrl
         if ($code -ge 200 -and $code -lt 400) { $up = $true; break }
+        if ($code) { $lastCode = $code }
     }
     Write-Host ""
     if ($up) {
@@ -2388,24 +2424,55 @@ function Cmd-StartWeb {
             $bindDiagnosed = $true
         }
 
-        if ($proc.HasExited) {
-            if (-not $bindDiagnosed) { Bad "Tomcat exited during startup. Tomcat log tail:" }
+        if ($proc.HasExited -or $bindDiagnosed) {
+            # A dead Tomcat / bind failure is a REAL failure - full tails are
+            # worth their bulk here.
+            if ($proc.HasExited -and -not $bindDiagnosed) { Bad "Tomcat exited during startup. Tomcat log tail:" }
             else { Info "Tomcat log tail:" }
-        } elseif (-not $bindDiagnosed) {
-            Warn "Web UI did not respond yet. Check 'lsfdev.ps1 status' shortly, or inspect .lsfusion-dev/tomcat/logs/."
+            $shownTail = @(Tail-Text (Read-FileText $TomcatOut) 40)
+            $shownTail | ForEach-Object { Write-Host "    $_" }
+            if ($catalog) {
+                Write-Host "  --- $($catalog.Name) ---"
+                $catTail = @(Tail-Text (Read-FileText $catalog.FullName) 40)
+                $catTail | ForEach-Object { Write-Host "    $_" }
+                $shownTail += $catTail
+            }
+            # Explain benign ERROR-level lines only when they are in the tails
+            # the user actually SAW (a stale line deep in the full log must not
+            # trigger an explanation for nothing).
+            Note-BenignLogLines ($shownTail -join "`n")
+        } else {
+            # Tomcat is ALIVE and no bind error was found: this is "readiness
+            # not confirmed in time", not "broken" - say which of the two
+            # shapes it is, and keep the output compact (the old 40+40-line
+            # INFO dumps were measured at 20% of a whole session's tool
+            # output across 12 false WARNs).
+            if ($lastCode) {
+                Bad "Tomcat answered during the $Timeout s wait, but never with success - the LAST answer was HTTP $lastCode; the app context did not become ready (broken/missing war?). Try: setup -RefreshWar, then start-web."
+            } else {
+                Warn "No HTTP answer within $Timeout s. Tomcat (PID $($proc.Id)) is STILL RUNNING and may simply need more time on a loaded machine - re-check shortly with 'lsfdev.ps1 status', or raise the wait: start-web -Timeout <seconds>."
+            }
+            Info "Exit code 1 here means 'readiness NOT CONFIRMED in time' - Tomcat was left running; it does NOT mean the web client is broken."
+            # catalina delta: only what this start appended (same file), or
+            # the whole file when Tomcat rolled to a new day's log.
+            $catText = ""
+            if ($catalog) {
+                $catText = Read-FileText $catalog.FullName
+                if ($catalog.FullName -eq $preCatFile -and $catText.Length -ge $preCatChars) {
+                    $catText = $catText.Substring($preCatChars)
+                }
+            }
+            $probs = @(Get-ProblemTail @((Read-FileText $TomcatOut),
+                                         (Read-FileText (Join-Path $StateDir "tomcat.err.log")),
+                                         $catText))
+            if ($probs.Count) {
+                Info "Problem lines from the Tomcat logs (deduplicated; full logs: .lsfusion-dev\tomcat\logs\):"
+                $probs | ForEach-Object { Write-Host "    $_" }
+                Note-BenignLogLines ($probs -join "`n")
+            } else {
+                Info "No ERROR/WARNING lines in the Tomcat logs so far - startup is just slow. Full logs: .lsfusion-dev\tomcat\logs\"
+            }
         }
-        $shownTail = @(Tail-Text (Read-FileText $TomcatOut) 40)
-        $shownTail | ForEach-Object { Write-Host "    $_" }
-        if ($catalog) {
-            Write-Host "  --- $($catalog.Name) ---"
-            $catTail = @(Tail-Text (Read-FileText $catalog.FullName) 40)
-            $catTail | ForEach-Object { Write-Host "    $_" }
-            $shownTail += $catTail
-        }
-        # Explain benign ERROR-level lines only when they are in the tails
-        # the user actually SAW (a stale line deep in the full log must not
-        # trigger an explanation for nothing).
-        Note-BenignLogLines ($shownTail -join "`n")
         # Nonzero on every not-up outcome (bind failure, dead Tomcat, no HTTP
         # answer in time) - automation must not read a broken web start as
         # success.
@@ -2514,6 +2581,9 @@ function Cmd-KeepRunning {
 function Note-BenignLogLines([string]$text) {
     if ($text -match 'ERROR\s+MainDispatchServlet\s+-\s+Removing navigator') {
         Info "Note: 'ERROR MainDispatchServlet - Removing navigator ...' is the web client's NORMAL session cleanup (a browser tab or verify session closed), logged at ERROR level by the platform - not an application failure."
+    }
+    if ($text -match 'ERROR Log4j API could not find a logging provider') {
+        Info "Note: 'Log4j API could not find a logging provider' is benign - the web client logs through Tomcat's JULI; Log4j's probe simply reports that no Log4j backend is present."
     }
 }
 
@@ -2656,42 +2726,125 @@ function Cmd-Verify {
     if ($doSteps.Count) { Info "Do     : $($doSteps.Count) generic step(s) after navigation (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/assert-count/assert-text by Playwright selector; interaction verbs use the first VISIBLE match, assert-* all visible matches)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
 
-    # Use --name=value form so an empty password is preserved through
-    # PowerShell's native-argument handling (without =, empty strings get
-    # dropped and argparse sees the next flag as the value). Every free-text
-    # value goes through ConvertTo-NativeArg - PS 5.1 does not escape embedded
-    # double quotes on its own, and -Do steps (JS, attribute selectors) carry
-    # them routinely.
     # -Do steps travel via a UTF-8 JSON file, NOT argv: PowerShell 5.1 wraps a
     # native argument in quotes only when it sees whitespace outside naively
     # paired quote characters, so JS / attribute-selector steps with certain
     # quote+space patterns (e.g. join(" | ")) get split apart no matter how
-    # they are escaped. A file cannot be corrupted by argv quoting.
-    $doArgs = @()
+    # they are escaped. A file cannot be corrupted by argv quoting. (The
+    # remaining parameters follow the same route via verify-args.json below.)
+    $doJsonFile = ""
     if ($doSteps.Count) {
         # NOTE: the staging file variable must NOT be named $doFile - PS
         # variables are case-insensitive and it would clobber the -DoFile
         # parameter.
         $doJsonFile = Join-Path $StateDir "verify-do.json"
         [IO.File]::WriteAllText($doJsonFile, (ConvertTo-Json -InputObject $doSteps -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
-        $doArgs = @("--do-file=$doJsonFile")
     }
-    $reloadArgs = @()
-    if ($Reload) { $reloadArgs = @("--reload") }
-    $jsonText = (& $py $scriptPath --url $target --output-dir $StateDir `
-        "--user=$(ConvertTo-NativeArg $vUser)" "--password=$(ConvertTo-NativeArg $vPass)" `
-        "--click=$(ConvertTo-NativeArg $Click)" "--double-click=$(ConvertTo-NativeArg $DoubleClick)" `
-        "--open-script-file=$(ConvertTo-NativeArg $openFileArg)" "--open-expect=$(ConvertTo-NativeArg $OpenExpect)" `
-        --viewport-width $ViewportWidth --viewport-height $ViewportHeight "--locale=$Locale" `
-        --session-port $sessionPort `
-        @reloadArgs @doArgs --timeout 30000) -join "`n"
-    $pyExit = $LASTEXITCODE
+
+    # Every parameter goes through ONE UTF-8 JSON args file. The helper now
+    # runs under Start-Process (so a hung run can be tree-killed by the
+    # watchdog below), whose PS 5.1 argument handling cannot safely quote
+    # arbitrary selector/JS text - a file cannot be corrupted by argv
+    # quoting, the same reasoning that already moved -Do steps off argv.
+    $argsFile = Join-Path $StateDir "verify-args.json"
+    $argSpec = @{
+        url = "$target"; output_dir = "$StateDir"
+        user = "$vUser"; password = "$vPass"
+        click = "$Click"; double_click = "$DoubleClick"
+        open_script_file = "$openFileArg"; open_expect = "$OpenExpect"
+        viewport_width = [int]$ViewportWidth; viewport_height = [int]$ViewportHeight
+        locale = "$Locale"; session_port = [int]$sessionPort
+        reload = [bool]$Reload; do_file = "$doJsonFile"
+        timeout = 30000
+    }
+    [IO.File]::WriteAllText($argsFile, (ConvertTo-Json -InputObject $argSpec -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+
+    # Hard watchdog over the WHOLE Playwright run. Playwright's title() /
+    # content() / evaluate() carry no timeout at all, and a web client wedged
+    # by a broken form (blocked renderer - a real lsFusion failure mode)
+    # hangs them forever: measured 150+ s with zero output until an external
+    # kill, reported costing multiple background tasks + TaskStops before the
+    # form was even suspected. An explicit -Timeout sets the budget.
+    $verifyBudget = if ($ScriptBound.ContainsKey("Timeout")) { [Math]::Max(1, [int]$Timeout) } else { 180 }
+    Info "Budget : $verifyBudget s for the whole run (watchdog; override with -Timeout <seconds>)"
+    if ($verifyBudget -lt 15) { Warn "A budget under 15 s rarely lets even the browser launch finish - expect a watchdog kill." }
+
+    $pyOut = Join-Path $StateDir "verify-stdout.json"
+    $pyErrFile = Join-Path $StateDir "verify-stderr.txt"
+    Remove-Item $pyOut, $pyErrFile -Force -ErrorAction SilentlyContinue
+    $pyProc = Start-Process -FilePath $py -WorkingDirectory $StateDir -PassThru -NoNewWindow `
+        -RedirectStandardOutput $pyOut -RedirectStandardError $pyErrFile `
+        -ArgumentList @(('"' + $scriptPath + '"'), ('--args-file="' + $argsFile + '"'))
+    $null = $pyProc.Handle   # cache the handle now or ExitCode is unreadable after exit (PS 5.1)
+    $pyDeadline = (Get-Date).AddSeconds($verifyBudget)
+    while (-not $pyProc.HasExited -and (Get-Date) -lt $pyDeadline) { Start-Sleep -Milliseconds 400 }
+
+    # The args file carries the login password (-Password rides it) - never
+    # leave that on disk. The helper parses it in its first moments, so by
+    # now it has been consumed on every path (kill included) and can go.
+    Remove-Item $argsFile -Force -ErrorAction SilentlyContinue
+
+    if (-not $pyProc.HasExited) {
+        # taskkill /T takes the whole tree down: python -> node driver ->
+        # (non-session) Chromium. A session Chromium is NOT a descendant -
+        # it is stopped explicitly below, because it still holds the wedged
+        # page and would hang the next verify -Session the same way. The
+        # absolute path dodges PATH shadowing, and the kill is VERIFIED -
+        # claiming "killed" while the tree survives (access denied etc.)
+        # would be worse than the hang itself.
+        & (Join-Path $env:SystemRoot "System32\taskkill.exe") /T /F /PID $pyProc.Id *> $null
+        $killWait = (Get-Date).AddSeconds(5)
+        while (-not $pyProc.HasExited -and (Get-Date) -lt $killWait) { Start-Sleep -Milliseconds 200 }
+        Write-Host ""
+        if ($pyProc.HasExited) {
+            Bad "verify did not finish within $verifyBudget s - the Playwright run was KILLED by the watchdog."
+        } else {
+            Bad "verify did not finish within $verifyBudget s - and the watchdog could NOT kill python PID $($pyProc.Id) (still alive; kill it manually: taskkill /T /F /PID $($pyProc.Id))."
+        }
+        $phaseTxt = (Read-FileText (Join-Path $StateDir "verify-phase.txt")).Trim()
+        if ($phaseTxt -match '^(\d+)s\t(.*)$') {
+            Info "Hung step  : $($Matches[2])  (entered at t+$($Matches[1]) s, killed at t+$verifyBudget s)"
+        } elseif ($phaseTxt) {
+            Info "Hung step  : $phaseTxt"
+        }
+        Info "This usually means the page WEDGED the web client (a form that blocks the browser's renderer)."
+        Info "The app SERVER is typically fine - fix the form; do not chase Playwright, Chromium or machine load."
+        $kept = @()
+        foreach ($af in @("verify-login.png", "verify-app.png", "verify-open.png", "verify-click.png",
+                          "verify-dblclick.png", "verify-do.png", "verify-dom.html")) {
+            $ap = Join-Path $StateDir $af
+            if (Test-Path $ap) { $kept += "$af ($([math]::Round((Get-Item $ap).Length / 1KB, 1)) KB)" }
+        }
+        if ($kept.Count) { Info "Artifacts written before the hang: $($kept -join ', ') (in $StateDir)" }
+        else { Info "Artifacts: none were written before the hang (it hit before the first screenshot)." }
+        $consoleTail = @(Tail-Text (Read-FileText (Join-Path $StateDir "verify-console.txt")) 8)
+        if ($consoleTail.Count -and ($consoleTail -join '').Trim()) {
+            Info "Browser console tail (verify-console.txt):"
+            $consoleTail | ForEach-Object { Write-Host "    $_" }
+        } else {
+            Info "Browser console: empty so far (a renderer stuck in a busy loop emits nothing)."
+        }
+        if ($Session -and (Test-Path $PwSessionPid)) {
+            Stop-Tracked $PwSessionPid @() "Persistent verify-session browser (it kept the wedged page)"
+            Info "Session browser stopped - reopen with 'verify -Session' after fixing the form."
+        }
+        # A hung run is a TOOL failure, not a failed check - -AllowWarnings
+        # must not convert it to 0.
+        exit 1
+    }
+    $pyExit = $pyProc.ExitCode
+    $jsonText = Read-FileText $pyOut
 
     $r = $null
     try { $r = $jsonText | ConvertFrom-Json } catch { }
     if (-not $r) {
         Bad "verify_playwright.py did not return parseable JSON (exit $pyExit). Raw output:"
         Write-Host $jsonText
+        $errTail = @(Tail-Text (Read-FileText $pyErrFile) 15)
+        if ($errTail.Count -and ($errTail -join '').Trim()) {
+            Info "stderr tail (verify-stderr.txt):"
+            $errTail | ForEach-Object { Write-Host "    $_" }
+        }
         # A tool/protocol failure, not a failed check - -AllowWarnings
         # (report-only for CHECKS) must not turn an unusable run into 0.
         exit 1
@@ -3648,6 +3801,13 @@ function Cmd-Api {
     $logLenBefore = 0
     if (Test-Path $ServerOut) { $logLenBefore = (Get-Item $ServerOut).Length }
 
+    # Exit code of this command: 0 = HTTP success received; 1 = the request
+    # FAILED (HTTP error status, connection refused, ...); 3 = CLIENT-side
+    # timeout - outcome UNKNOWN (the action may still be running). Before
+    # 0.1.35 every failure path fell through to the dispatcher's exit 0, and
+    # probe automation was reported classifying '[FAIL] ... (HTTP 500)' runs
+    # as OK twice in one session.
+    $apiFail = 0
     try {
         if ($useBody) {
             $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
@@ -3701,6 +3861,8 @@ function Cmd-Api {
             Bad "No HTTP response within $httpTimeout s - the CLIENT gave up waiting; this says nothing about the server."
             Warn "The action is likely STILL RUNNING and may yet finish and APPLY its changes. Do not treat this as failure, do not restart the server, and do NOT re-run a mutation script unchecked - it could apply twice."
             Info "Check first: 'lsfdev.ps1 log' until the action finishes, then re-read state with a read-only api call (RETURN/EXPORT). For long actions pass -Timeout <seconds> (bounds this HTTP wait); raise the outer tool-call timeout to match."
+            Info "Exit code will be 3: NO VERDICT (client timeout) - distinct from 1 (request failed) exactly so automation cannot misread it either way."
+            $apiFail = 3
         } else {
             $errResp = $_.Exception.Response
             $statusTag = ""
@@ -3711,6 +3873,7 @@ function Cmd-Api {
             $errBody = Get-ErrorResponseBody $_
             if ($errBody) { Write-Host $errBody }
             else { Info "(the server sent no error body)" }
+            $apiFail = 1
         }
     }
 
@@ -3737,6 +3900,10 @@ function Cmd-Api {
             } finally { $fs.Close() }
         }
     } catch { }
+
+    # After the log tail, so a failed call still surfaces its Server messages
+    # (constraint text of a canceled APPLY arrives that way).
+    if ($apiFail) { exit $apiFail }
 }
 
 function Cmd-Open {
@@ -3851,6 +4018,10 @@ version and dies on every plugin update.
                  click through the navigator like a user would. With devmode
                  off it logs in through the real form - -User/-Password picks
                  the account (default: admin, empty password).
+                 The WHOLE run is bounded by a watchdog (default 180 s;
+                 -Timeout <s> overrides): a page that wedges the web client
+                 (blocked renderer) is killed with the hung step named and
+                 the browser-console tail printed - exit 1, artifacts kept.
   open           Open the web UI in the default browser.
   api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
                  Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
@@ -3863,6 +4034,8 @@ version and dies on every plugin update.
                  POST body). A client timeout is NOT a server verdict: the
                  action keeps running and may still apply - check 'log' /
                  re-read state, never blindly re-run.
+                 Exit codes: 0 = HTTP success, 1 = request failed (HTTP
+                 error / connection), 3 = client timeout (NO verdict).
   precheck       Sub-second syntax + name check of .lsf files against the
                  RUNNING dev server, before paying for a restart (which
                  reports name errors one at a time). -Files 'a.lsf','b.lsf'
@@ -3927,8 +4100,10 @@ Common options:
                         when running several servers - it is always bound.
   -WebPort <port>       Tomcat HTTP port (default 8080).
   -ShutdownPort <port>  Tomcat shutdown port (default 8005).
-  -Timeout <seconds>    Startup wait (default 180). For 'api' an explicit
-                        value also bounds the HTTP wait (see 'api' above).
+  -Timeout <seconds>    Startup wait (default 180, honored in FULL - no
+                        internal cap). For 'api' an explicit value also
+                        bounds the HTTP wait (see 'api' above); for 'verify'
+                        it sets the whole-run watchdog budget (default 180).
   -JvmArgs "<args>"     Extra app-server JVM args, persisted at setup
                         (e.g. -JvmArgs "-Duser.language=ru -Xmx4g"; appended
                         after defaults, so a user -Xmx wins). On start /
