@@ -413,7 +413,14 @@ function Get-PortPids([int]$port) {
 
 # HTTP status of a GET with redirects NOT followed: 2xx/3xx = the app
 # answers; 404/500 = a BOUND port serving a broken deployment (e.g. the war
-# failed to deploy) - NOT readiness; 0 = no HTTP answer at all. Implemented
+# failed to deploy) - NOT readiness; -1 = TCP reached the port but no HTTP
+# response arrived (timeout / connection dropped mid-response); 0 = the TCP
+# connect itself failed (nothing bound / refused). -1 vs 0 matters for the
+# final diagnosis: "TCP OK, HTTP pending" is a slow-but-alive app (classic
+# cause: stale PostgreSQL planner statistics - analyzeDBAction()), while
+# "TCP never connects" is a connector that never bound - collapsing both
+# into one message sent a real session hunting wedged connectors for a
+# 104 s landing page that ANALYZE fixed to 0.7 s. Implemented
 # on HttpWebRequest with AllowAutoRedirect=$false: PS 5.1's own
 # `Invoke-WebRequest -MaximumRedirection 0` throws on a 3xx with
 # Exception.Response = NULL (measured), which would misread a healthy
@@ -431,7 +438,17 @@ function Get-HttpProbeStatus([string]$url) {
     } catch [Net.WebException] {
         $resp = $_.Exception.Response
         if ($resp) { try { return [int]$resp.StatusCode } finally { $resp.Close() } }
-        return 0
+        # No response object: split by HOW it failed. ConnectFailure (and
+        # name resolution) = the port was never reached -> 0. Everything
+        # else (Timeout, ReceiveFailure, ConnectionClosed, ...) means the
+        # TCP connection was made and HTTP never answered -> -1. On
+        # localhost a bound socket accepts the handshake into the backlog
+        # even while Tomcat is still deploying, so Timeout reliably means
+        # "reached but silent", not "unreachable".
+        $st = $_.Exception.Status
+        if ($st -eq [Net.WebExceptionStatus]::ConnectFailure -or
+            $st -eq [Net.WebExceptionStatus]::NameResolutionFailure) { return 0 }
+        return -1
     } catch { return 0 }
 }
 
@@ -2356,17 +2373,22 @@ function Cmd-StartWeb {
     $deadline = (Get-Date).AddSeconds($Timeout)
     $up = $false
     $lastCode = 0
+    $tcpSeen = $false
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 3
         if ($proc.HasExited) { break }
         # Readiness = a 2xx/3xx answer ONLY. An error status must keep
         # polling: a Tomcat whose WAR failed to deploy serves 404s on a
         # perfectly bound port, and that must not read as "up". The last
-        # error status is kept - "404 the whole time" and "never answered"
-        # are different diagnoses and must not print the same message.
+        # error status and TCP reachability are kept as HISTORY; the final
+        # diagnosis goes by the LAST probe (see below) - "still 404 at the
+        # end", "TCP OK but silent", "TCP flapped" and "TCP never
+        # connected" are different diagnoses and must not print the same
+        # message.
         $code = Get-HttpProbeStatus $webUrl
         if ($code -ge 200 -and $code -lt 400) { $up = $true; break }
-        if ($code) { $lastCode = $code }
+        if ($code -gt 0) { $lastCode = $code }
+        if ($code -ne 0) { $tcpSeen = $true }
     }
     Write-Host ""
     if ($up) {
@@ -2447,10 +2469,29 @@ function Cmd-StartWeb {
             # shapes it is, and keep the output compact (the old 40+40-line
             # INFO dumps were measured at 20% of a whole session's tool
             # output across 12 false WARNs).
-            if ($lastCode) {
-                Bad "Tomcat answered during the $Timeout s wait, but never with success - the LAST answer was HTTP $lastCode; the app context did not become ready (broken/missing war?). Try: setup -RefreshWar, then start-web."
+            # Diagnose by the FINAL probe result ($code survives the loop),
+            # never by sticky history: the measured shape "404 while the
+            # context deploys, then silent-but-slow answers" is the
+            # stale-statistics case and must not be misread as a broken
+            # war. History ($lastCode / $tcpSeen) is still reported as
+            # context, so a flapping probe cannot print a factually wrong
+            # CURRENT state. The reached-but-silent branch names the app
+            # ALIVE and slow - the old undifferentiated message sent a
+            # session through connector/IPv6/browser-leak hypotheses when
+            # the real cause was stale PostgreSQL statistics - and offers
+            # analyzeDBAction() only while the app server's RMI port
+            # actually listens ('api' goes through the app server; with it
+            # down the right move is start-server, not ANALYZE).
+            if ($code -gt 0) {
+                Bad "Tomcat still answered HTTP $code at the end of the $Timeout s wait; the app context did not become ready (broken/missing war?). Try: setup -RefreshWar, then start-web."
+            } elseif ($code -eq -1) {
+                $hist = if ($lastCode) { " (earlier probes answered HTTP $lastCode - normal while the context is still deploying)" } else { "" }
+                $hint = if (Test-PortOpen $cfg.rmiPort) { "If data volume grew since the last ANALYZE (bulk load, or rows created through the app's own UI - no schema change needed), stale PostgreSQL planner statistics are the classic cause: lsfdev.ps1 api -Script `"analyzeDBAction();`" (measured 104 s -> 0.7 s)." } else { "NOTE: nothing listens on app-server RMI port $($cfg.rmiPort) - the web client may be blocked waiting for a stopped app server; run start-server first, then re-check." }
+                Warn "TCP connect to port $($cfg.webPort) is OK, but no HTTP response arrived in $Timeout s$hist. Tomcat (PID $($proc.Id)) is STILL RUNNING and reachable - the app is working on the answer, just very slowly (or the war is still deploying); re-check shortly with 'lsfdev.ps1 status', or raise the wait: start-web -Timeout <seconds>. $hint"
+            } elseif ($tcpSeen) {
+                Warn "Web port $($cfg.webPort) accepted TCP earlier in the wait, but the LAST probe could not connect at all, while Tomcat (PID $($proc.Id)) is STILL RUNNING - the connector came up and then dropped (or is flapping mid-start). Read .lsfusion-dev\tomcat\logs\ and re-check with 'lsfdev.ps1 status'."
             } else {
-                Warn "No HTTP answer within $Timeout s. Tomcat (PID $($proc.Id)) is STILL RUNNING and may simply need more time on a loaded machine - re-check shortly with 'lsfdev.ps1 status', or raise the wait: start-web -Timeout <seconds>."
+                Warn "TCP connect to web port $($cfg.webPort) never succeeded in $Timeout s, although Tomcat (PID $($proc.Id)) is STILL RUNNING - its HTTP connector has not bound yet (extremely slow startup), or failed to bind (Tomcat keeps running in that case). Re-check shortly with 'lsfdev.ps1 status'; if it persists, read .lsfusion-dev\tomcat\logs\ and consider setup -WebPort <free port>."
             }
             Info "Exit code 1 here means 'readiness NOT CONFIRMED in time' - Tomcat was left running; it does NOT mean the web client is broken."
             # catalina delta: only what this start appended (same file), or
@@ -2529,7 +2570,13 @@ function Cmd-Status {
         $code = Get-HttpProbeStatus $webUrlS
         if ($code -ge 200 -and $code -lt 400) { Ok "Web client    : running (PID $tPid, $webUrlS)$ownNote" }
         elseif ($code -gt 0) { Warn "Web client    : Tomcat PID $tPid serves port $web but the app answers HTTP $code - the war likely failed to deploy (check .lsfusion-dev/tomcat/logs/; setup -RefreshWar re-downloads it)$ownNote" }
-        else { Warn "Web client    : Tomcat PID $tPid holds port $web but nothing answered the HTTP probe - still starting, or the connector is wedged; retry status shortly$ownNote" }
+        else {
+            # The stale-statistics hint only makes sense while the app
+            # server is reachable - 'api' goes through it, and a web client
+            # blocked on a STOPPED app server needs start-server instead.
+            $hint = if (Test-PortOpen $rmi) { "if data volume recently grew (bulk load or via the app UI), refresh PostgreSQL statistics: lsfdev.ps1 api -Script `"analyzeDBAction();`"; otherwise retry status shortly" } else { "the app server is not listening on RMI port $rmi (see the App server line above) - the web client may be blocked waiting for it; run start-server first" }
+            Warn "Web client    : Tomcat PID $tPid accepts TCP on port $web but gave no HTTP response within the 5 s probe - still starting, or answering very slowly; $hint$ownNote"
+        }
     }
     elseif ((Process-Alive $tPid) -and (Test-PortOpen $web)) { Warn "Web client    : Tomcat PID $tPid is alive but web port $web is served by PID(s) $($webOwners -join ', ') - its connector likely failed to bind (foreign process on the port). Free the port or setup -WebPort <free port>." }
     elseif (Test-PortOpen $web) { Warn "Web client    : something is on web port $web (PID file stale)" }

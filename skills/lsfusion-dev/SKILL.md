@@ -701,6 +701,11 @@ exits 1. One nuance on `start-web`: exit 1 with the "STILL RUNNING" WARN
 means **readiness was not confirmed within `-Timeout`** (honored in full,
 default 180 s — there is no internal cap), NOT that Tomcat is broken — it is
 left running and often finishes moments later; `status` re-checks cheaply.
+The WARN names which of two shapes it is: **"TCP connect OK, no HTTP
+response"** = the app is reachable and alive, just answering slowly — if
+data recently grew, refresh PostgreSQL statistics first
+(`analyzeDBAction()`, below) instead of hunting connector problems; **"TCP
+never connected"** = the HTTP connector never bound.
 War **deploy** (~15 s in catalina.log) is not readiness: the app answers its
 first 200 tens of seconds after that on a loaded machine.
 
@@ -844,11 +849,18 @@ then wonder why the server is gone; the how-to-tell-what-killed-it checklist
 is in [Servers, sessions and other processes on the
 box](#servers-sessions-and-other-processes-on-the-box).
 
-**Refresh PostgreSQL statistics after a first start or a big schema change —
-call `analyzeDBAction()`.** lsFusion emits large, join-heavy SQL. On a
-freshly-loaded dev DB — or after a sync that created/changed many tables —
-PostgreSQL has **no planner statistics** for those tables, so the first form
-opens and counts can crawl until autovacuum eventually catches up. The
+**Refresh PostgreSQL statistics after a first start, a big schema change, or
+mass data growth — call `analyzeDBAction()`.** lsFusion emits large,
+join-heavy SQL. Whenever PostgreSQL's planner statistics don't match the
+data — a freshly-loaded dev DB, a sync that created/changed many tables, **or
+a lot of new rows since the last ANALYZE** (bulk imports, API loads, or data
+created through the app's own UI — no schema change needed) — form opens and
+counts can crawl until autovacuum eventually catches up. The stale-data
+variant is the treacherous one: the UI that opened instantly yesterday
+suddenly takes minutes (measured: landing page 104 s → 0.7 s after ANALYZE),
+`start-web`/`status` report "TCP OK but no HTTP response", and it is easy to
+burn the diagnosis on hung connectors or leaked browsers — run this action
+**first** when a working app suddenly slows down. The
 platform ships a built-in maintenance action for exactly this:
 **`analyzeDBAction()`** (from the system `Service` module — also callable as
 `Service.analyzeDBAction()`), which runs PostgreSQL `ANALYZE` on the
@@ -864,8 +876,9 @@ lsfdev.ps1 api -Script "analyzeDBAction();"
 
 Calling the action (rather than raw `psql`) works uniformly with no psql
 client on PATH and no DB credentials to dig out. Skip it for ordinary
-edit→restart cycles; it only matters after the first full schema load or a
-sync that touched many tables.
+edit→restart cycles; it matters after the first full schema load, a sync
+that touched many tables, or whenever data volume jumped since the last
+run — regardless of whether the schema changed.
 
 > **UTF-8 / non-ASCII pitfall.** Put any non-ASCII script text (Cyrillic
 > names, localized strings) in a UTF-8 file and pass `-ScriptFile` — never
@@ -1090,6 +1103,42 @@ checking the unit-test output.
    canceled `APPLY` logs, but **cannot rescue a plain `MESSAGE`** (no
    `NOWAIT` → no log line → nothing to tail; use `RETURN`/`EXPORT` for
    anything you need to read back).
+
+   **The `Server message:` log line is a no-client-context behavior — not a
+   property of `NOWAIT`.** The platform logs a message only when the action
+   runs with **no interactive client attached** (Action API calls, scheduler
+   tasks). The same action triggered from a live UI — a form button, a
+   custom-view controller callback — delivers `MESSAGE`, `NOWAIT` included,
+   to that client's browser and writes **nothing** to the server log:
+   instrumenting a UI-triggered action with `MESSAGE ... NOWAIT` and then
+   tailing the log is a measured dead end (the toast pops in the user's
+   browser, the log stays silent). To trace an action that runs from the
+   UI, write into a `DATA` property and apply it in a **separate** session —
+   `NEWSESSION`, not `NESTEDSESSION` (a nested session's `APPLY` copies
+   changes back into the form's session instead of the database) — so the
+   trace persists immediately without committing the user's own pending
+   form changes:
+
+   ```lsf
+   diag = DATA STRING ();
+   // inside the action under test (OVERRIDE keeps the entry when x is
+   // NULL: string + propagates NULL, and CONCAT skips a NULL operand -
+   // the trace would silently record nothing):
+   NEWSESSION { diag() <- CONCAT ' | ', diag(), 'reached A, x=' + (OVERRIDE STRING(x), 'null'); APPLY; }
+   ```
+
+   then read it back any time with `lsfdev.ps1 api -Script "RETURN
+   MyModule.diag();"` and reset with `NEWSESSION { MyModule.diag() <- NULL;
+   APPLY; }` — namespace-qualify the property in API scripts, they resolve
+   names across every loaded module. Two caveats: (1) inside `NEWSESSION`
+   property reads see a **fresh** session, not the form's uncommitted
+   changes — parameters (like `x` above) carry their values in, so pass
+   whatever you need to log as a parameter or bake it into the string
+   beforehand; (2) the isolation holds only **outside** an apply
+   transaction — when the instrumented code runs inside apply events or
+   constraints, the platform defers the `NEWSESSION` body into the outer
+   `APPLY`, so the trace shares that apply's fate and vanishes if it is
+   canceled (readback stays empty even though the code ran).
 
 3. **UI, last.** When log + API agree the build is healthy, check the
    UI. The workhorse is `verify` — it exists in every harness, and the

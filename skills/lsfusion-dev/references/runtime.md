@@ -209,7 +209,16 @@ for a 2xx/3xx answer; note that the war *deploy* line in catalina.log
 (~15 s) is **not** readiness — the app's first 200 typically lands tens of
 seconds later, longer on a loaded machine. A run that ends with the
 "STILL RUNNING" WARN + exit 1 means "not confirmed in time", not "broken":
-Tomcat keeps deploying and `status` usually flips to OK shortly.
+Tomcat keeps deploying and `status` usually flips to OK shortly. The final
+message diagnoses by the **last** probe (earlier history is reported as
+context): **"TCP connect OK, no HTTP response"** = Tomcat reachable, the
+app answering slowly — see the stale-statistics row in Troubleshooting;
+**"TCP never connected"** = the HTTP connector never bound; a probe still
+answering an HTTP error at the end of the wait is a distinct war-problem
+case, and a connector that accepted TCP earlier but not at the end is
+called out as flapping. The stale-statistics hint is offered only while
+the app server's RMI port is listening — a web client blocked on a stopped
+app server gets "run start-server" instead.
 
 ## settings.properties keys
 
@@ -276,8 +285,10 @@ access, installing JDK 11 or 17 is the most reliable fix.
 | `Address already in use` / port `7652`/`8080` busy | Another process holds the port. `lsfdev.ps1 stop`; if the port is held by a foreign process, `setup -RmiPort <free>` / `-WebPort <free>` (setup rewrites `settings.properties` and Tomcat's `server.xml` together), then `start`. |
 | `BindException` from `WebSocketServer` in stderr, server otherwise starts | Another instance holds `webSocket.port` (default `8887`). Non-fatal but WebSocket features silently break — set a per-instance `webSocket.port` (`setup -WebSocketPort <free> -Force`) and restart. |
 | Web UI loads but shows a connection error | The application server is not running or not on `7652`. Check `lsfdev.ps1 status` and the server log. |
+| Web UI **suddenly** takes minutes to load / `start-web` cannot confirm readiness although Tomcat listens (probe says "TCP connect OK, no HTTP response") | The app is alive — its queries crawl on **stale PostgreSQL planner statistics**. Happens after mass data growth (bulk import, API load, or rows created through the app's own UI), **no schema change needed**. Run `lsfdev.ps1 api -Script "analyzeDBAction();"` *before* suspecting hung connectors, IPv6 binding or browser leaks (measured: landing page 104 s → 0.7 s). Requires the app server up — `api` goes through it; the WARN checks its RMI port and says `start-server` instead when it is down. |
 | **Every** form open fails with `invalid stream header` (or `StreamCorruptedException` / `InvalidClassException`), web UI otherwise loads | The client war and the server jar come from **different builds** of the same `-SNAPSHOT` version — RMI serialization mismatch. Typical in Maven projects: Maven updated the server snapshot, the war stayed from an older `setup`. `status` / `start-web` print both build dates and the remedy for the stale side: server newer → `setup -RefreshWar`; war newer → `mvn -U -DskipTests compile` + `restart` (Maven-resolved server), or delete `.lsfusion-dev/lsfusion-server-<ver>.jar` and re-run `setup` (skill-downloaded server). |
 | Scheduler task saved with an **empty action**; `actionCanonicalName('My.action[]')` returns NULL for an action that exists in code | Lightstart skipped the Reflection sync, so actions added since the last full start have no `Reflection.Action` row — the lookup silently returns NULL. Run **one** `restart -FullStart`, then re-create/re-pick the action (see [Lightstart](#lightstart)). |
+| Added `MESSAGE ... NOWAIT` to an action for debugging, but no `Server message:` line ever appears in the log | The action runs from a **live UI** (form button, custom-view controller callback) — messages, `NOWAIT` included, go to that client's browser and never reach the log; the `Server message:` log line exists only for no-client contexts (Action API, scheduler). Trace UI-triggered actions with a `DATA` property written inside `NEWSESSION { ... APPLY; }`, read back via `api -Script "RETURN ...;"` (recipe + caveats in SKILL.md, verification step 2). |
 | Tomcat exits immediately | Read `.lsfusion-dev/tomcat/logs/catalina.*.log`. Usually a bad war or a port clash on `8080`/`8005`. |
 | The app server (and maybe Tomcat) is **gone** although nothing in your session stopped it — no error, `server.out.log` just ends | Something killed the JVM. Establish the killer before working around it (checklist in SKILL.md, *Servers, sessions and other processes on the box*): `%TEMP%\claude-lsfdev-hooks.log` says whether the plugin's **session-end auto-stop** fired (it stops the projects a session started once that session's CLI process ended and was not resumed for `LSFDEV_STOP_GRACE_MIN` = 60 min; a resumed session cancels it, and the next session start reports it; `lsfdev.ps1 keep-running` opts a project out); a **graceful** end (`Server is stopping…`, Tomcat's `Stopping ProtocolHandler`) is a Windows shutdown/logoff or Ctrl+C, not a kill; an abrupt end with the Tomcat still up is the signature of another session's `Get-Process java … | Stop-Process` sweep — grep the other sessions' transcripts. The JVMs are launched detached from the tool shell (0.1.34+), so a stopped/aborted tool call is not a suspect anymore. Fix = `restart`, never a pattern kill of your own. |
 | `start-server` says **inconclusive** | First start builds the DB schema and can take minutes. Re-run `log`, or `start-server -Timeout 300`. |

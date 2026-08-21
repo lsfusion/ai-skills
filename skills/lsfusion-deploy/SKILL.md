@@ -582,7 +582,7 @@ same skill, Part 2 — the platform's built-in **`/files/list` /
 JVM's classpath, no SSH or jar tooling needed. Reach for that before
 anything else when you need to know "is feature X really on the server?".
 
-### Refresh PostgreSQL planner statistics after a first install or a big schema change — call `analyzeDBAction()`
+### Refresh PostgreSQL planner statistics after a first install, a big schema change, or mass data growth — call `analyzeDBAction()`
 
 A freshly-loaded DB has **no PostgreSQL planner statistics**, so the first queries and form opens can crawl until autovacuum catches up. Immediately after `STARTED`, call the platform's built-in **`analyzeDBAction()`** (runs `ANALYZE` on the server's own connection) once over the Action API — rationale and details in the **lsfusion-dev** skill, step 4; the auth rule (deployed = devmode OFF = `-u admin:` with empty password) in **lsfusion-eval**:
 
@@ -592,7 +592,7 @@ curl -sS -u 'admin:' -X POST -H 'Content-Type: application/x-www-form-urlencoded
   https://<host>/eval/action
 ```
 
-Run it after the **first** deploy and after any deploy that adds/removes many classes/properties; skip it for steady-state redeploys that only change resources (JS/CSS) or a handful of properties.
+Run it after the **first** deploy, after any deploy that adds/removes many classes/properties, and whenever a working UI **suddenly slows to minutes** after heavy data growth (bulk load, integration import, or rows created through the app's own UI — stale statistics need no schema change; measured 104 s → 0.7 s on a landing page). Skip it for steady-state redeploys that only change resources (JS/CSS) or a handful of properties.
 
 ### Lock the drop guards back to `true` once the deploy succeeded
 

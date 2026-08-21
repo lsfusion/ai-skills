@@ -390,8 +390,17 @@ not in the response body, and (for a plain `MESSAGE`) not even in the server
 log; only `MESSAGE ... NOWAIT` leaves a `Server message:` line in the log.
 Without `NOWAIT` the text is visible **nowhere at all** — no log-tailing
 trick (including `lsfdev.ps1 api`'s own `Server message:` capture) can
-recover it. Don't put `MESSAGE` in API scripts at all. Two ways to actually
-read a value:
+recover it. Don't put `MESSAGE` in API scripts at all. And that
+`Server message:` line is a **no-client-context** behavior, not a property
+of `NOWAIT`: an action triggered from a live UI (a form button, a
+custom-view controller callback) delivers `MESSAGE`, `NOWAIT` included, to
+the client's browser and writes nothing to the server log — log-tailing
+cannot trace UI-triggered actions either. Instrument those by writing into
+a `DATA` property inside `NEWSESSION { ... APPLY; }` and reading it back
+with `RETURN` (recipe and its caveats — NULL-safe formatting,
+namespace-qualified readback, no isolation inside apply events — in the
+**lsfusion-dev** skill, verification step 2).
+Two ways to actually read a value:
 
 **1. `RETURN <expr>;` — the action's return value becomes the response
 body.** Simplest path for a scalar (a count, a name, a
