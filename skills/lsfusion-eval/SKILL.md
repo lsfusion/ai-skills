@@ -422,6 +422,21 @@ curl -sS -X POST \
   http://localhost:7651/eval
 ```
 
+**One NULL annihilates a concatenated `RETURN` — build multi-value probes
+as `EXPORT` columns instead.** String `+` propagates NULL, so a probe like
+`RETURN 'items=' + STRING(cntItems()) + ' orders=' + STRING(cntOrders());`
+returns an **empty body** the moment any single operand is NULL —
+indistinguishable from the other no-proof empty 200s, and the
+"empty body → use `RETURN`/`EXPORT`" hint won't rescue you because a
+`RETURN` *was* there (measured: one NULL among a dozen concatenated
+counters blanked the whole probe). Give each value its own `EXPORT` column
+— a NULL column just drops out of the JSON while the rest survive
+(verified live: `EXPORT FROM a = 1, b = (1 IF 1>2), c = 'ok';` →
+`{"a":1,"c":"ok"}`; the missing-key rule below tells you how to read
+that). If you do concatenate into one `RETURN`, wrap **every** operand in
+`OVERRIDE ..., 0` / `OVERRIDE ..., ''` — as the two-counter recipe under
+Common recipes does; one bare operand is enough to blank the body.
+
 **2. `EXPORT FROM` to stdout via the response body.** For tabular /
 structured data the
 action's `EXPORT` target becomes the HTTP response body — content type is

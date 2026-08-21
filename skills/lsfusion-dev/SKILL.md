@@ -1088,7 +1088,10 @@ checking the unit-test output.
    **Reading values back and confirming mutations has sharp edges — the
    canonical recipes are in the lsfusion-eval skill** ("Getting values
    back", "Chaining and verifying"). In short: `RETURN <expr>;` sends a
-   scalar back in the response body, a
+   scalar back in the response body (for **several** values give each its
+   own `EXPORT FROM a = ..., b = ...` column rather than concatenating one
+   `RETURN` — string `+` propagates NULL, so one NULL operand blanks the
+   whole body, while a NULL EXPORT column just drops out of the JSON), a
    plain `MESSAGE` is visible **nowhere** over HTTP (not in the response
    and not in the server log — only `MESSAGE ... NOWAIT` leaves a
    `Server message:` log line), and a constraint-canceled `APPLY`

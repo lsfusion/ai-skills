@@ -3880,13 +3880,17 @@ function Cmd-Api {
             $explained = (Test-Path $hintMarker) -and
                 (((Get-Date) - (Get-Item $hintMarker).LastWriteTime).TotalHours -lt 6)
             if ($explained) {
-                Info "(empty response body - carries no proof, and a plain MESSAGE is invisible over HTTP."
+                Info "(empty response body - carries no proof; a plain MESSAGE is invisible over HTTP; a concatenated"
+                Info " RETURN blanks when ANY operand is NULL - prefer EXPORT FROM columns or OVERRIDE each operand."
                 Info " For mutations, end the script with: $recipe)"
             } else {
                 Info "(empty response body - normal for actions without RETURN/EXPORT, but carries no proof either:"
                 Info " a plain MESSAGE (no NOWAIT) is visible NOWHERE over HTTP - not here and not in the server"
                 Info " log, so the log tail below cannot surface it either; only MESSAGE ... NOWAIT leaves a log"
                 Info " line. A constraint-canceled APPLY still answers 200."
+                Info " If the script DID have a RETURN: a concatenated RETURN goes empty when ANY operand is NULL"
+                Info " (string + propagates NULL) - give each value its own EXPORT FROM column (a NULL column just"
+                Info " drops out of the JSON while the rest survive), or wrap every operand in OVERRIDE ..., 0/''."
                 Info " Also: EXPORT must be at the TOP LEVEL - its result is a session-local property, so inside"
                 Info " NEWSESSION{} it is discarded with the session and never reaches the HTTP response (RETURN is"
                 Info " fine inside NEWSESSION - it propagates up the stack - but an /eval/action script already runs"
