@@ -345,7 +345,8 @@ whether `MATERIALIZED` is legal on that property shape, aggregation
 well-formedness beyond grammar), and it cannot judge `REQUIRE`
 completeness — the throwaway module depends on **every** loaded module,
 so names resolve even when the real module's `REQUIRE` list would not
-reach them (that failure surfaces only on restart). Parse errors come
+reach them (that failure surfaces only at a full load — the restart, or
+locally the `dryrun` described below). Parse errors come
 batched, but **name errors surface one per call** (fix and re-run), any
 load-only construct suppresses name checking for the whole script (see
 the phase table), and
@@ -353,19 +354,23 @@ two real-module constructs **crash eval's compiler outright** instead of
 producing the polite restriction error — measured on 7.0-SNAPSHOT:
 `EXTEND FORM` (`RuntimeException NF COLLECTION RESTARTED`) and `() + { }`
 overrides of existing actions (`ClassCastException ... NFList`). A file
-containing those can't be linted past the offending statement — the
-restart is the only check for it (`precheck` reports such files as
+containing those can't be linted past the offending statement — only a
+full load checks it: the restart, or locally the scoped `dryrun` (below;
+`precheck` reports such files as
 "cannot lint" rather than failing them). The limit case is a file that is
 *entirely* META definitions / `@`-instantiations / `EXTEND FORM` (a
 typical extension/main module): eval coverage there is **zero** — META
 bodies compile only at instantiation — and `precheck` classifies such
 files upfront as **"restart-only"**, checking just the structure (MODULE
 header, META/END balance, brackets); neither an ambiguity nor a
-constraint error in them can surface before the restart, so budget that
-cycle instead of re-linting. For a whole new module in one
-pass, temporarily strip the load-only options
+constraint error in them can surface before a full load — locally that
+is a seconds-cheap scoped `dryrun`, on a remote server the restart
+cycle — so don't re-lint them. For a whole new module in one
+pass on a **remote** server, temporarily strip the load-only options
 (`NONULL`/`MATERIALIZED`/`INDEXED`) so the `DATA`/calc/form surface
-checks cleanly, and probe each `CLASS`/`WHEN`/`CONSTRAINT` separately.
+checks cleanly, and probe each `CLASS`/`WHEN`/`CONSTRAINT` separately —
+on a local lsfdev box skip that contortion and run the scoped `dryrun`
+(next paragraph), which checks the module exactly as written.
 Actually loading the schema still requires the restart — this just
 catches the typos first, cheaply. (For comparison, measured on
 7.0-SNAPSHOT: ~30 ms per precheck call vs a 26–41 s failed-restart cycle
@@ -379,9 +384,23 @@ the server JVM with `-Dsettings.dryRun=true`, which loads and checks the
 restart-only class — then exits before the DB sync: no ports bound, the
 running server untouched, **no PostgreSQL at all**, ~9 s of JVM on a
 772-module project (`-TopModule` narrows the scope further;
-comma-separated list allowed). It needs the sources and the platform jar
-locally, so for a **remote** server eval stays the only lint; use eval
-per-edit (milliseconds), `dryrun` as the pre-restart gate.
+comma-separated list allowed on 7.0-SNAPSHOT builds from 2026-08-03 —
+an older dryRun-capable build reads the list as ONE module name and
+fails with `Module 'A,B' not found`; pass one module per run there).
+It needs the sources and the platform jar
+locally, so for a **remote** server eval stays the only lint. On a local
+box split the roles by what eval can actually reach: eval/`precheck`
+per-edit where names get checked — files of plain calc properties,
+actions, `FORM`s with **no** load-only construct anywhere in them
+(milliseconds; one `CLASS` in the file blinds names for all of it); for
+new-module code full of load-only
+constructs, where eval is a syntax check at best, the scoped
+`dryrun -TopModule <Mod>` IS the per-edit loop (~4 s per run, one
+semantic error per run like a restart), with an
+unscoped `dryrun` as the pre-restart gate — a scoped run skips the
+edited modules' dependents, and under a configured `logics.topModule`
+(the standard layout) the restart itself loads only that module's
+`REQUIRE` closure, so wire new modules in before that gate.
 
 ### Getting values back
 

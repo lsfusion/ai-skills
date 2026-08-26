@@ -2254,6 +2254,7 @@ function Cmd-DryRun {
         $scope = if ($TopModule) { "the REQUIRE closure of '$TopModule'" } else { "the configured module set" }
         Ok "Logic compiled and checked successfully in $secs s ($moduleCount$scope). No ports were bound, no schema was synced, nothing was started."
         Info "This validates everything a restart checks at LOAD time; the restart itself is still needed to apply the schema (and to catch DB-sync/migration issues)."
+        if ($TopModule) { Info "Scoped run: dependents of the listed modules were NOT checked, and under a configured logics.topModule (the standard layout) a module must be REQUIREd (transitively) from it for a restart to load it at all - wire new modules in, then gate with an unscoped dryrun before restarting." }
     } elseif ($proc.ExitCode -eq 0) {
         Warn "JVM exited 0 but the dry-run success marker is missing - inspect the log:"
         $tailOut | ForEach-Object { Write-Host "    $_" }
@@ -2280,6 +2281,14 @@ function Cmd-DryRun {
         }
         Write-Host ""
         if ($logicFail) { Info "Like a restart, ONE semantic error is reported per run (parse errors come batched) - fix and re-run. Sub-second single-file linting: precheck." }
+        elseif ($TopModule -and $TopModule.Contains(',') -and $outText -match "Module '[^']*,[^']*' not found") {
+            # Measured on a 2026-07-31 build: dryRun works but the comma-list
+            # lands as ONE module name ("Module 'A,B' not found") - list
+            # support arrived in 7.0-SNAPSHOT builds from 2026-08-03.
+            Info "This platform build treats the comma-list as ONE module name (comma-separated topModule arrived in 7.0-SNAPSHOT builds from 2026-08-03). Re-run per module ($(@($TopModule -split ',' | ForEach-Object { "-TopModule $($_.Trim())" }) -join ' / ')), run unscoped (checks the project's configured module set - under a configured topModule an unwired new module stays unchecked), or update the platform:"
+            if ($mode.UseMaven) { Info "  mvn -U -DskipTests compile, then re-run dryrun." }
+            else { Info "  delete '$jarPath' and re-run setup (it refetches missing artifacts)." }
+        }
         exit 1
     }
 }
@@ -3554,7 +3563,7 @@ function Cmd-Precheck {
 
     $headers = Get-EvalAuthHeaders $cfg
     Info "POST http://localhost:$($cfg.httpPort)/eval (statements mode), $($targets.Count) file(s)."
-    Info "Verifies syntax everywhere and names where eval reaches them (~30 ms/file); loading the schema still requires a restart."
+    Info "Verifies syntax everywhere and names where eval reaches them (~30 ms/file); module files or names eval cannot reach get the exact scoped 'dryrun' command in the summary (seconds, full load fidelity)."
     Write-Host ""
     # Top-level names declared anywhere in THIS selection (column-0
     # declarations and CLASSes, harvested off the comment-blanked shadow).
@@ -3589,6 +3598,14 @@ function Cmd-Precheck {
     }
     $failCount = 0
     $skipCount = 0
+    # Files whose NAMES eval never reached (load-only constructs preempt name
+    # resolution) still print an Ok - count them separately so the summary
+    # tells the truth instead of "all pass". Their modules (plus the skipped
+    # files') feed a concrete scoped-dryrun suggestion: dryrun load-checks
+    # exactly what eval could not, in seconds, several times cheaper than the
+    # restart the old wording pointed at.
+    $nameBlind = 0
+    $uncheckedModules = New-Object 'System.Collections.Generic.List[string]'
     foreach ($t in $targets) {
         $leaf = Split-Path $t -Leaf
         try {
@@ -3608,16 +3625,26 @@ function Cmd-Precheck {
             # safe direction even if eval would refuse INTERNAL). A call
             # site (run();) or a longer name (runTotals) does not match.
             $fileShadow = Get-CommentBlankedShadow $raw
+            # Module name harvested early: the dryrun hint wants it even for
+            # files the run()-guard below skips (a dry run only LOADS modules,
+            # it executes nothing, so it is the right check for them too).
+            $moduleName = $null
+            if ($fileShadow -cmatch '^\s*MODULE\s+([A-Za-z_][A-Za-z0-9_]*)\s*;') { $moduleName = $Matches[1] }
             if ($fileShadow -cmatch '(?m)^[ \t]*run(?![A-Za-z0-9_])\s*(?:''(?:[^''\\]|\\.)*''\s*)?(?:\([^)]*\)\s*)?(?:\{|\+?=|INTERNAL\b)') {
                 $skipCount++
-                Warn "$leaf - skipped: it declares run(), and /eval EXECUTES run() - a linter must not run project actions. Rename the action (or lint the file without it)."
+                if ($moduleName) { $uncheckedModules.Add($moduleName) }
+                # The dryrun alternative applies only to a real module (a
+                # headerless run() file is an eval probe - not loadable, and
+                # deliberately not FAILed for the missing header either).
+                $runDryNote = if ($moduleName) { " Or check it via 'dryrun' - a dry run loads modules without executing anything." } else { "" }
+                Warn "$leaf - skipped: it declares run(), and /eval EXECUTES run() - a linter must not run project actions. Rename the action (or lint the file without it).$runDryNote"
                 continue
             }
             # Every .lsf module must open with a MODULE header - the restart
             # loader rejects a file without one, and header-stripping cannot
             # flag what is absent. Checked on the shadow (a leading license
             # comment is already blank there).
-            if ($fileShadow -cnotmatch '^\s*MODULE\s+[A-Za-z_][A-Za-z0-9_]*\s*;') {
+            if (-not $moduleName) {
                 $failCount++
                 Bad "$leaf - FAIL: no valid leading 'MODULE <Name>;' header - the restart loader requires one (precheck strips headers, it cannot invent a missing one)."
                 continue
@@ -3656,6 +3683,7 @@ function Cmd-Precheck {
                 # PASS or a misleading compiler-crash report - say the truth
                 # upfront instead.
                 $skipCount++
+                $uncheckedModules.Add($moduleName)
                 Warn "$leaf - restart-only: the file is entirely META definitions / @-instantiations / EXTEND FORM. eval can check NONE of its content - ambiguity and constraint errors included - so only structure was verified (MODULE header, META/END balance, brackets). Only a full load checks this file: run 'dryrun' (seconds, live server untouched) or budget the restart cycle - don't re-run precheck for it."
                 continue
             }
@@ -3668,7 +3696,7 @@ function Cmd-Precheck {
             }
             $metaCaveat = ""
             if ($cov.HasMeta) {
-                $metaCaveat = " (declares META: bodies compile only at @-instantiation - a definition not instantiated in THIS file stays unchecked until restart)"
+                $metaCaveat = " (declares META: bodies compile only at @-instantiation - a definition not instantiated in THIS file stays unchecked until a load whose scope instantiates it)"
             }
             $scriptText = (Strip-ModuleHeader $raw) + "`r`nrun() {}"
             # Transport: small scripts ride the %XX query parameter (decodes
@@ -3714,9 +3742,10 @@ function Cmd-Precheck {
             # (ClassCastException). Says nothing about the file's validity.
             if ($body -match 'RemoteInternalException|Internal Server Error:\s*java\.') {
                 $skipCount++
+                $uncheckedModules.Add($moduleName)
                 $first = "$(@($body -split "`r?`n" | Where-Object { $_.Trim() })[0])".Trim()
                 if ($first.Length -gt 160) { $first = $first.Substring(0, 160) + " ..." }
-                Warn "$leaf - cannot lint: eval's compiler crashed on a construct it does not support (typically EXTEND FORM or a '() + { }' override of an existing action). Only a restart checks this file."
+                Warn "$leaf - cannot lint: eval's compiler crashed on a construct it does not support (typically EXTEND FORM or a '() + { }' override of an existing action). Only a full load checks this file - 'dryrun' does it in seconds, live server untouched."
                 Info "    ($first)"
                 continue
             }
@@ -3734,8 +3763,10 @@ function Cmd-Precheck {
                 # (measured: a name error on line 1 goes unreported when a
                 # CLASS sits on line 2), so this outcome proves the syntax of
                 # the whole file and nothing about its names.
+                $nameBlind++
+                $uncheckedModules.Add($moduleName)
                 $where = if ($evalOnly[0] -match ':(\d+):\d+') { " at line $($Matches[1])" } else { "" }
-                Ok "$leaf - syntax OK (whole file). Names NOT checked: a load-only construct$where stops eval before name resolution - names in this file surface only on restart.$metaCaveat"
+                Ok "$leaf - syntax OK (whole file). Names NOT checked: a load-only construct$where stops eval before name resolution - names in this file surface only at a full load: 'dryrun' (seconds, live server untouched) or the restart.$metaCaveat"
             } else {
                 # A not-found on a name that another file of THIS selection
                 # declares is a cross-file reference eval cannot see, not a
@@ -3758,7 +3789,8 @@ function Cmd-Precheck {
                 }
                 if ($crossRefs.Count) {
                     $skipCount++
-                    Warn "$leaf - inconclusive: uses $($crossRefs -join ', ') - eval checks files one at a time, so a name declared in another file of this same selection cannot resolve here. Cross-file references are checked by the restart."
+                    $uncheckedModules.Add($moduleName)
+                    Warn "$leaf - inconclusive: uses $($crossRefs -join ', ') - eval checks files one at a time, so a name declared in another file of this same selection cannot resolve here. Cross-file references are checked by a full load: 'dryrun' (seconds) or the restart."
                 } else {
                     $failCount++
                     Bad "$leaf - FAIL:"
@@ -3771,14 +3803,36 @@ function Cmd-Precheck {
         }
     }
     Write-Host ""
+    # Everything eval could not fully check - names behind load-only
+    # constructs, restart-only files, crashed lints, cross-file references,
+    # run() files - is exactly what a dryrun scoped to those modules (their
+    # REQUIRE closures come along automatically) validates in seconds without
+    # touching the running server. Name that command instead of pointing at
+    # the restart, which costs several times more per attempt. Always the
+    # SCOPED list, never a bare 'dryrun': the unscoped run follows the
+    # CONFIGURED top module's closure, and a new module not yet REQUIREd from
+    # it would silently stay outside that check - the scoped list checks the
+    # named modules regardless of wiring.
+    $dryHint = $null
+    $unchecked = @($uncheckedModules | Select-Object -Unique)
+    if ($unchecked.Count) {
+        $dryHint = "dryrun -TopModule `"$($unchecked -join ',')`""
+    }
     if ($failCount) {
         Bad "$failCount of $($targets.Count) file(s) failed the pre-check."
-        Info "Name errors surface ONE per call (parse errors come all at once) - fix, re-run precheck until clean, THEN restart."
+        Info "Name errors surface ONE per call (parse errors come all at once) - fix, re-run precheck until clean."
+        if ($dryHint) { Info "The unchecked/skipped files above stay unproven either way - once precheck is clean, run '$dryHint' to load-check them (seconds, live server untouched), then the usual tail: unscoped 'dryrun' gate, restart to apply." }
+        else { Info "Then gate with 'dryrun' (REQUIRE completeness is beyond eval's reach - it sees every loaded module) and restart to apply." }
         exit 1
-    } elseif ($skipCount) {
-        Warn "$skipCount of $($targets.Count) file(s) skipped (reasons above), the rest pass - the restart is the only check for the skipped ones."
+    } elseif ($skipCount -or $nameBlind) {
+        if ($skipCount) { Warn "$skipCount of $($targets.Count) file(s) not fully checked (each reason above - coverage there ranges from partial name checking down to none)." }
+        if ($nameBlind) { Warn "Syntax passed everywhere it was checked, but names went UNCHECKED in $nameBlind of $($targets.Count) file(s) (load-only constructs) - 'is not found' errors there are exactly what a restart would still hit." }
+        if ($dryHint) {
+            Info "Cheap full check of the unchecked modules above: '$dryHint' - real load fidelity (names, REQUIRE closure, META / EXTEND FORM) in seconds, the running server untouched."
+            Info "Then, before the restart that applies the schema: REQUIRE each new module from the top module (under a configured logics.topModule - the standard layout - an unwired module is invisible to the restart and the unscoped dryrun alike), then gate with an unscoped 'dryrun' (a scoped pass does not check dependents) and restart."
+        }
     } else {
-        Ok "All $($targets.Count) file(s) pass. This proves syntax (+ names where eval reached them) - the schema itself still loads on restart."
+        Ok "All $($targets.Count) file(s) pass. This proves syntax (+ names where eval reached them) - REQUIRE completeness is beyond eval either way, so gate with 'dryrun' (seconds), then restart to apply the schema."
     }
 }
 
@@ -4088,34 +4142,43 @@ version and dies on every plugin update.
                  Exit codes: 0 = HTTP success, 1 = request failed (HTTP
                  error / connection), 3 = client timeout (NO verdict).
   precheck       Sub-second syntax + name check of .lsf files against the
-                 RUNNING dev server, before paying for a restart (which
-                 reports name errors one at a time). -Files 'a.lsf','b.lsf'
+                 RUNNING dev server (~30 ms/file). -Files 'a.lsf','b.lsf'
                  (project-relative or absolute); default: every .lsf under
                  src/main. Strips MODULE/REQUIRE headers, posts to /eval.
                  Verdicts say what was proven: files with load-only
-                 constructs (CLASS/WHEN/...) get syntax-only coverage, and
+                 constructs (CLASS / persistent DATA / WHEN / CONSTRAINT)
+                 get syntax-only coverage - names NOT checked - and
                  EXTEND FORM / '() + { }' files can't be linted at all. A
                  file that is ENTIRELY META definitions / @-usages / EXTEND
                  FORM is reported upfront as RESTART-ONLY (eval compiles none
                  of it - ambiguity/constraint errors included); precheck
                  still checks its structure (MODULE header, META/END balance,
-                 bracket balance) but only a full load is the real check -
-                 dryrun does it in seconds, the restart while applying.
+                 bracket balance). When module files or names went unchecked,
+                 the summary prints the exact scoped 'dryrun -TopModule ...'
+                 command that checks them in seconds (a headerless run()
+                 probe keeps only its per-file warning - not a module, not
+                 dry-runnable). NEW modules are mostly such
+                 load-only declarations, so for new code iterate on the
+                 scoped dryrun; precheck's name coverage pays off on files
+                 free of load-only constructs (computed properties, actions,
+                 FORMs - one CLASS anywhere blinds the whole file's names).
                  REQUIRE completeness is never checked (eval sees every
                  loaded module) - a missing REQUIRE surfaces only at
                  restart or dryrun.
-  dryrun         Full-fidelity validation of the WHOLE project without
-                 starting it: launches the server JVM with
-                 -Dsettings.dryRun=true, which compiles and checks every
-                 module (parse, metacode expansion, name resolution vs the
-                 real REQUIRE graph, EXTEND FORM - everything a restart
-                 checks at LOAD time) and exits before the DB sync. Binds NO
-                 ports, syncs NO schema, opens NO DB connection at all (no
-                 PostgreSQL needed), runs safely NEXT TO a live server
-                 (never stops or touches it). Covers
+  dryrun         Full-fidelity validation of the project without starting
+                 it - the inner validation loop for NEW code (scoped via
+                 -TopModule) and the gate before a restart. Launches the
+                 server JVM with -Dsettings.dryRun=true, which compiles and
+                 checks every module in scope (parse, metacode expansion,
+                 name resolution vs the real REQUIRE graph, EXTEND FORM -
+                 everything a restart checks at LOAD time) and exits before
+                 the DB sync. Binds NO ports, syncs NO schema, opens NO DB
+                 connection at all (no PostgreSQL needed), runs safely NEXT
+                 TO a live server (never stops or touches it). Covers
                  precheck's blind spots (missing REQUIRE, EXTEND FORM /
-                 restart-only files) at the cost of a JVM boot instead of
-                 milliseconds. -TopModule <M> forces logics.topModule for
+                 restart-only files, names behind load-only constructs) at
+                 the cost of a JVM boot instead of milliseconds.
+                 -TopModule <M> forces logics.topModule for
                  this run only, limiting the check to the REQUIRE closure
                  (faster on many-module projects); a comma-separated list
                  is allowed (quote it: -TopModule "A,B").

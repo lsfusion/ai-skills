@@ -428,7 +428,11 @@ start. `dryrun -TopModule <M>` overrides it per-run via
 `lsfusion.properties`). The value may be a **comma-separated list** —
 the union of the closures is loaded; quote it (`-TopModule
 "Sales,Purchase"`) so PowerShell passes one string (measured: an unknown
-name anywhere in the list fails with `Module 'X' not found`). Everything
+name anywhere in the list fails with `Module 'X' not found`). List
+support arrived in 7.0-SNAPSHOT builds from **2026-08-03**: an older
+dryRun-capable build reads the whole list as ONE module name and fails
+with `Module 'A,B' not found` (measured on a 2026-07-31 build; the
+command detects that and prints per-module / update fallbacks). Everything
 outside the closure
 is dropped **before parsing** — a module outside the closure contributes
 nothing, not even syntax errors — and dependents of the listed modules

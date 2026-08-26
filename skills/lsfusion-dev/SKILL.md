@@ -215,8 +215,8 @@ a running `verify -Session` browser, or anything else that happened before.
 | `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. Exit codes are trustworthy: **0** = HTTP success, **1** = request failed (HTTP error / connection refused), **3** = client timeout (no verdict — deliberately distinct from 1). |
-| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server, before paying for a restart. `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). See "run `precheck`" below. |
-| `dryrun` | **Full-fidelity validation of the whole project without starting it.** Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets), opens **no DB connection at all** — no PostgreSQL needed — and never touches the running server, so it validates safely **next to a live instance**. `-TopModule <M>` (comma-separated list allowed — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See "run `dryrun`" below. |
+| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only, **names NOT checked**; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). When module files or names went unchecked, the summary prints the exact scoped `dryrun -TopModule "…"` command that checks them in seconds — new-module code is mostly load-only declarations, so iterate on that `dryrun` there and keep precheck for files eval can fully check (no load-only construct anywhere in the file). See the `precheck` part of step 4. |
+| `dryrun` | **Full-fidelity validation without starting anything — the inner loop for new code (scoped) and the gate before a restart.** Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets), opens **no DB connection at all** — no PostgreSQL needed — and never touches the running server, so it validates safely **next to a live instance**. `-TopModule <M>` (comma-separated list allowed — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See the `dryrun` part of step 4. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
 its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbName`, `-Version`
@@ -677,7 +677,8 @@ structure as-is — don't restructure on top of an existing layout.
 
 ### 4. Run and monitor
 
-Run `start` (or `restart` after later edits). `start-server` tails the log and
+Run `start` (after later edits: validate first — see **"Validate before
+you restart"** below — then `restart`). `start-server` tails the log and
 returns one of three verdicts:
 
 - **started** — the log shows `Server has successfully started`. Good.
@@ -900,11 +901,38 @@ seeding test data, running a one-off fix, ad-hoc count / lookup,
 calling an existing action with specific arguments — is **data**, not
 schema, and belongs on the running server.
 
-**Before a schema restart, run `precheck` — a sub-second linter for the
-whole `.lsf` surface.** A restart is the only way to *load* new schema,
-but it's a slow way to discover a typo: a failed restart costs 26–41 s
-and reports **one name error per cycle** (parse errors do come batched).
-`precheck` feeds each file to the running server's `/eval` endpoint
+**Validate before you restart — and pick the inner loop by what the
+edit contains.** A restart is the only way to *apply* new schema, but
+it's a slow way to *discover* mistakes: a failed restart costs 26–41 s,
+takes the app down, and reports **one name error per cycle** (parse
+errors do come batched). Two cheaper validators cover the discovery,
+with different reach:
+
+- **New code → scoped `dryrun`.** New modules are mostly schema
+  declarations — `CLASS`, persistent `DATA`, `WHEN`, `CONSTRAINT`,
+  `EXTEND FORM`, META — and those are exactly what `/eval` refuses to
+  load, so `precheck` proves only *syntax* there and answers **"names
+  NOT checked"** (measured session: 15 new files, every one declaring a
+  `CLASS` → precheck caught ~nothing, while a scoped `dryrun` surfaced
+  the errors at ~4 s per run — parse errors batched, one semantic error
+  per run like a restart — live server untouched). For new code
+  **`dryrun -TopModule "<EditedModules>"` is the inner loop** — go
+  straight there instead of iterating on precheck.
+- **Edits to eval-checkable files → `precheck`.** Computed properties,
+  actions, whole `FORM` declarations: ~30 ms/file beats seconds, and
+  names ARE checked — but only when the **file** carries no load-only
+  construct at all: eval lints whole files, so a single `CLASS` /
+  persistent `DATA` / `WHEN` / `CONSTRAINT` anywhere in the file blinds
+  name checking for everything in it (the verdict says so when that
+  happens; the scoped `dryrun` is the loop then).
+
+Both paths converge on the same tail: an unscoped `dryrun` **gate** —
+it covers what neither loop proved (`REQUIRE` completeness after a
+clean precheck, dependents after a scoped run) — then **one restart,
+to apply**.
+
+**`precheck` — the sub-second linter.** It feeds each file to the
+running server's `/eval` endpoint
 (headers stripped, line numbers preserved), which compiles it in a fixed
 order (parse → EVAL-restriction → name resolution) in ~30 ms:
 
@@ -924,7 +952,14 @@ used in EVAL module` — precheck reports that as **syntax OK, names NOT
 checked** (the restriction preempts name resolution for the whole
 script). Two constructs crash eval's compiler outright — `EXTEND FORM`
 and `() + { }` overrides of existing actions — such files come back as
-"cannot lint: only a restart checks this file".
+"cannot lint". Every unchecked-file / unchecked-names verdict points at
+`dryrun`, and the run summary prints the exact scoped command —
+`dryrun -TopModule "<the unchecked modules>"` — covering those files in
+one go (one exception: a headerless `run()` eval probe is not a module,
+cannot be dry-run, and keeps only its per-file warning). A PASS can
+still carry a narrow caveat worded per file — NAMESPACE/PRIORITY
+ambiguity, META bodies nothing in the file instantiates — those don't
+trigger the hint.
 
 **Know the restart-only file class — precheck names it upfront.** A file
 that is *entirely* META definitions / `@`-instantiations / `EXTEND FORM`
@@ -945,8 +980,8 @@ with misleading wrapped-brace parse errors. The lsfusion-eval skill's
 "Syntax-checking `.lsf` without a restart" has the phase table and the
 raw-curl form for remote servers.
 
-**Between `precheck` and the restart sits `dryrun` — the full project
-check without starting anything.** It launches the server JVM with
+**`dryrun` — the full-fidelity check without starting anything; for new
+code, the inner loop itself.** It launches the server JVM with
 `-Dsettings.dryRun=true`: the whole logic —
 modules, classes, properties, actions, forms — is parsed,
 metacode-expanded, name-resolved and finalized exactly as at a restart,
@@ -990,28 +1025,45 @@ What makes it different from a restart (all measured):
 (plus system modules) by forcing `logics.topModule` for that run only —
 the project's `lsfusion.properties` is not touched. The value may be a
 **comma-separated list** (`-TopModule "Sales,Purchase"` — quote it so
-PowerShell passes one string); the union of the closures is checked. On the measured 772-module project
+PowerShell passes one string); the union of the closures is checked.
+List support arrived in 7.0-SNAPSHOT builds from **2026-08-03** — an
+older dryRun-capable build reads the list as ONE module name and fails
+with `Module 'A,B' not found` (measured on a 2026-07-31 build; the
+command detects that and prints the per-module / update fallback). On the measured 772-module project
 the closure of a leaf module was 11 modules and the JVM phase dropped
 from ~9 s to ~4 s. Two hard caveats, both measured: modules **outside
 the closure are not checked at all** (not even parsed), and
 **dependents of the listed modules are not checked either** — a
 signature change that breaks M's callers only surfaces in a full dryrun
 (or the restart). So scope iteration to the module you edit, but keep
-the unscoped `dryrun` as the gate before the restart. Never write
+the unscoped `dryrun` as the gate before the restart. The flip side
+helps new code: a scoped run checks a brand-new module even **before**
+it is wired into the top module's `REQUIRE` — under a configured
+`logics.topModule` (the standard layout) the unscoped run, like the
+restart, loads only that closure and silently skips such a module,
+which is also why precheck's summary always suggests the scoped list
+(with no topModule configured, every classpath module loads instead). Never write
 `settings.dryRun` or a forced `topModule` into `settings.properties` /
 `lsfusion.properties` — a server started with `dryRun` just exits, and
 a persisted narrow `topModule` would make a real start **drop the
 out-of-closure modules' tables** at schema sync. lsfdev passes both as
 per-run `-D` flags only.
 
-When to reach for `dryrun` (instead of a restart, never instead of
-`precheck` — milliseconds still beat seconds mid-edit): as the **gate
-right before a restart** (a failed restart costs 26–41 s *and* downtime;
-a failed dryrun costs ~10–40 s and nothing else); for **restart-only
-files** (`EXTEND FORM` / all-META modules) where precheck proves
-nothing; to catch a **missing `REQUIRE`** precheck structurally cannot;
-and for CI-style "does this branch even load" checks — that box needs
-**no PostgreSQL at all**.
+When to reach for `dryrun`: as the **inner loop for new code** (scoped
+with `-TopModule` to the edited modules — a failed scoped run costs
+seconds and nothing else); for **restart-only files** (`EXTEND FORM` /
+all-META modules) and **"names NOT checked"** verdicts, where precheck
+proves little to nothing; to catch a **missing `REQUIRE`** precheck
+structurally cannot; as the **gate right before a restart** (a failed
+restart costs 26–41 s *and* downtime; a failed full dryrun ~10–40 s and
+nothing else); and for CI-style "does this branch even load" checks —
+that box needs **no PostgreSQL at all**. `precheck` keeps its edge where
+eval genuinely checks names — property/action/`FORM` files with no
+load-only construct anywhere in them, ~30 ms
+per file — and its structural FAILs (unclosed META) are instant. Treat
+it as a fast probe, not a gate: the moment it answers "names NOT
+checked" / "restart-only" / "cannot lint", the next step is the `dryrun`
+command its summary prints, not another precheck round.
 
 **Web resources (JS / CSS / images) need NO restart in devmode — any page
 load picks them up; browser cache is NOT a factor.** Files under
@@ -1613,9 +1665,13 @@ front of step 2:
    classpath stays exactly two entries — staging dir plus jar — which
    avoids the duplicate-module trap.
 
-Pass `-TopModule <Name>` only if the project's own config does not set one
-(rare). For everything else — code edits, dev-mode behaviour, light start,
-verification — the workflow is identical to a scaffolded project.
+Pass `-TopModule <Name>` **at setup** only if the project's own config does
+not set one (rare) — that value persists and steers real starts. This does
+not apply to `dryrun -TopModule`, which deliberately overrides the
+configured top module **for that validation run only** and is the normal
+way to scope it. For everything else — code edits, dev-mode behaviour,
+light start, verification — the workflow is identical to a scaffolded
+project.
 
 When extending an existing project, **explore before adding**: use
 `lsfusion_retrieve_docs` and any project-element search the MCP exposes to
