@@ -1,7 +1,7 @@
 {
   "name": "lsfusion-ai-skills",
   "description": "Skills for developing, deploying, and evaluating lsFusion applications, bundled with the ai.lsfusion.org MCP server.",
-  "version": "0.1.38",
+  "version": "0.1.39",
   "author": {
     "name": "lsFusion",
     "url": "https://github.com/lsfusion"

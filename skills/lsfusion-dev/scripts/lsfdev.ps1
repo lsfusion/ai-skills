@@ -2282,12 +2282,14 @@ function Cmd-DryRun {
         Write-Host ""
         if ($logicFail) { Info "Like a restart, ONE semantic error is reported per run (parse errors come batched) - fix and re-run. Sub-second single-file linting: precheck." }
         elseif ($TopModule -and $TopModule.Contains(',') -and $outText -match "Module '[^']*,[^']*' not found") {
-            # Measured on a 2026-07-31 build: dryRun works but the comma-list
-            # lands as ONE module name ("Module 'A,B' not found") - list
-            # support arrived in 7.0-SNAPSHOT builds from 2026-08-03.
-            Info "This platform build treats the comma-list as ONE module name (comma-separated topModule arrived in 7.0-SNAPSHOT builds from 2026-08-03). Re-run per module ($(@($TopModule -split ',' | ForEach-Object { "-TopModule $($_.Trim())" }) -join ' / ')), run unscoped (checks the project's configured module set - under a configured topModule an unwired new module stays unchecked), or update the platform:"
+            # A stale build predating comma-list topModule reads the list as
+            # ONE module name (measured). The latest 7.0-SNAPSHOT is the
+            # assumed target, so the fix is updating the platform;
+            # per-module runs bridge the gap until then.
+            Info "This platform build is OUTDATED: it predates comma-separated topModule and read the whole list as ONE module name. Update the platform:"
             if ($mode.UseMaven) { Info "  mvn -U -DskipTests compile, then re-run dryrun." }
             else { Info "  delete '$jarPath' and re-run setup (it refetches missing artifacts)." }
+            Info "Until then: re-run per module ($(@($TopModule -split ',' | ForEach-Object { "-TopModule $($_.Trim())" }) -join ' / '))."
         }
         exit 1
     }

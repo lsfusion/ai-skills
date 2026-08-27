@@ -1026,10 +1026,9 @@ What makes it different from a restart (all measured):
 the project's `lsfusion.properties` is not touched. The value may be a
 **comma-separated list** (`-TopModule "Sales,Purchase"` — quote it so
 PowerShell passes one string); the union of the closures is checked.
-List support arrived in 7.0-SNAPSHOT builds from **2026-08-03** — an
-older dryRun-capable build reads the list as ONE module name and fails
-with `Module 'A,B' not found` (measured on a 2026-07-31 build; the
-command detects that and prints the per-module / update fallback). On the measured 772-module project
+(A stale local build predating list support fails with
+`Module 'A,B' not found` — the command detects that and tells you to
+update the platform.) On the measured 772-module project
 the closure of a leaf module was 11 modules and the JVM phase dropped
 from ~9 s to ~4 s. Two hard caveats, both measured: modules **outside
 the closure are not checked at all** (not even parsed), and

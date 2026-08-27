@@ -384,9 +384,7 @@ the server JVM with `-Dsettings.dryRun=true`, which loads and checks the
 restart-only class — then exits before the DB sync: no ports bound, the
 running server untouched, **no PostgreSQL at all**, ~9 s of JVM on a
 772-module project (`-TopModule` narrows the scope further;
-comma-separated list allowed on 7.0-SNAPSHOT builds from 2026-08-03 —
-an older dryRun-capable build reads the list as ONE module name and
-fails with `Module 'A,B' not found`; pass one module per run there).
+comma-separated list allowed).
 It needs the sources and the platform jar
 locally, so for a **remote** server eval stays the only lint. On a local
 box split the roles by what eval can actually reach: eval/`precheck`
