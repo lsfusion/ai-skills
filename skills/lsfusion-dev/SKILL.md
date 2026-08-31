@@ -212,7 +212,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `keep-running` | Exempt this project from the **session-end auto-stop** (the plugin's hooks stop the servers a Claude session started ~60 min after that session's process ended without being resumed — see [Servers, sessions and other processes on the box](#servers-sessions-and-other-processes-on-the-box)). `-Off` re-enables it. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server); `Auto-stop: OFF` when `keep-running` is set. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-OutPrefix <stem>` renames the whole artifact set of a run (`<stem>-open.png`, …) so a batch loop over several forms keeps per-form evidence instead of overwriting `verify-*.png` each run. `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. Exit codes are trustworthy: **0** = HTTP success, **1** = request failed (HTTP error / connection refused), **3** = client timeout (no verdict — deliberately distinct from 1). |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only, **names NOT checked**; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). When module files or names went unchecked, the summary prints the exact scoped `dryrun -TopModule "…"` command that checks them in seconds — new-module code is mostly load-only declarations, so iterate on that `dryrun` there and keep precheck for files eval can fully check (no load-only construct anywhere in the file). See the `precheck` part of step 4. |
@@ -232,7 +232,8 @@ persisted),
 re-download the client war at the same version — the `-SNAPSHOT`
 war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
-`-DoubleClick`, `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
+`-DoubleClick`, `-OutPrefix` (verify: per-run artifact filename stem — batch
+runs keep per-form screenshots), `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
 `-Do` (verify: generic click/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/assert-count/assert-text
 steps by Playwright selector, first visible match — see step 5), `-DoFile`
 (verify: `-Do` steps from a file — JSON array or one per line; survives
@@ -1067,7 +1068,8 @@ command its summary prints, not another precheck round.
 **Web resources (JS / CSS / images) need NO restart in devmode — any page
 load picks them up; browser cache is NOT a factor.** Files under
 `src/main/resources/**` that the browser fetches — `CUSTOM`-component
-`.js`/`.css` registered via `onWebClientInit`, icons, web assets — are served
+`.js`/`.jsx`/`.css` (registered via `onWebClientInit`, or auto-loaded from
+`web/init/`), icons, web assets — are served
 live from source: on every page load the devmode server re-reads them from
 `src/main/resources` and emits them under a content-hash URL
 (`/file/dev/...?version=<hash of the bytes>`) with `Cache-Control: no-store`,
@@ -1227,8 +1229,9 @@ checking the unit-test output.
    card of one specific object:
 
    ```
-   # a navigator form by name
-   lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Items"
+   # a navigator form by name - assert a value the form SHOWS (a grid cell,
+   # a panel value), never the form's own caption (see the -OpenExpect rule below)
+   lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Coffee beans"
 
    # the edit card of one object, looked up by business key
    lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;" -OpenExpect "Coffee beans"
@@ -1257,7 +1260,14 @@ checking the unit-test output.
      visible inputs** (a form field's content is an input `value`, not a
      text node), and the report says which kind matched: a plain
      "visible" for text, "as the VALUE of a visible input" for field
-     content.
+     content. **Never use the form's own caption as the expect text**: the
+     caption renders on the docked **tab** (and in the navigator) —
+     *outside* the form's `[lsfusion-form]` subtree — so the scoped check
+     reports it as `on the page but NOT inside the opened form` and strict
+     verify exits 2 even though the right form opened (the report then
+     names the tab-caption match as the likely cause). Assert something
+     that renders *inside* the form: a container/panel caption or a known
+     data value, like every example above.
    - **The open itself is cross-checked against the DOM.** The report
      prints the form really on screen (`Active form : tab '…'; visible
      sID(s): …`) and compares it with the form/class the script names —
@@ -1283,6 +1293,21 @@ checking the unit-test output.
      edit form named unlike its class) may a WARN be over-cautious — then
      judge `verify-open.png` (and pass `-AllowWarnings` if that run must
      exit 0).
+   - **Checking several forms in a row? Pass `-OutPrefix <stem>` per run.**
+     Every verify run wipes and rewrites its artifact set, so a batch loop
+     without it keeps only the *last* form's `verify-open.png` — the
+     evidence of the other runs is gone. With a per-form stem each run
+     writes its own set (`items-open.png`, `items-dom.html`,
+     `items-console.txt`, …) and the report's "judge …" messages name those
+     files:
+
+     ```
+     foreach ($f in 'items','partners','orders') {
+       lsfdev.ps1 verify -OpenScript "SHOW Shop.$f DOCKED;" -OutPrefix $f
+     }
+     ```
+
+     Letters, digits, `.`, `_`, `-` only; the default stem stays `verify`.
    - Non-ASCII script text (Cyrillic keys, localized captions) → UTF-8 file
      + `-OpenScriptFile`, exactly like `api -ScriptFile` (see the UTF-8
      pitfall in step 4).
@@ -1422,7 +1447,22 @@ checking the unit-test output.
    **2**, so scripts and CI can trust `$LASTEXITCODE` instead of parsing
    `[WARN]` lines. `-AllowWarnings` restores report-only exit 0; tool-level
    errors (missing python, bad usage) exit 1 either way. Browser console
-   errors are reported but never flip the exit code (apps log noise there).
+   errors are reported but never flip the exit code (apps log noise there)
+   — with one upgrade: **custom-view failures get their own `[WARN]`
+   diagnosis lines above the total counter** (they stay included in its
+   count). A broken `.jsx` web resource
+   is served by the platform as a `console.error` stub *instead of* its
+   script, so the report prints `.jsx transform FAILED: … <resource>:
+   <Babel error + source position>` (and any render-time `Custom view
+   error: … '<fn>' is not a component`) plus what it means: the component
+   function never got defined, so every form using it renders an **empty
+   custom container** — the typical broken-custom-view signature; that
+   blank area on the screenshot is this failure, not a layout or data
+   problem. Fix the `.jsx` at the reported position and re-run — web
+   resources are picked up on the next page load, no restart. Since these
+   lines alone don't flip the exit code, **pair the run with an assertion
+   on content the view renders** (`-OpenExpect`, or `-Do
+   "assert-text:..."`) when a broken custom view must fail the batch.
 
    **A hung page cannot hang `verify`.** The whole Playwright run sits under
    a watchdog (default 180 s; `-Timeout <s>` sets the budget). On overrun

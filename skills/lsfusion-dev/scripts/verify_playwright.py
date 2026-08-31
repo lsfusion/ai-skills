@@ -56,6 +56,24 @@ BENIGN_CONSOLE_SUBSTRINGS = (
     "beforeunload' confirmation panel",
 )
 
+# Console [error] prefixes that ARE first-class diagnoses, extracted from the
+# count into result["custom_view_errors"] so the caller can print each as its
+# own line. Both are platform-pinned message shapes:
+#   * a broken .jsx web resource is served as a console.error stub -
+#     "lsFusion .jsx transform failed for <resource>: <Babel error+position>"
+#     (JsxTransformer.transform, asserted by JsxTransformerTest) - so the
+#     component function never gets defined;
+#   * every custom-view render failure logs under ONE prefix -
+#     "lsFusion custom view: ..." (GwtClientUtils.logLsfViewError), e.g.
+#     "'X' is not a component: it is not in the registry, ..." when a form
+#     draws a CUSTOM/custom= view whose function is missing.
+# Together they are the typical broken-custom-view signature: the container
+# renders empty (plus a short inline error) while the form itself opens fine.
+CUSTOM_VIEW_ERROR_PREFIXES = (
+    ("jsx-transform", "lsFusion .jsx transform failed for "),
+    ("custom-view",   "lsFusion custom view: "),
+)
+
 
 def _split_pos(spec: str):
     """Split 'selector@x,y' into (selector, {'x':..,'y':..}) — offset from the
@@ -759,6 +777,13 @@ def main() -> int:
                          "(JS, attribute selectors): PowerShell 5.1's native "
                          "argv quoting corrupts some quote/space patterns, a "
                          "file cannot be corrupted. Used by lsfdev.ps1 -Do")
+    ap.add_argument("--out-prefix", default="verify",
+                    help="filename stem for this run's artifacts "
+                         "(<prefix>-open.png, <prefix>-dom.html, "
+                         "<prefix>-console.txt, ...). Default 'verify'. "
+                         "Batch callers (one run per form) pass a per-form "
+                         "stem so each run keeps its own artifact set "
+                         "instead of overwriting verify-*.png")
     ap.add_argument("--session-port", type=int, default=0,
                     help="reuse (or spawn) a persistent headless Chromium on "
                          "this CDP port instead of launching a throwaway "
@@ -804,17 +829,27 @@ def main() -> int:
             loaded = [loaded]
         args.do_actions = [str(s) for s in loaded] + args.do_actions
 
+    # Artifact stem: a plain filename fragment only - it is joined into
+    # paths, so anything else (separators, '..', whitespace) must be
+    # rejected as given, not sanitized silently into a different name.
+    stem = args.out_prefix or "verify"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", stem):
+        print(json.dumps({"error": f"invalid --out-prefix {stem!r}: letters, "
+                          "digits, '.', '_', '-' only (max 64 chars, starting "
+                          "with a letter or digit)"}))
+        return 2
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    login_png    = out_dir / "verify-login.png"
-    app_png      = out_dir / "verify-app.png"
-    open_png     = out_dir / "verify-open.png"
-    click_png    = out_dir / "verify-click.png"
-    dblclick_png = out_dir / "verify-dblclick.png"
-    do_png       = out_dir / "verify-do.png"
-    dom_path     = out_dir / "verify-dom.html"
-    console_path = out_dir / "verify-console.txt"
-    phase_path   = out_dir / "verify-phase.txt"
+    login_png    = out_dir / f"{stem}-login.png"
+    app_png      = out_dir / f"{stem}-app.png"
+    open_png     = out_dir / f"{stem}-open.png"
+    click_png    = out_dir / f"{stem}-click.png"
+    dblclick_png = out_dir / f"{stem}-dblclick.png"
+    do_png       = out_dir / f"{stem}-do.png"
+    dom_path     = out_dir / f"{stem}-dom.html"
+    console_path = out_dir / f"{stem}-console.txt"
+    phase_path   = out_dir / f"{stem}-phase.txt"
 
     # Wipe previous artefacts so callers can rely on file presence.
     for p in (login_png, app_png, open_png, click_png, dblclick_png, do_png, dom_path, console_path, phase_path):
@@ -1899,6 +1934,27 @@ def _finish(result: dict, console_lines: list[str], console_path: Path) -> int:
         if l.startswith("[error]")
         and not any(b in l for b in BENIGN_CONSOLE_SUBSTRINGS)
     )
+    # Custom-view failures get their own structured entries (still included in
+    # the count above). Deduplicated with a count: an init web resource loads
+    # on EVERY page load, so one broken .jsx logs its stub 2+ times per run.
+    # A message can be multi-line (the Babel error embeds the source frame) -
+    # it is passed through whole; the caller prints the first line.
+    fails: list[dict] = []
+    by_msg: dict[str, dict] = {}
+    for l in console_lines:
+        if not l.startswith("[error]"):
+            continue
+        body = l[len("[error]"):].lstrip()
+        for kind, prefix in CUSTOM_VIEW_ERROR_PREFIXES:
+            if body.startswith(prefix):
+                entry = by_msg.get(body)
+                if entry is None:
+                    entry = {"kind": kind, "message": body, "count": 0}
+                    by_msg[body] = entry
+                    fails.append(entry)
+                entry["count"] += 1
+                break
+    result["custom_view_errors"] = fails
     print(json.dumps(result, indent=2))
     return 0 if not result["error"] else 1
 

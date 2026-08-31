@@ -31,6 +31,7 @@ param(
     [string]$DoubleClick = "",
     [string[]]$Do = @(),
     [string]$DoFile = "",
+    [string]$OutPrefix = "",
     [switch]$AllowWarnings,
     [switch]$Session,
     [switch]$EndSession,
@@ -2678,6 +2679,26 @@ function Cmd-Verify {
     # default - any entry here makes it exit 2 (unless -AllowWarnings), so
     # automation can trust the exit code instead of parsing [WARN] lines.
     $checkFails = New-Object System.Collections.Generic.List[string]
+    # Artifact stem: default 'verify' keeps the documented verify-*.png names;
+    # -OutPrefix gives a batch loop (one verify per form) a per-form artifact
+    # set - without it every run wipes and rewrites the same files and only
+    # the last form's evidence survives. A plain filename fragment only: it
+    # is joined into paths, so separators/'..' are rejected, not sanitized.
+    $outStem = "verify"
+    if ($OutPrefix) {
+        # \A..\z, not ^..$: the .NET $ anchor accepts a trailing newline,
+        # which would then leak into every artifact filename.
+        if ($OutPrefix -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z') {
+            throw "-OutPrefix must be a plain filename stem: letters, digits, '.', '_', '-' only (max 64 chars, starting with a letter or digit); got '$OutPrefix'."
+        }
+        $outStem = $OutPrefix
+    }
+    # The artifact names as this run will actually write them - interpolated
+    # into every 'judge <file>' message below, so the guidance never points
+    # at a default-named file a prefixed run did not produce.
+    $loginShot = "$outStem-login.png"; $openShot = "$outStem-open.png"
+    $clickShot = "$outStem-click.png"; $dblShot  = "$outStem-dblclick.png"
+    $doShot    = "$outStem-do.png";    $domFile  = "$outStem-dom.html"
     if ($EndSession) {
         if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
         else { Info "No persistent verify session to end." }
@@ -2783,6 +2804,7 @@ function Cmd-Verify {
     }
     if ($doSteps.Count) { Info "Do     : $($doSteps.Count) generic step(s) after navigation (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/assert-count/assert-text by Playwright selector; interaction verbs use the first VISIBLE match, assert-* all visible matches)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
+    if ($outStem -ne "verify") { Info "Output : artifact stem '$outStem' ($outStem-*.png, $domFile, $outStem-console.txt) - this run overwrites only its own set" }
 
     # -Do steps travel via a UTF-8 JSON file, NOT argv: PowerShell 5.1 wraps a
     # native argument in quotes only when it sees whitespace outside naively
@@ -2813,6 +2835,7 @@ function Cmd-Verify {
         viewport_width = [int]$ViewportWidth; viewport_height = [int]$ViewportHeight
         locale = "$Locale"; session_port = [int]$sessionPort
         reload = [bool]$Reload; do_file = "$doJsonFile"
+        out_prefix = "$outStem"
         timeout = 30000
     }
     [IO.File]::WriteAllText($argsFile, (ConvertTo-Json -InputObject $argSpec -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
@@ -2859,7 +2882,7 @@ function Cmd-Verify {
         } else {
             Bad "verify did not finish within $verifyBudget s - and the watchdog could NOT kill python PID $($pyProc.Id) (still alive; kill it manually: taskkill /T /F /PID $($pyProc.Id))."
         }
-        $phaseTxt = (Read-FileText (Join-Path $StateDir "verify-phase.txt")).Trim()
+        $phaseTxt = (Read-FileText (Join-Path $StateDir "$outStem-phase.txt")).Trim()
         if ($phaseTxt -match '^(\d+)s\t(.*)$') {
             Info "Hung step  : $($Matches[2])  (entered at t+$($Matches[1]) s, killed at t+$verifyBudget s)"
         } elseif ($phaseTxt) {
@@ -2868,16 +2891,16 @@ function Cmd-Verify {
         Info "This usually means the page WEDGED the web client (a form that blocks the browser's renderer)."
         Info "The app SERVER is typically fine - fix the form; do not chase Playwright, Chromium or machine load."
         $kept = @()
-        foreach ($af in @("verify-login.png", "verify-app.png", "verify-open.png", "verify-click.png",
-                          "verify-dblclick.png", "verify-do.png", "verify-dom.html")) {
+        foreach ($af in @($loginShot, "$outStem-app.png", $openShot, $clickShot,
+                          $dblShot, $doShot, $domFile)) {
             $ap = Join-Path $StateDir $af
             if (Test-Path $ap) { $kept += "$af ($([math]::Round((Get-Item $ap).Length / 1KB, 1)) KB)" }
         }
         if ($kept.Count) { Info "Artifacts written before the hang: $($kept -join ', ') (in $StateDir)" }
         else { Info "Artifacts: none were written before the hang (it hit before the first screenshot)." }
-        $consoleTail = @(Tail-Text (Read-FileText (Join-Path $StateDir "verify-console.txt")) 8)
+        $consoleTail = @(Tail-Text (Read-FileText (Join-Path $StateDir "$outStem-console.txt")) 8)
         if ($consoleTail.Count -and ($consoleTail -join '').Trim()) {
-            Info "Browser console tail (verify-console.txt):"
+            Info "Browser console tail ($outStem-console.txt):"
             $consoleTail | ForEach-Object { Write-Host "    $_" }
         } else {
             Info "Browser console: empty so far (a renderer stuck in a busy loop emits nothing)."
@@ -2976,7 +2999,7 @@ function Cmd-Verify {
                     # the DOM, so an unrelated EDIT would look identical.
                     # Only a scoped -OpenExpect hit (below) upgrades this to
                     # a verified pass.
-                    Info "Open check: $($r.open.form_basis) - CONSISTENT with the script's '$($r.open.form_matched)', but circumstantial. It is verified only if the -OpenExpect text is found INSIDE that form; without -OpenExpect judge verify-open.png."
+                    Info "Open check: $($r.open.form_basis) - CONSISTENT with the script's '$($r.open.form_matched)', but circumstantial. It is verified only if the -OpenExpect text is found INSIDE that form; without -OpenExpect judge $openShot."
                 }
                 'open-inactive' {
                     $wrongForm = $true
@@ -2984,20 +3007,26 @@ function Cmd-Verify {
                 }
                 'not-open' {
                     $wrongForm = $true
-                    Warn "Open check: nothing matching the script's form ('$($sNames -join "', '")') is open - the direct open did not take effect (typical cause: the app's own startup action, e.g. onWebClientStarted, opened/activated another form over it). If the form is merely named/captioned differently than the script mention, ignore this and judge verify-open.png."
+                    Warn "Open check: nothing matching the script's form ('$($sNames -join "', '")') is open - the direct open did not take effect (typical cause: the app's own startup action, e.g. onWebClientStarted, opened/activated another form over it). If the form is merely named/captioned differently than the script mention, ignore this and judge $openShot."
                 }
                 default {
-                    if ($sNames.Count) { Info "Open check: could not read (or re-confirm) the form state from the DOM - judge verify-open.png." }
+                    if ($sNames.Count) { Info "Open check: could not read (or re-confirm) the form state from the DOM - judge $openShot." }
                     else { Info "Open check: the script names no form directly (no SHOW/DIALOG/ACTIVATE in it - e.g. it calls a project action), so the opened-form identity is not cross-checked." }
                 }
             }
             if ($wrongForm) { $checkFails.Add("open check: the script's form is not on screen") }
             if ($r.open.expect) {
                 $positiveVerdict = ($openVerdict -eq 'match' -or $openVerdict -eq 'probable')
+                # Set when the text WAS found but outside / not scopeable to
+                # the opened form - the states the tab-caption diagnosis below
+                # applies to (a not-found miss cannot be a tab-caption hit:
+                # tab captions are visible text, a page-wide probe finds them).
+                $expectFoundOffForm = $false
                 if ($r.open.expect_found) {
                     $whereNote = if ("$($r.open.expect_where)" -eq 'input-value') { "as the VALUE of a visible input - a form field shows it; it is not a text node" } else { "as visible text" }
                     if ($wrongForm) {
-                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) - but the script's form is NOT what is on screen (see the open check above), so the match comes from ANOTHER form (e.g. the same string in a grid). NOT a pass - judge verify-open.png."
+                        $expectFoundOffForm = $true
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) - but the script's form is NOT what is on screen (see the open check above), so the match comes from ANOTHER form (e.g. the same string in a grid). NOT a pass - judge $openShot."
                     } elseif ($positiveVerdict -and "$($r.open.expect_scope)" -eq 'form') {
                         $pin = if ($openVerdict -eq 'probable') { " - together with the open check above this pins that form as the script's" } else { "" }
                         Ok "Expected text '$($r.open.expect)' found ($whereNote) INSIDE the opened form's DOM subtree$pin."
@@ -3006,31 +3035,48 @@ function Cmd-Verify {
                         # hit is page-wide and COULD belong to another visible
                         # form/window. Under the strict contract an unscoped
                         # hit is unverified, not a pass.
-                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but the form was matched by tab caption only, so the hit could not be scoped to it - UNVERIFIED; judge verify-open.png (or -AllowWarnings if that run must exit 0)."
+                        $expectFoundOffForm = $true
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but the form was matched by tab caption only, so the hit could not be scoped to it - UNVERIFIED; judge $openShot (or -AllowWarnings if that run must exit 0)."
                         $checkFails.Add("expect not scopeable (form matched by caption only)")
                     } elseif ($openVerdict -eq 'probable') {
-                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but could not be scoped to the circumstantially matched form (no single form element to scope to) - it does NOT verify the open; judge verify-open.png."
+                        $expectFoundOffForm = $true
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but could not be scoped to the circumstantially matched form (no single form element to scope to) - it does NOT verify the open; judge $openShot."
                         $checkFails.Add("expect not verifiable against the circumstantially matched form")
                     } elseif ($sNames.Count) {
                         # The script names concrete forms but the cross-check
                         # could not run or confirm - a page-wide hit may be the
                         # very wrong-form false positive; never present it as
                         # a pass.
-                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but the opened-form cross-check could not run or confirm (see above) - UNVERIFIED, the hit may come from another form; judge verify-open.png."
+                        $expectFoundOffForm = $true
+                        Warn "Expected text '$($r.open.expect)' was found ($whereNote) on the page, but the opened-form cross-check could not run or confirm (see above) - UNVERIFIED, the hit may come from another form; judge $openShot."
                         $checkFails.Add("expect found but UNVERIFIED (form state unreadable)")
                     } else {
                         # No form named in the script: nothing stronger than a
                         # page-wide claim exists - say exactly that.
-                        Ok "Expected text '$($r.open.expect)' found ($whereNote) on the page - the opened-form identity is not cross-checkable for this script (no SHOW/DIALOG/ACTIVATE in it), confirm via verify-open.png."
+                        Ok "Expected text '$($r.open.expect)' found ($whereNote) on the page - the opened-form identity is not cross-checkable for this script (no SHOW/DIALOG/ACTIVATE in it), confirm via $openShot."
                     }
                 }
                 elseif ($positiveVerdict -and $r.open.expect_found_elsewhere) {
-                    Warn "Expected text '$($r.open.expect)' is on the page but NOT inside the opened form ('$($r.open.form_matched)') - it belongs to another form/window (the same string elsewhere is the very false positive this check exists for). NOT a pass - judge verify-open.png."
+                    $expectFoundOffForm = $true
+                    Warn "Expected text '$($r.open.expect)' is on the page but NOT inside the opened form ('$($r.open.form_matched)') - it belongs to another form/window (the same string elsewhere is the very false positive this check exists for). NOT a pass - judge $openShot."
                     $checkFails.Add("expected text only OUTSIDE the opened form")
                 }
                 else {
-                    Warn "Expected text '$($r.open.expect)' NOT found - neither as visible text nor as any visible input's value. Check verify-open.png (caption may differ / form may be empty)."
+                    Warn "Expected text '$($r.open.expect)' NOT found - neither as visible text nor as any visible input's value. Check $openShot (caption may differ / form may be empty)."
                     $checkFails.Add("expected text '$($r.open.expect)' not found")
+                }
+                # The single commonest cause of the off-form states above,
+                # named explicitly (measured to cost repeated runs otherwise):
+                # the expect text is the FORM'S OWN CAPTION. Captions render in
+                # the docked-tab strip (and the navigator), which sit OUTSIDE
+                # the form's [lsfusion-form] subtree, so a caption can never
+                # verify the open - even when the right form is on screen.
+                if ($expectFoundOffForm) {
+                    $expNorm = ("$($r.open.expect)" -replace '\s+', ' ').Trim()
+                    $tabHit = @($r.open.open_tabs) | Where-Object { $_ -and $expNorm -and (("$_" -replace '\s+', ' ').Trim()).ToLowerInvariant().Contains($expNorm.ToLowerInvariant()) } | Select-Object -First 1
+                    if ($tabHit) {
+                        Info "Likely cause: the expect text matches the caption of the docked tab '$tabHit' - a form's caption lives on the TAB, outside the form's subtree, so don't use it as -OpenExpect. Assert text that renders INSIDE the form instead: a container/panel caption or a known data value."
+                    }
                 }
             }
         }
@@ -3053,13 +3099,13 @@ function Cmd-Verify {
                 }
                 'intercepted' {
                     Warn "Element '$seg' WAS found and visible, but another element intercepted every click: $($r.click.blocked_by)"
-                    Warn "That is a loading overlay / sliding panel / hover popup on top - even a forced click did not land. Check verify-click.png for what was covering it; retry, or reach the target with -Do 'click:<css selector>'."
+                    Warn "That is a loading overlay / sliding panel / hover popup on top - even a forced click did not land. Check $clickShot for what was covering it; retry, or reach the target with -Do 'click:<css selector>'."
                 }
                 'not_enabled' {
                     Warn "Element '$seg' was found and visible but stayed DISABLED - for native lsFusion controls that usually means a SERVER-side state (DISABLEIF / readonly / permissions; commonly: a value typed just before was never committed); CUSTOM/React components may also disable purely client-side."
                 }
                 'not_visible' {
-                    Warn "Element '$seg' exists in the DOM but its text is not visible (icon-only navigator entry or a collapsed panel) - text-based -Click cannot hit it. Click it via -Do 'click:<css selector>' (e.g. by lsfusion-container attribute from verify-dom.html)."
+                    Warn "Element '$seg' exists in the DOM but its text is not visible (icon-only navigator entry or a collapsed panel) - text-based -Click cannot hit it. Click it via -Do 'click:<css selector>' (e.g. by lsfusion-container attribute from $domFile)."
                 }
                 default {
                     # Unclassified actionability failure - the truncated first
@@ -3075,13 +3121,13 @@ function Cmd-Verify {
                 if ($r.click.available.icon_only.Count) {
                     Info "Icon-only entries (text hidden - NOT clickable by text): $($r.click.available.icon_only -join ' | ')"
                 }
-                Info "(Full failure-time DOM: verify-dom.html)"
+                Info "(Full failure-time DOM: $domFile)"
             }
         } elseif ($r.click.clicked.Count) {
             Ok "Clicked through: $($r.click.clicked -join ' > ')"
         }
         if ($r.click.forced.Count) {
-            Warn "Segment(s) [$($r.click.forced -join ', ')] needed a FORCED click (an overlay was intercepting; hit-target check bypassed) - trust verify-click.png over this report for what actually opened."
+            Warn "Segment(s) [$($r.click.forced -join ', ')] needed a FORCED click (an overlay was intercepting; hit-target check bypassed) - trust $clickShot over this report for what actually opened."
         }
     }
     if ($r.double_click -and $r.double_click.requested) {
@@ -3093,17 +3139,17 @@ function Cmd-Verify {
             Warn "Double-click failed: $(@($r.double_click.error -split "`r?`n")[0])"
             $checkFails.Add("double-click failed")
             switch ("$($r.double_click.reason)") {
-                'not_found'   { Warn "No cell with visible text '$DoubleClick' - row text is locale/data-dependent; check verify-dblclick.png for the actual grid text." }
-                'intercepted' { Warn "Row found, but clicks were intercepted by: $($r.double_click.blocked_by) - likely a loading overlay; check verify-dblclick.png and retry." }
-                'not_enabled' { Warn "Row/cell found but stayed DISABLED (for native lsFusion controls usually a server-side DISABLEIF / readonly state) - check verify-dblclick.png." }
-                'not_visible' { Warn "The matched text exists but is not visible (hidden column / virtualized row?) - check verify-dblclick.png; scroll or filter first via -Do." }
-                default       { Warn "Row found but never became clickable - check verify-dblclick.png." }
+                'not_found'   { Warn "No cell with visible text '$DoubleClick' - row text is locale/data-dependent; check $dblShot for the actual grid text." }
+                'intercepted' { Warn "Row found, but clicks were intercepted by: $($r.double_click.blocked_by) - likely a loading overlay; check $dblShot and retry." }
+                'not_enabled' { Warn "Row/cell found but stayed DISABLED (for native lsFusion controls usually a server-side DISABLEIF / readonly state) - check $dblShot." }
+                'not_visible' { Warn "The matched text exists but is not visible (hidden column / virtualized row?) - check $dblShot; scroll or filter first via -Do." }
+                default       { Warn "Row found but never became clickable - check $dblShot." }
             }
         } elseif ($r.double_click.target) {
-            Ok "Double-clicked row '$($r.double_click.target)' - edit card in verify-dblclick.png"
+            Ok "Double-clicked row '$($r.double_click.target)' - edit card in $dblShot"
         }
         if ($r.double_click.forced) {
-            Warn "The double-click needed FORCE (an overlay was intercepting; hit-target check bypassed) - trust verify-dblclick.png for what actually opened."
+            Warn "The double-click needed FORCE (an overlay was intercepting; hit-target check bypassed) - trust $dblShot for what actually opened."
         }
     }
     if ($r.do -and $r.do.requested) {
@@ -3135,15 +3181,53 @@ function Cmd-Verify {
         # not seeing one is a failure of the promised login flow, not a pass.
         # (An explicit -Url targets a foreign server whose devmode state the
         # local launch line says nothing about - no expectation there.)
-        Warn "No login form appeared although the server runs with devmode OFF - the page may not have rendered; check verify-login.png and the error above."
+        Warn "No login form appeared although the server runs with devmode OFF - the page may not have rendered; check $loginShot and the error above."
         $checkFails.Add("no login form (devmode off)")
     } else {
         Ok "No login form on the landing page - devmode auto-authenticated as '$($cfg.adminUser)', the screenshot shows the running app."
     }
 
+    # Custom-view failures out of the console, each as its own diagnosis line
+    # BEFORE the bare counter - the typical way a CUSTOM/React view fails is
+    # exactly this: the form opens fine, the container renders empty (plus a
+    # short inline error), and the only real evidence is a console line.
+    # Two platform-pinned shapes (extracted by the python helper):
+    #   jsx-transform - a broken .jsx is served as a console.error stub
+    #                   instead of its script, so the component function is
+    #                   never defined (message carries the Babel error and
+    #                   source position; an init resource logs it once per
+    #                   page load, hence the xN);
+    #   custom-view   - render-time "lsFusion custom view: ..." errors, e.g.
+    #                   '<fn>' is not a component when the function is missing.
+    $cvErrs = @(); if ($r.PSObject.Properties['custom_view_errors']) { $cvErrs = @($r.custom_view_errors) }
+    $sawJsxFail = $false
+    $sawNotComponent = $false
+    foreach ($cv in $cvErrs) {
+        $cvLines = @("$($cv.message)" -split "`r?`n")
+        $times = if ([int]$cv.count -gt 1) { " (x$($cv.count))" } else { "" }
+        if ("$($cv.kind)" -eq 'jsx-transform') {
+            $sawJsxFail = $true
+            # A multi-line transform message is the Babel error + its source
+            # code frame; only the first line fits the report.
+            $more = if ($cvLines.Count -gt 1) { " [full message with the source frame: $($r.artifacts.console)]" } else { "" }
+            Warn ".jsx transform FAILED$($times): $($cvLines[0])$more"
+        } else {
+            if ("$($cv.message)" -match 'is not a component') { $sawNotComponent = $true }
+            $more = if ($cvLines.Count -gt 1) { " [full message: $($r.artifacts.console)]" } else { "" }
+            Warn "Custom view error$($times): $($cvLines[0])$more"
+        }
+    }
+    if ($sawJsxFail) {
+        Info "A broken .jsx is served as that console-error stub INSTEAD of its script, so the component function never gets defined and every form using it renders an EMPTY custom container (short inline error in it) - that blank area on the screenshot is THIS failure, not a layout or data problem. Fix the .jsx at the position in the message and re-run: devmode serves web resources fresh on every page load, no restart needed."
+    } elseif ($sawNotComponent) {
+        Info "The named function is not a drawable component on this page: typo in the .lsf 'custom'/CUSTOM name, the defining web resource not loaded/registered, or its script died earlier (then the cause is usually a line above or in $($r.artifacts.console)). The affected container renders EMPTY except a short inline error."
+    } elseif ($cvErrs.Count) {
+        Info "A custom (React) view reported a render-time error - its container has likely rendered empty or wrong; the message above (full text in $($r.artifacts.console)) is the diagnosis, not the screenshot."
+    }
     if ($r.console_errors -gt 0) {
         # Diagnostics, not an assertion: console errors are reported but do
-        # not flip the exit code (apps routinely log noise there).
+        # not flip the exit code (apps routinely log noise there); the
+        # custom-view lines above are included in this count.
         Warn "Browser console reported $($r.console_errors) error(s) - see $($r.artifacts.console)."
     }
     if ($r.error) {
@@ -4246,7 +4330,8 @@ Common options:
                         (qualify names with the namespace; DOCKED renders the
                         form as a tab like in production - without it the
                         form opens as a small floating window). Output goes
-                        to verify-open.png. ASCII-safe only; for non-ASCII
+                        to verify-open.png (the stem follows -OutPrefix).
+                        ASCII-safe only; for non-ASCII
                         use -OpenScriptFile.
   -OpenScriptFile <path> 'verify': same as -OpenScript but read from a UTF-8
                         file (preferred for non-ASCII scripts).
@@ -4260,15 +4345,22 @@ Common options:
                         (active tab + lsfusion-form sIDs), WARNs when it is
                         not the form the script names, and scopes the text
                         sample to the matched form's subtree - found text on
-                        the wrong form is NOT a pass.
+                        the wrong form is NOT a pass. Do NOT pass the form's
+                        own caption: it renders on the docked TAB (and in
+                        the navigator), outside the form's subtree, so it
+                        can never verify the open (the report names that
+                        cause when it happens) - use a container/panel
+                        caption or a known data value instead.
   -Click <text>         'verify' only: click navigator entry(ies) by visible
                         text before the final screenshot; chain with '>'
                         (e.g. -Click "Master data > Items"). Output goes to
-                        verify-click.png; first form open gets generous waits.
+                        verify-click.png (stem follows -OutPrefix); first
+                        form open gets generous waits.
   -DoubleClick <text>   'verify' only: after -Click navigation, double-click a
                         grid row by visible cell text to open its edit card,
                         then screenshot it (e.g. -DoubleClick "Coffee beans").
-                        Output goes to verify-dblclick.png.
+                        Output goes to verify-dblclick.png (stem follows
+                        -OutPrefix).
   -Do <step>[,<step>]   'verify' only: generic interaction steps, run in order
                         AFTER the -Click/-DoubleClick navigation - the way to
                         reach buttons/inputs inside CUSTOM (React) components
@@ -4328,7 +4420,7 @@ Common options:
                         substring (case-insensitive); both poll up to 5 s and
                         fail the step (and the strict verify exit) otherwise.
                         Chain stops at the first failed step. Screenshot goes
-                        to verify-do.png. Example:
+                        to verify-do.png (stem follows -OutPrefix). Example:
                           verify -Click "Schedule" -Do "edit:Comment=>Ivanov","drag:.task-a=>.task-b","click:text=Book","assert-count:.task-card=>3"
   -DoFile <path>        'verify': read -Do steps from a UTF-8 file - either a
                         JSON array of step strings, or ONE STEP PER LINE
@@ -4338,6 +4430,13 @@ Common options:
                         one argument, gluing steps into a single garbled
                         selector - lsfdev warns when a step looks glued).
                         File steps run before any -Do steps.
+  -OutPrefix <stem>     'verify': filename stem for this run's artifacts -
+                        <stem>-open.png, <stem>-do.png, <stem>-dom.html,
+                        <stem>-console.txt, ... (default 'verify'). Every run
+                        wipes and rewrites its own stem's files, so when
+                        checking several forms in a loop pass a per-form
+                        stem (e.g. -OutPrefix items) or only the last run's
+                        screenshots survive. Letters, digits, '.', '_', '-'.
   -AllowWarnings        'verify': report-only mode - failed checks still
                         print [WARN]/[FAIL] but the exit code stays 0. By
                         DEFAULT verify is strict: any failed check (expect

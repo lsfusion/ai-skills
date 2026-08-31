@@ -36,11 +36,16 @@ configuration, or when you need to change ports/versions.
     │                             (plugin skill dirs aren't visible to python.exe)
     ├── verify-login.png          Playwright screenshot of the login page
     ├── verify-app.png            Playwright screenshot after the login attempt
+    ├── verify-open.png           the form opened by -OpenScript
     ├── verify-click.png / verify-dblclick.png   -Click / -DoubleClick results
     ├── verify-do.png             state after the -Do interaction steps
     ├── pw-session.pid / pw-session-profile/     persistent verify -Session
     │                             browser (killed by verify -EndSession / stop)
     └── verify-dom.html / verify-console.txt
+    (the verify- stem of all of these follows -OutPrefix: a run with
+    -OutPrefix items writes items-open.png, items-dom.html, ... and leaves
+    the sets of other prefixes untouched - how batch runs keep per-form
+    evidence)
 ```
 
 The application server runs with the **project folder as its working
