@@ -265,7 +265,7 @@ is part of the workflow.
 | `HTTP 200`, empty body | Script compiled, name-resolved against the running schema, and ran — **nothing more**. A `MESSAGE` produces exactly this (its text is swallowed — see the gotchas), and so does a mutation whose `APPLY` was silently **canceled by a constraint**. An empty 200 is never data-level proof; write scripts that `RETURN` something. |
 | `HTTP 200`, body present | Script ended in `RETURN <expr>;` or declared an `EXPORT FROM ...` — the value/export is the body. See "Getting values back" below. |
 | `HTTP 401` | Auth issue — see the trap table above. Usually means you sent the wrong `-u` form, NOT that the password is wrong. |
-| `HTTP 500`, body with `[error]:` | The script failed one of the compile phases (see "Syntax-checking" below for the exact order). Three error shapes, in the order the server checks them: a **parse error** (`no viable alternative`, `extraneous input`, `missing X`, `mismatched input`) = bad syntax; **`X cannot be used in EVAL module`** = a forbidden construct whose **syntax** is fine (this check preempts name resolution — see below); **`... is not found`** = an unknown class/property/action (the deployed config differs from yours, or a missing REQUIRE), reported only for scripts free of forbidden constructs. Genuine type mismatches (`... types don't match`, `should have integral class`) surface only when the value is realized — note INTEGER+STRING is **not** one (it coerces). **Parse** errors come batched (every statement's, in one response); **name** errors surface one per call — the body then ends with `Subsequent errors (if any) could not be found.` |
+| `HTTP 500`, body with `[error]:` | The script failed one of the compile phases (see "Syntax-checking" below for the exact order). Three error shapes, in the order the server checks them: a **parse error** (`no viable alternative`, `extraneous input`, `missing X`, `mismatched input`) = bad syntax; **`X cannot be used in EVAL module`** = a forbidden construct whose **syntax** is fine (this check preempts name resolution — see below); **`... is not found`** = an unknown class/property/action (the deployed config differs from yours, or a missing REQUIRE), reported only for scripts free of forbidden constructs. Genuine type mismatches (`... types don't match`, `should have integral class`) surface only when the value is realized — note INTEGER+STRING is **not** one (it coerces). **Parse** errors come batched (every statement's, in one response); **name** errors surface one per call — the body then ends with `Only the first error is reported: set 'batchScriptErrors' (or run with 'dryRun') to report several errors at once.` (a server started with `settings.batchScriptErrors=true` batches them instead and drops that trailer). |
 | `HTTP 404` | Endpoint not in this build (no `Eval` module REQUIREd, or wrong path). |
 
 The canonical "is this name in the running schema?" check against
@@ -287,8 +287,8 @@ exactly which phase failed (verified live on 7.0-SNAPSHOT):
 
 | Phase (in order) | Catches | Error shape in the body |
 |---|---|---|
-| 1. Parse (grammar) | malformed syntax in **anything**, including forbidden constructs — the whole file, errors batched | `no viable alternative` / `extraneous input` / `missing X` / `mismatched input` / `required (...)+ loop` |
-| 2. EVAL restriction | a construct eval can't load (see below). Fires **before** name resolution regardless of statement order — measured: a name error on line 1 goes unreported when a `CLASS` sits on line 2 | `<X> statement / option cannot be used in EVAL module` |
+| 1. Parse (grammar) | malformed syntax in **anything**, including forbidden constructs — the whole file, errors batched (except past a `CLASS` / `TABLE`: those abort the first pass, see phase 2) | `no viable alternative` / `extraneous input` / `missing X` / `mismatched input` / `required (...)+ loop` |
+| 2. EVAL restriction | a construct eval can't load (see below). Thrown, so the compile stops there. `CLASS` / `TABLE` are refused in the **first** pass — before name resolution of anything, and nothing after them is even parsed (measured: a name error on line 1 goes unreported when a `CLASS` sits on line 2; a parse error on line 2 goes unreported when a `CLASS` sits on line 1). Every other refused construct is caught in the **main** pass, statement by statement — names in earlier statements are already resolved (a name error on line 1 IS reported with a `WHEN` on line 3), nothing after it is | `<X> statement / option cannot be used in EVAL module`, `... is forbidden in EVAL module` |
 | 3. Name resolution | unknown class / property / action, missing `REQUIRE` — incl. names used inside `FORM` and event conditions. Reached only when phase 2 found nothing | `property or action '<name>' is not found` |
 | 4. Type realization | genuine type mismatches — but only when the value is actually used (lazy on unused declarations; INTEGER+STRING coerces, not an error) | `... types don't match` / `should have integral class` |
 
@@ -299,10 +299,14 @@ outcomes:
 - **`... is not found`** → a referenced element doesn't exist (typo, or a
   `REQUIRE` you haven't added). Only reported for scripts with **no**
   load-only constructs (see the previous row).
-- **`... cannot be used in EVAL module`** → the construct's (and the whole
-  file's) **syntax** is clean; eval won't load it, and — because this check
-  preempts name resolution — the script's **names were NOT checked**. A
-  syntax-PASS, not a names-PASS.
+- **`... cannot be used in EVAL module`** / **`... is forbidden in EVAL
+  module`** → eval refuses the construct and stops there; the construct
+  itself is fine syntactically. How much else was proven depends on the
+  construct: after a `CLASS` / `TABLE` (first pass) only the lines before
+  it are syntax-checked and **no names** are; after any other refused
+  construct (main pass) the **whole file** parsed clean and names were
+  checked in the statements **before** it. Never a names-PASS for the
+  whole script.
 
 So a typo in `CLASS`, persistent `DATA` (`NONULL` / `MATERIALIZED` /
 `INDEXED`), `WHEN`, `CONSTRAINT` etc. still yields a parse error, and a
@@ -333,11 +337,13 @@ local lsfdev project don't hand-roll the curl at all: **`lsfdev.ps1
 precheck -Files 'src\main\lsfusion\My.lsf'`** does exactly this per file —
 strips the `MODULE`/`REQUIRE` header (a full module posted verbatim dies
 with `missing EOF at 'MODULE'`) while preserving line numbers, appends the
-`run() {}`, and words each verdict by what was actually proven (syntax
-everywhere; names only where eval reached them). A file that declares its
-own `run()` is **skipped with a warning** instead of linted — `/eval`
-executes `run()`, and a linter must not run project actions (the skip
-alone does not fail the command; only real FAILs exit nonzero).
+`run() {}`, and labels each verdict by what was actually proven: `[OK]`
+(compiled, names proven), `[FAIL]` (a real error), `[SKIP]` + `[NEEDS
+DRYRUN]` (eval cannot check it — a limitation of the check, not an
+error). A file that declares its own `run()` is a `[SKIP]` instead of
+linted — `/eval` executes `run()`, and a linter must not run project
+actions. Only real `[FAIL]`s exit 1 (3 = no verdict, endpoint unusable);
+a run of nothing but `[SKIP]`s exits 0 with a `[NEEDS DRYRUN]` summary.
 
 Limits — eval is a linter, **not** the loader: it does not validate the
 load-time semantics specific to forbidden constructs (constraint logic,
@@ -347,21 +353,25 @@ completeness — the throwaway module depends on **every** loaded module,
 so names resolve even when the real module's `REQUIRE` list would not
 reach them (that failure surfaces only at a full load — the restart, or
 locally the `dryrun` described below). Parse errors come
-batched, but **name errors surface one per call** (fix and re-run), any
-load-only construct suppresses name checking for the whole script (see
-the phase table), and
-two real-module constructs **crash eval's compiler outright** instead of
-producing the polite restriction error — measured on 7.0-SNAPSHOT:
-`EXTEND FORM` (`RuntimeException NF COLLECTION RESTARTED`) and `() + { }`
-overrides of existing actions (`ClassCastException ... NFList`). A file
-containing those can't be linted past the offending statement — only a
+batched, but **name errors surface one per call** (fix and re-run — unless
+the server runs with `settings.batchScriptErrors=true`), a refused
+construct stops name checking from that statement on (see the phase
+table), and
+several real-module constructs **crash eval's compiler outright** instead
+of producing the polite restriction error — measured on 7.0-SNAPSHOT:
+`EXTEND FORM`, `EXTEND CLASS` and `DESIGN` / `NAVIGATOR` edits of existing
+elements (`RuntimeException NF COLLECTION RESTARTED`), `+ { }` / `+=`
+implementations of an existing `ABSTRACT` (`ClassCastException ... NFList`
+/ `NullPointerException`); a `+ { }` on a *non*-abstract target is a
+genuine `... is not found`, in eval and at a full load alike. A file
+containing a crashing construct can't be linted past it — only a
 full load checks it: the restart, or locally the scoped `dryrun` (below;
 `precheck` reports such files as
-"cannot lint" rather than failing them). The limit case is a file that is
+`[SKIP]` + `[NEEDS DRYRUN]` rather than failing them). The limit case is a file that is
 *entirely* META definitions / `@`-instantiations / `EXTEND FORM` (a
 typical extension/main module): eval coverage there is **zero** — META
 bodies compile only at instantiation — and `precheck` classifies such
-files upfront as **"restart-only"**, checking just the structure (MODULE
+files upfront as **`[SKIP]` + `[NEEDS DRYRUN]`**, checking just the structure (MODULE
 header, META/END balance, brackets); neither an ambiguity nor a
 constraint error in them can surface before a full load — locally that
 is a seconds-cheap scoped `dryrun`, on a remote server the restart
@@ -393,8 +403,8 @@ actions, `FORM`s with **no** load-only construct anywhere in them
 (milliseconds; one `CLASS` in the file blinds names for all of it); for
 new-module code full of load-only
 constructs, where eval is a syntax check at best, the scoped
-`dryrun -TopModule <Mod>` IS the per-edit loop (~4 s per run, one
-semantic error per run like a restart), with an
+`dryrun -TopModule <Mod>` IS the per-edit loop (~4 s per run, every
+parse and semantic error batched — unlike a restart), with an
 unscoped `dryrun` as the pre-restart gate — a scoped run skips the
 edited modules' dependents, and under a configured `logics.topModule`
 (the standard layout) the restart itself loads only that module's

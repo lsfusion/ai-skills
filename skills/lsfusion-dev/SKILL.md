@@ -215,7 +215,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-OutPrefix <stem>` renames the whole artifact set of a run (`<stem>-open.png`, …) so a batch loop over several forms keeps per-form evidence instead of overwriting `verify-*.png` each run. `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. Exit codes are trustworthy: **0** = HTTP success, **1** = request failed (HTTP error / connection refused), **3** = client timeout (no verdict — deliberately distinct from 1). |
-| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and words each verdict by what was proven (a load-only construct → syntax-only, **names NOT checked**; `EXTEND FORM` / `() + { }` → "cannot lint"; an all-META/`EXTEND FORM` file → "restart-only" upfront, structure checks incl. META/END balance still run). When module files or names went unchecked, the summary prints the exact scoped `dryrun -TopModule "…"` command that checks them in seconds — new-module code is mostly load-only declarations, so iterate on that `dryrun` there and keep precheck for files eval can fully check (no load-only construct anywhere in the file). See the `precheck` part of step 4. |
+| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and gives each file one of four verdicts: **`[OK]`** (eval compiled it — syntax and names proven), **`[FAIL]`** (a real error in the code: parse error, unknown name, unclosed META, missing header), **`[SKIP]`** (eval *cannot* check it — a limitation of the pre-check, never an error: a construct the eval module refuses such as `CLASS` / `WHEN` / `CONSTRAINT`, one that crashes its compiler such as `EXTEND FORM`, a name declared in another project file the server has not loaded, an all-META/`EXTEND FORM` file, a file declaring `run()`), each `[SKIP]` followed by **`[NEEDS DRYRUN]`** — the full module loader checks it, and the summary prints the exact scoped `dryrun -TopModule "…"` command. The summary is red and the exit code 1 **only for `[FAIL]`**; a run whose only findings are pre-check limitations ends in `[NEEDS DRYRUN]` with exit 0 (exit 3 = no verdict, the endpoint could not be used). Every file is also scanned statically for comparisons with the `NULL` literal (`x != NULL` / `== NULL`, `x = NULL` in a condition) — they compile clean but are **always `NULL`**, so they come back as line:col warnings, never a FAIL. New-module code is mostly refused declarations, so iterate on the scoped `dryrun` there and keep precheck for files eval can fully check. See the `precheck` part of step 4. |
 | `dryrun` | **Full-fidelity validation without starting anything — the inner loop for new code (scoped) and the gate before a restart.** Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets), opens **no DB connection at all** — no PostgreSQL needed — and never touches the running server, so it validates safely **next to a live instance**. `-TopModule <M>` (comma-separated list allowed — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See the `dryrun` part of step 4. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
@@ -912,20 +912,20 @@ with different reach:
 - **New code → scoped `dryrun`.** New modules are mostly schema
   declarations — `CLASS`, persistent `DATA`, `WHEN`, `CONSTRAINT`,
   `EXTEND FORM`, META — and those are exactly what `/eval` refuses to
-  load, so `precheck` proves only *syntax* there and answers **"names
-  NOT checked"** (measured session: 15 new files, every one declaring a
+  load, so `precheck` answers **`[SKIP]` + `[NEEDS DRYRUN]`** there,
+  proving little (measured session: 15 new files, every one declaring a
   `CLASS` → precheck caught ~nothing, while a scoped `dryrun` surfaced
-  the errors at ~4 s per run — parse errors batched, one semantic error
-  per run like a restart — live server untouched). For new code
+  the errors at ~4 s per run — parse and semantic errors batched, live
+  server untouched). For new code
   **`dryrun -TopModule "<EditedModules>"` is the inner loop** — go
   straight there instead of iterating on precheck.
 - **Edits to eval-checkable files → `precheck`.** Computed properties,
   actions, whole `FORM` declarations: ~30 ms/file beats seconds, and
-  names ARE checked — but only when the **file** carries no load-only
-  construct at all: eval lints whole files, so a single `CLASS` /
-  persistent `DATA` / `WHEN` / `CONSTRAINT` anywhere in the file blinds
-  name checking for everything in it (the verdict says so when that
-  happens; the scoped `dryrun` is the loop then).
+  names ARE checked — up to the first construct eval refuses: a `CLASS`
+  or `TABLE` anywhere in the file stops eval's first pass (names checked
+  nowhere), any other refused construct stops the main pass (names
+  checked only in the statements before it). The `[SKIP]` verdict says
+  exactly which line stopped it; the scoped `dryrun` is the loop then.
 
 Both paths converge on the same tail: an unscoped `dryrun` **gate** —
 it covers what neither loop proved (`REQUIRE` completeness after a
@@ -942,38 +942,89 @@ lsfdev.ps1 precheck -ProjectDir "C:/Work/proj"                # all .lsf under s
 lsfdev.ps1 precheck -ProjectDir "C:/Work/proj" -Files 'src\main\lsfusion\Invoice.lsf'
 ```
 
-A parse error means bad syntax; `... is not found` means a missing
-element / `REQUIRE`. One blind spot the other way: eval's throwaway
+**Read the verdict labels literally — they separate errors in the code
+from limits of the check.** `[OK]` = eval compiled the file (syntax and
+names proven). `[FAIL]` = a real error: a parse error means bad syntax,
+`... is not found` an element that does not exist (typo, or a `REQUIRE`
+you have not added). `[SKIP]` = eval **cannot** check the file, or the
+rest of it — a limitation of this pre-check, never a finding about the
+code — and every `[SKIP]` is followed by `[NEEDS DRYRUN]`, the loader
+that does check it. Only `[FAIL]` turns the summary red (exit 1); a run
+whose only findings are `[SKIP]`s ends in a `[NEEDS DRYRUN]` summary with
+exit 0 — do not read it as broken code, run the printed command. (Exit 3
+= no verdict at all: the endpoint could not be used.)
+
+What produces a `[SKIP]`, and how much was still proven (all measured):
+
+- **A construct the eval module refuses** — `CLASS`, `TABLE`, `INDEX`,
+  `DATA … NONULL / MATERIALIZED / TABLE`, `WHEN`, `ON`, `CONSTRAINT`,
+  `=>`, `<- … WHEN`, `AGGR`, `GROUP … : <parent from another module>`,
+  `… IN <group of another module>` — answered `... cannot be used in
+  EVAL module` / `... is forbidden in EVAL module`. The restriction is
+  thrown, so eval stops right there, and *where* decides the coverage:
+  `CLASS` and `TABLE` are refused in eval's **first** pass — syntax is
+  proven only up to that line, names nowhere (a name error on line 1 goes
+  unreported with a `CLASS` on line 2, a parse error on line 2 with a
+  `CLASS` on line 1); everything else is refused in the **main** pass,
+  which runs only after the whole file parsed clean — syntax proven for
+  the whole file, names only in the statements before that line. The
+  verdict names the line and the construct.
+- **A construct that crashes eval's compiler** — `EXTEND FORM`,
+  `EXTEND CLASS`, `DESIGN` / `NAVIGATOR` edits of *existing* elements,
+  `+ { }` / `+=` implementations of an existing `ABSTRACT` — an internal
+  exception with a Java stack instead of the polite error. Not a verdict
+  on the file (a `+ { }` on a **non**-abstract target is a genuine
+  `... is not found` at a full load too, and stays `[FAIL]`).
+- **A name declared in another file of the project** that the running
+  server has not loaded (a new module, or a declaration added in this
+  edit session): eval lints one file at a time against the loaded schema,
+  so its `is not found` is a cross-file reference, not an error — precheck
+  harvests every top-level declaration under `src/main` to tell the two
+  apart.
+- **A file that is entirely META / `@`-instantiations / `EXTEND FORM`**
+  (see below) and **a file declaring `run()`** (eval would execute it).
+
+One blind spot the other way: eval's throwaway
 module depends on **every** loaded module, so a name your file uses
 without the matching `REQUIRE` still resolves — an incomplete `REQUIRE`
 list surfaces only at restart or `dryrun` (which checks the real
-`REQUIRE` graph — see below). When a file carries a load-only construct (`CLASS` /
-`DATA … NONULL` / `WHEN` / `CONSTRAINT`), eval answers `... cannot be
-used in EVAL module` — precheck reports that as **syntax OK, names NOT
-checked** (the restriction preempts name resolution for the whole
-script). Two constructs crash eval's compiler outright — `EXTEND FORM`
-and `() + { }` overrides of existing actions — such files come back as
-"cannot lint". Every unchecked-file / unchecked-names verdict points at
-`dryrun`, and the run summary prints the exact scoped command —
-`dryrun -TopModule "<the unchecked modules>"` — covering those files in
-one go (one exception: a headerless `run()` eval probe is not a module,
-cannot be dry-run, and keeps only its per-file warning). A PASS can
+`REQUIRE` graph — see below). The run summary prints the exact scoped
+command — `dryrun -TopModule "<the skipped modules>"` — covering every
+`[SKIP]` in one go (one exception: a headerless `run()` eval probe is not
+a module, cannot be dry-run, and keeps only its `[SKIP]`). A PASS can
 still carry a narrow caveat worded per file — NAMESPACE/PRIORITY
 ambiguity, META bodies nothing in the file instantiates — those don't
 trigger the hint.
 
+**One check runs before eval on every linted file, restart-only ones
+included: comparisons with the `NULL` literal.** `x != NULL`, `x == NULL`
+and `x = NULL` compile without a word, but the `NULL` operand propagates
+through the comparison like through any other operator, so the result is
+`NULL` whatever `x` holds (measured: `IF s() != NULL` with `s() = 'abc'`
+takes the `ELSE` branch) — a `FILTER` / `SHOWIF` / `IF` / `WHERE` built on
+it is silently empty and no load ever reports it. precheck flags each
+occurrence with line:col as a **warning** (the load accepts it, so it is
+not a FAIL) and counts them in the summary. `==` / `!=` next to `NULL` are
+flagged unconditionally; a single `=` only in a condition context (after
+`IF` / `WHERE` / `AND` / `OR` / `NOT` / `FILTER` / `SHOWIF` … on the same
+line, or followed by `THEN` / `AND` / `OR`), because `col = NULL` in an
+`EXPORT`, `SEEK f.o = NULL` and `showIf = NULL` in `DESIGN` are legitimate.
+The fix is the rules idiom for a value of **any** class, not only
+`BOOLEAN`: `IF prop(...)` / `NOT prop(...)`.
+
 **Know the restart-only file class — precheck names it upfront.** A file
 that is *entirely* META definitions / `@`-instantiations / `EXTEND FORM`
 (the typical extension/main module) gets **zero** eval coverage — precheck
-reports **"restart-only"** immediately instead of a hollow PASS, checking
-just the structure: MODULE header, **META/END balance** (an unclosed META
-is a hard FAIL: it swallows the rest of the file at restart) and bracket
-balance (a warning). Plan the loop around the truth: **for a restart-only
-file, only a full load checks it** — `dryrun` (below) does that in seconds
-without touching the live server, the restart does it while applying the
-schema; don't spend cycles re-running precheck there. Files that merely
-*declare* META next to other code are linted normally, with the caveat
-that un-instantiated META bodies stay unchecked until a full load.
+answers **`[SKIP]` + `[NEEDS DRYRUN]`** immediately instead of a hollow
+PASS, checking just the structure: MODULE header, **META/END balance** (an
+unclosed META is a hard `[FAIL]`: it swallows the rest of the file at
+restart) and bracket balance (a warning). Plan the loop around the truth:
+**for such a file, only a full load checks it** — `dryrun` (below) does
+that in seconds without touching the live server, the restart does it
+while applying the schema; don't spend cycles re-running precheck there.
+Files that merely *declare* META next to other code are linted normally,
+with the caveat that un-instantiated META bodies stay unchecked until a
+full load.
 
 Do **not** use `api` for any of this: its `/eval/action`
 endpoint wraps the script as an action body and any declaration dies
@@ -987,13 +1038,15 @@ code, the inner loop itself.** It launches the server JVM with
 modules, classes, properties, actions, forms — is parsed,
 metacode-expanded, name-resolved and finalized exactly as at a restart,
 then the JVM exits **before the DB sync** instead of starting services.
-Exit code 0 = the logic loads; 1 = it does not (the error, with
+Exit code 0 = the logic loads; 1 = it does not (every error, with
 file:line:col, is printed). Every load-time blind spot of `precheck` is
 covered (all measured): names resolve against the file's **real
 `REQUIRE` closure**, so an incomplete `REQUIRE` list fails here;
 `EXTEND FORM`, `() + { }` overrides, META instantiation — the whole
-"restart-only" file class — get real checking; parse errors come
-batched, and, like a restart, **one semantic error per run**.
+`[SKIP]` class — get real checking; and, unlike a restart, **semantic
+errors come batched** too (`dryRun` implies `batchScriptErrors`: three
+planted name errors across two modules all reported in one run), so fix
+everything it lists before re-running.
 
 ```
 lsfdev.ps1 dryrun -ProjectDir "C:/Work/proj"                    # whole project
@@ -1051,19 +1104,20 @@ per-run `-D` flags only.
 
 When to reach for `dryrun`: as the **inner loop for new code** (scoped
 with `-TopModule` to the edited modules — a failed scoped run costs
-seconds and nothing else); for **restart-only files** (`EXTEND FORM` /
-all-META modules) and **"names NOT checked"** verdicts, where precheck
-proves little to nothing; to catch a **missing `REQUIRE`** precheck
-structurally cannot; as the **gate right before a restart** (a failed
-restart costs 26–41 s *and* downtime; a failed full dryrun ~10–40 s and
-nothing else); and for CI-style "does this branch even load" checks —
-that box needs **no PostgreSQL at all**. `precheck` keeps its edge where
-eval genuinely checks names — property/action/`FORM` files with no
-load-only construct anywhere in them, ~30 ms
-per file — and its structural FAILs (unclosed META) are instant. Treat
-it as a fast probe, not a gate: the moment it answers "names NOT
-checked" / "restart-only" / "cannot lint", the next step is the `dryrun`
-command its summary prints, not another precheck round.
+seconds and nothing else); for every **`[NEEDS DRYRUN]`** precheck
+prints (`EXTEND FORM` / all-META modules, refused constructs, cross-file
+names), where precheck proves little to nothing; to catch a **missing
+`REQUIRE`** precheck structurally cannot; as the **gate right before a
+restart** (a failed restart costs 26–41 s *and* downtime; a failed full
+dryrun ~10–40 s and nothing else); and for CI-style "does this branch
+even load" checks — that box needs **no PostgreSQL at all**. `precheck`
+keeps its edge where eval genuinely checks names — property/action/`FORM`
+files with no refused construct anywhere in them, ~30 ms
+per file — and its structural `[FAIL]`s (unclosed META) are instant.
+Treat it as a fast probe, not a gate: the moment it answers `[SKIP]` /
+`[NEEDS DRYRUN]`, the next step is the `dryrun` command its summary
+prints, not another precheck round — and never read that summary as a
+failure of the code.
 
 **Web resources (JS / CSS / images) need NO restart in devmode — any page
 load picks them up; browser cache is NOT a factor.** Files under

@@ -101,6 +101,8 @@ function Head($text) {
 function Ok($text)   { Write-Host "  [OK]   $text" -ForegroundColor Green }
 function Warn($text) { Write-Host "  [WARN] $text" -ForegroundColor Yellow }
 function Bad($text)  { Write-Host "  [FAIL] $text" -ForegroundColor Red }
+function Skip($text) { Write-Host "  [SKIP] $text" -ForegroundColor Cyan }
+function NeedsDryrun($text) { Write-Host "  [NEEDS DRYRUN] $text" -ForegroundColor Magenta }
 function Info($text) { Write-Host "  $text" }
 
 function Read-FileText([string]$path) {
@@ -2281,7 +2283,18 @@ function Cmd-DryRun {
             $tailErr | ForEach-Object { Write-Host "    $_" }
         }
         Write-Host ""
-        if ($logicFail) { Info "Like a restart, ONE semantic error is reported per run (parse errors come batched) - fix and re-run. Sub-second single-file linting: precheck." }
+        if ($logicFail) {
+            # Current builds batch every semantic error into one dry run
+            # (settings.dryRun implies batchScriptErrors - measured: three
+            # planted name errors across two modules, all in one run); the
+            # "first error only" trailer marks an older build that still
+            # stops at the first one.
+            if ($outText -match 'Subsequent errors \(if any\) could not be found|Only the first error is reported') {
+                Info "This platform build is OUTDATED: it reports ONE semantic error per run (parse errors come batched) - fix and re-run. Current 7.0-SNAPSHOT builds report every semantic error in one dry run; update the platform. Sub-second single-file linting: precheck."
+            } else {
+                Info "Every semantic error the load hit is listed above (a dry run batches them, unlike a restart) - fix them all, then re-run. Sub-second single-file linting: precheck."
+            }
+        }
         elseif ($TopModule -and $TopModule.Contains(',') -and $outText -match "Module '[^']*,[^']*' not found") {
             # A stale build predating comma-list topModule reads the list as
             # ONE module name (measured). The latest 7.0-SNAPSHOT is the
@@ -3624,7 +3637,8 @@ function Cmd-Precheck {
     # depends on every loaded module - but a brand-new module's names exist
     # only after its first successful restart.)
     if (-not (Test-PortOpen $cfg.httpPort)) {
-        throw "Nothing is listening on the Action API port $($cfg.httpPort). precheck compiles against the RUNNING dev server - start it first: lsfdev.ps1 start-server"
+        Warn "No verdict: nothing is listening on the Action API port $($cfg.httpPort). precheck compiles against the RUNNING dev server - start it first: lsfdev.ps1 start-server. Exit code 3 = no verdict (not a statement about the files)."
+        exit 3
     }
     # An open port only proves SOMETHING listens. If it is not this project's
     # tracked server (parallel-session port drift, a manually started
@@ -3649,13 +3663,15 @@ function Cmd-Precheck {
 
     $headers = Get-EvalAuthHeaders $cfg
     Info "POST http://localhost:$($cfg.httpPort)/eval (statements mode), $($targets.Count) file(s)."
-    Info "Verifies syntax everywhere and names where eval reaches them (~30 ms/file); module files or names eval cannot reach get the exact scoped 'dryrun' command in the summary (seconds, full load fidelity)."
+    Info "Verdicts: [OK] eval compiled it (syntax + names proven) | [FAIL] a real error in the code | [SKIP] eval cannot check it - a limitation of this pre-check, NOT an error - each followed by [NEEDS DRYRUN]: the full module loader checks it (the summary prints the exact scoped 'dryrun' command)."
     Write-Host ""
-    # Top-level names declared anywhere in THIS selection (column-0
-    # declarations and CLASSes, harvested off the comment-blanked shadow).
-    # eval checks files one at a time, so file B legitimately cannot see file
-    # A's new declaration - a not-found on such a name is a cross-file
-    # reference, reported as inconclusive rather than FAIL.
+    # Top-level names declared anywhere in THIS PROJECT (column-0
+    # declarations and keyworded declarations, harvested off the
+    # comment-blanked shadow of the selected files plus every .lsf under the
+    # source roots). eval checks one file at a time against what the running
+    # server has LOADED, so a name declared in a new or freshly edited module
+    # legitimately comes back 'is not found' - a cross-file reference eval
+    # cannot see, reported as [SKIP], never as a FAIL.
     # Ordinal dictionary, NOT a PS hashtable: hashtable keys are
     # case-insensitive, and lsFusion identifiers are not - CLASS 'NewProp'
     # must not swallow a genuine error on 'newProp'.
@@ -3663,9 +3679,17 @@ function Cmd-Precheck {
     # overloads legitimately live in several files, and a single-owner map
     # would let the last writer shadow the others (a same-name declaration in
     # the current file must not hide a cross-file overload). Full paths, not
-    # leaves: two selected files can share a basename; the leaf is display-only.
+    # leaves: two files can share a basename; the leaf is display-only.
+    $harvest = New-Object 'System.Collections.Generic.List[string]'
+    $harvestSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in $targets) { if ($harvestSeen.Add($t)) { $harvest.Add($t) } }
+    foreach ($root in @(@("src\main\lsfusion", "src\main\resources") | ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ })) {
+        foreach ($f in @(Get-ChildItem $root -Recurse -Filter *.lsf -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })) {
+            if ($harvestSeen.Add($f)) { $harvest.Add($f) }
+        }
+    }
     $declaredHere = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]' ([System.StringComparer]::Ordinal)
-    foreach ($t in $targets) {
+    foreach ($t in $harvest) {
         try {
             $sh = Get-CommentBlankedShadow ([IO.File]::ReadAllText($t))
             # Column-0 property/action declarations, plus keyworded top-level
@@ -3682,18 +3706,57 @@ function Cmd-Precheck {
             }
         } catch { }
     }
+    # Verdict classes - the whole point of the labels. [OK]: eval compiled
+    # the file. [FAIL]: a REAL error in the code (parse error, unknown name,
+    # unclosed META, missing header). [SKIP]: eval cannot check the file, or
+    # the rest of it - a limitation of THIS pre-check, never a statement
+    # about the code - always followed by [NEEDS DRYRUN], the loader that
+    # does check it. Only [FAIL] makes the summary red / exit 1; a run whose
+    # only findings are pre-check limitations ends in [NEEDS DRYRUN] with
+    # exit 0. (Feedback: CLASS files and eval-crashing constructs used to
+    # come back as FAIL, and agents read that as broken code.) No verdict at
+    # all - the endpoint could not be used - exits 3, like 'api'.
+    $okCount = 0
     $failCount = 0
-    $skipCount = 0
-    # Files whose NAMES eval never reached (load-only constructs preempt name
-    # resolution) still print an Ok - count them separately so the summary
-    # tells the truth instead of "all pass". Their modules (plus the skipped
-    # files') feed a concrete scoped-dryrun suggestion: dryrun load-checks
-    # exactly what eval could not, in seconds, several times cheaper than the
-    # restart the old wording pointed at.
-    $nameBlind = 0
+    $skipCount = 0          # [SKIP] verdicts (eval limitation or policy skip)
+    $needsDryCount = 0      # ... of which are modules a scoped dryrun loads
+    $toolErrCount = 0       # no verdict at all: endpoint / IO problem
+    # Comparisons with the NULL literal flagged by the static scan below -
+    # never a FAIL (the server compiles them clean), but always a bug worth
+    # a line in the summary so a PASS is not mistaken for "no findings".
+    $nullCmpCount = 0
+    # The server's "first error only" trailer, in both wordings the platform
+    # has used - when it is absent the server batches semantic errors
+    # (settings.batchScriptErrors) and the "ONE per call" hint would lie.
+    $sawFirstOnly = $false
+    $firstOnlyRx = 'Subsequent errors \(if any\) could not be found|Only the first error is reported'
+    # Compiler-crash signature: an internal exception with a Java stack
+    # instead of the polite '[error]:' block. The header text is localized
+    # ("Wewnetrzny blad serwera" on a pl host), so match the exception class
+    # and the stack frames, not the words.
+    $crashRx = 'RemoteInternalException|Internal Server Error|(?m)^\s+at (lsfusion|java|org)\.'
+    # Restriction messages of the eval module, both wordings the platform
+    # uses ("<X> cannot be used in EVAL module" from emitEvalModuleError,
+    # "... is forbidden in EVAL module" from the group / event paths).
+    $restrictRx = 'cannot be used in EVAL module|is forbidden in EVAL module'
+    # CLASS and TABLE are refused in eval's FIRST pass (initMetaAndClasses),
+    # which aborts right there: parse errors before the statement still come
+    # batched with it, nothing after it is parsed, names are resolved
+    # nowhere (measured: a name error on line 1 goes unreported with a CLASS
+    # on line 2, and a parse error on line 2 goes unreported with a CLASS on
+    # line 1). Every other restriction fires in the MAIN pass, which only
+    # starts after the whole file parsed clean and runs statement by
+    # statement - names BEFORE it were checked, nothing after it.
+    $firstPassRx = '^(CLASS|TABLE) statement '
+    # Body-line classes: entries carry eval's throwaway module name and a
+    # position; everything else is framing that must not be read as an
+    # error. An unrecognized line is treated as an error line (fail-safe).
+    $entryRx = '^\s*UNIQUE\d+NSNAME:(\d+):(\d+)\s+(.*)$'
+    $noiseRx = '^\s*\[error\]:\s*$|^\s*Subsequent errors|^\s*Only the first error is reported|^\s*\d+ more error\(s\) are not shown'
     $uncheckedModules = New-Object 'System.Collections.Generic.List[string]'
     foreach ($t in $targets) {
         $leaf = Split-Path $t -Leaf
+        $stem = $leaf -replace '\.lsf$', ''
         try {
             $raw = [IO.File]::ReadAllText($t)
             # /eval EXECUTES the script's run() action. Project modules never
@@ -3718,12 +3781,15 @@ function Cmd-Precheck {
             if ($fileShadow -cmatch '^\s*MODULE\s+([A-Za-z_][A-Za-z0-9_]*)\s*;') { $moduleName = $Matches[1] }
             if ($fileShadow -cmatch '(?m)^[ \t]*run(?![A-Za-z0-9_])\s*(?:''(?:[^''\\]|\\.)*''\s*)?(?:\([^)]*\)\s*)?(?:\{|\+?=|INTERNAL\b)') {
                 $skipCount++
-                if ($moduleName) { $uncheckedModules.Add($moduleName) }
+                Skip "$leaf - not linted: it declares run(), and /eval EXECUTES run() - a linter must not run project actions. Rename the action (or lint the file without it). Not a verdict on the file."
                 # The dryrun alternative applies only to a real module (a
                 # headerless run() file is an eval probe - not loadable, and
                 # deliberately not FAILed for the missing header either).
-                $runDryNote = if ($moduleName) { " Or check it via 'dryrun' - a dry run loads modules without executing anything." } else { "" }
-                Warn "$leaf - skipped: it declares run(), and /eval EXECUTES run() - a linter must not run project actions. Rename the action (or lint the file without it).$runDryNote"
+                if ($moduleName) {
+                    $needsDryCount++
+                    $uncheckedModules.Add($moduleName)
+                    NeedsDryrun "$leaf - requires the full module loader (module '$moduleName'; a dry run loads modules without executing anything)."
+                }
                 continue
             }
             # Every .lsf module must open with a MODULE header - the restart
@@ -3761,16 +3827,49 @@ function Cmd-Precheck {
             if ($balanceNotes.Count) {
                 Warn "$leaf - brackets look unbalanced outside comments/strings ($($balanceNotes -join '; ')) - if the restart fails with a parse error, start here (META fragments can legitimately unbalance, so this alone is not a FAIL)."
             }
+            # Comparison with the NULL literal. 'x != NULL', 'x == NULL' and
+            # 'x = NULL' compile without a word, but the NULL operand
+            # propagates through the comparison exactly as through any other
+            # operator, so the result is NULL WHATEVER x holds (measured on
+            # 7.0-SNAPSHOT: IF s() != NULL with s() = 'abc' takes the ELSE
+            # branch) - a FILTER / SHOWIF / IF / WHERE built on it is
+            # silently empty and nothing in the load reports it. The static
+            # pattern is trivial to catch, so catch it here, before eval.
+            # '==' / '!=' next to NULL have no legitimate reading. A single
+            # '=' does - EXPORT columns 'col = NULL', SEEK / DIALOG OBJECTS
+            # 'o = NULL', DESIGN 'showIf = NULL' - so it is flagged only in
+            # a condition context: after IF / WHERE / AND / OR / NOT /
+            # FILTER / SHOWIF / ... on the same line with no ',' ';' '{' or
+            # another '=' in between, or with THEN / AND / OR / XOR right
+            # after it. Measured on ~17k .lsf files (ERP + system modules):
+            # every strict-form hit was a real bug, the guarded '=' form
+            # produced no false positive. '<-' / '+=' end in '-' / '+', so
+            # the lookbehind keeps assignments out. Scanned on the
+            # structural shadow: a caption 'x = NULL' or a FORMULA string
+            # cannot trigger, and line:col still match the file.
+            $nullCmpRx = '(?:==|!=)\s*NULL\b|\bNULL\s*(?:==|!=)' +
+                '|(?<=\b(?:IF|WHERE|AND|OR|NOT|XOR|WHEN|FILTER|FILTERS|SHOWIF|READONLYIF|DISABLEIF|THEN|ELSE|CONSTRAINT)\b[^;{},=\r\n]*)(?<![<>!=+*/-])=\s*NULL\b' +
+                '|(?<![<>!=+*/-])=\s*NULL\s*(?=(?:THEN|AND|OR|XOR)\b)'
+            foreach ($nm in [regex]::Matches($structShadow, $nullCmpRx)) {
+                $nullCmpCount++
+                $before = $structShadow.Substring(0, $nm.Index)
+                $ln = ([regex]::Matches($before, "`n")).Count + 1
+                $col = $nm.Index - $before.LastIndexOf("`n")
+                $srcLine = @($raw -split "`r?`n")[$ln - 1].Trim()
+                if ($srcLine.Length -gt 120) { $srcLine = $srcLine.Substring(0, 120) + " ..." }
+                Warn "$leaf`:$ln`:$col - comparison with NULL is ALWAYS NULL: '$($nm.Value.Trim())' never holds, so the condition built on it is silently empty (and the server compiles it without a warning). Test NULL-ness as a condition instead - 'IF prop(...)' / 'NOT prop(...)' - for a value of ANY class, not only BOOLEAN. | $srcLine"
+            }
             if ((-not $cov.Residual) -and ($cov.HasMeta -or $cov.HasUsage -or $cov.HasExtend)) {
                 # The main-file shape that would otherwise burn a precheck
                 # cycle: all META definitions / @-instantiations / EXTEND
-                # FORM. eval can
-                # compile NONE of that, so posting it yields either a hollow
-                # PASS or a misleading compiler-crash report - say the truth
-                # upfront instead.
+                # FORM. eval can compile NONE of that, so posting it yields
+                # either a hollow PASS or a misleading compiler-crash report -
+                # say the truth upfront instead.
                 $skipCount++
+                $needsDryCount++
                 $uncheckedModules.Add($moduleName)
-                Warn "$leaf - restart-only: the file is entirely META definitions / @-instantiations / EXTEND FORM. eval can check NONE of its content - ambiguity and constraint errors included - so only structure was verified (MODULE header, META/END balance, brackets). Only a full load checks this file: run 'dryrun' (seconds, live server untouched) or budget the restart cycle - don't re-run precheck for it."
+                Skip "$leaf - unsupported by eval precheck: the file is entirely META definitions / @-instantiations / EXTEND FORM, and eval can compile none of that (ambiguity and constraint errors included). Not an error in the file. Structure verified: MODULE header, META/END balance, brackets."
+                NeedsDryrun "$leaf - requires the full module loader (module '$moduleName'): only a full load checks this file - 'dryrun' does it in seconds, live server untouched; don't re-run precheck for it."
                 continue
             }
             # NAMESPACE / PRIORITY steer how ambiguous names resolve; they are
@@ -3801,14 +3900,15 @@ function Cmd-Precheck {
                     -ContentType "application/x-www-form-urlencoded; charset=UTF-8" `
                     -Body ([Text.Encoding]::UTF8.GetBytes("script=$enc")) -UseBasicParsing -TimeoutSec 60
             }
+            $okCount++
             Ok "$leaf - PASS (eval compiled and loaded it clean)$nsCaveat$metaCaveat"
         } catch {
             $body = Get-ErrorResponseBody $_
             if (-not $body) {
                 # No HTTP error body: an IO problem, a connection drop, or a
-                # non-HTTP failure - report it per file and keep going.
-                $failCount++
-                Bad "$leaf - precheck error: $($_.Exception.Message)"
+                # non-HTTP failure - no verdict on the file, keep going.
+                $toolErrCount++
+                Warn "$leaf - no verdict: the request failed before the server judged the file ($($_.Exception.Message))."
                 continue
             }
             # Compiler verdicts live in HTTP 500 bodies only. Anything else
@@ -3816,76 +3916,127 @@ function Cmd-Precheck {
             # endpoint problem, not a statement about the file.
             $status = 0
             try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            $firstLine = "$(@($body -split "`r?`n" | Where-Object { $_.Trim() })[0])".Trim()
+            if ($firstLine.Length -gt 160) { $firstLine = $firstLine.Substring(0, 160) + " ..." }
             if ($status -ne 0 -and $status -ne 500) {
-                $failCount++
-                Bad "$leaf - HTTP $status from the endpoint (auth / wrong path / a build without the Eval module?) - not a verdict on the file: $(@($body -split "`r?`n" | Where-Object { $_.Trim() })[0])"
+                $toolErrCount++
+                Warn "$leaf - no verdict: HTTP $status from the endpoint (auth / wrong path / a build without the Eval module?) - not a statement about the file: $firstLine"
                 continue
             }
             # Some real-module constructs crash eval's compiler outright with
-            # an internal 500 + Java stack instead of the polite restriction
-            # error - measured on 7.0-SNAPSHOT with EXTEND FORM ("NF
-            # COLLECTION RESTARTED") and '() + {' action overrides
-            # (ClassCastException). Says nothing about the file's validity.
-            if ($body -match 'RemoteInternalException|Internal Server Error:\s*java\.') {
+            # an internal exception + Java stack instead of the polite
+            # restriction error - measured on 7.0-SNAPSHOT: EXTEND FORM and
+            # NAVIGATOR / DESIGN edits of existing elements ("NF COLLECTION
+            # RESTARTED"), EXTEND CLASS (same, in the first pass), '+ { }' /
+            # '+=' implementations of an existing ABSTRACT (ClassCastException
+            # / NullPointerException). Says nothing about the file's validity.
+            if ($body -match $crashRx) {
                 $skipCount++
+                $needsDryCount++
                 $uncheckedModules.Add($moduleName)
-                $first = "$(@($body -split "`r?`n" | Where-Object { $_.Trim() })[0])".Trim()
-                if ($first.Length -gt 160) { $first = $first.Substring(0, 160) + " ..." }
-                Warn "$leaf - cannot lint: eval's compiler crashed on a construct it does not support (typically EXTEND FORM or a '() + { }' override of an existing action). Only a full load checks this file - 'dryrun' does it in seconds, live server untouched."
-                Info "    ($first)"
+                # Which pass crashed says how much was proven: the main pass
+                # runs only after the whole file parsed clean (a parse error
+                # anywhere preempts the crash - measured), the class pass
+                # aborts wherever it was.
+                $cover = if ($body -match 'initMainLogic') { "Syntax OK (whole file); names unproven." }
+                         elseif ($body -match 'initMetaAndClasses') { "Nothing past the crashing statement was parsed; names unproven." }
+                         else { "Coverage unknown." }
+                Skip "$leaf - unsupported by eval precheck: its compiler crashed on a construct it cannot handle (EXTEND FORM / EXTEND CLASS, DESIGN or NAVIGATOR edits of existing elements, '+ { }' / '+=' implementations of an existing ABSTRACT). Not an error in the file. $cover"
+                Info "    ($firstLine)"
+                NeedsDryrun "$leaf - requires the full module loader (module '$moduleName')."
                 continue
             }
-            # Strip the "[error]:" preambles and the "Subsequent errors" note;
-            # rebrand eval's throwaway module name (UNIQUEnNSNAME) to the file
-            # so positions read naturally. Line:col match the original file -
-            # Strip-ModuleHeader blanks headers in place instead of removing.
-            $meat = @($body -split "`r?`n" | Where-Object { $_.Trim() } |
-                Where-Object { $_ -notmatch '^\s*\[error\]:\s*$' -and $_ -notmatch '^Subsequent errors' } |
-                ForEach-Object { ($_ -replace 'UNIQUE\d+NSNAME', ($leaf -replace '\.lsf$', '')).Trim() })
-            $evalOnly = @($meat | Where-Object { $_ -match 'cannot be used in EVAL module' })
-            if ($meat.Count -and ($evalOnly.Count -eq $meat.Count)) {
-                # Load-only construct (CLASS, persistent DATA options, WHEN,
-                # CONSTRAINT...). The restriction fires BEFORE name resolution
-                # (measured: a name error on line 1 goes unreported when a
-                # CLASS sits on line 2), so this outcome proves the syntax of
-                # the whole file and nothing about its names.
-                $nameBlind++
-                $uncheckedModules.Add($moduleName)
-                $where = if ($evalOnly[0] -match ':(\d+):\d+') { " at line $($Matches[1])" } else { "" }
-                Ok "$leaf - syntax OK (whole file). Names NOT checked: a load-only construct$where stops eval before name resolution - names in this file surface only at a full load: 'dryrun' (seconds, live server untouched) or the restart.$metaCaveat"
-            } else {
-                # A not-found on a name that another file of THIS selection
-                # declares is a cross-file reference eval cannot see, not a
-                # real error - inconclusive, the restart is the actual check.
-                $crossRefs = @()
-                foreach ($line in $meat) {
-                    # Any not-found kind counts: the server words them as
-                    # "property or action 'x[...]' is not found", "class 'X'
-                    # is not found", etc. - capture the bare identifier.
-                    if ($line -cmatch "'([A-Za-z_][A-Za-z0-9_]*)[^']*' is not found") {
-                        $nm = $Matches[1]
-                        if ($declaredHere.ContainsKey($nm)) {
-                            $others = @($declaredHere[$nm] | Where-Object { $_ -ne $t })
-                            if ($others.Count) {
-                                $names = @($others | ForEach-Object { Split-Path $_ -Leaf } | Select-Object -Unique)
-                                $crossRefs += "$nm (declared in $($names -join ', '))"
-                            }
+            if ($body -match $firstOnlyRx) { $sawFirstOnly = $true }
+            # Split the body into positioned entries; 'also at' / 'and N
+            # more' lines (batched-errors builds) attach to their entry;
+            # framing is dropped; anything else is kept as an error line.
+            $entries = New-Object 'System.Collections.Generic.List[object]'
+            $unknown = @()
+            foreach ($line in @($body -split "`r?`n")) {
+                if (-not $line.Trim()) { continue }
+                if ($line -match $entryRx) {
+                    $entries.Add(@{ Line = [int]$Matches[1]; Col = [int]$Matches[2]; Msg = $Matches[3].Trim(); Extra = @() })
+                } elseif ($entries.Count -and $line -match '^\s*(also at .*|and \d+ more)\s*$') {
+                    $entries[$entries.Count - 1].Extra += ($Matches[1] -replace 'UNIQUE\d+NSNAME', $stem)
+                } elseif ($line -notmatch $noiseRx) {
+                    $unknown += ($line -replace 'UNIQUE\d+NSNAME', $stem).Trim()
+                }
+            }
+            if (-not $entries.Count -and -not $unknown.Count) {
+                $toolErrCount++
+                Warn "$leaf - no verdict: HTTP 500 without a recognizable compiler message: $firstLine"
+                continue
+            }
+            # Classify: restriction (eval limitation) / cross-file reference
+            # (eval limitation) / real error. A not-found on a name that
+            # another file of THIS PROJECT declares is a reference eval
+            # cannot see - the running server has not loaded that module (or
+            # that edit) yet; a dryrun resolves it against the real REQUIRE
+            # graph. Any not-found kind counts: "property or action 'x[...]'
+            # is not found", "class 'X' is not found", "form 'f' ..." - the
+            # bare identifier is captured.
+            $restr = @($entries | Where-Object { $_.Msg -match $restrictRx })
+            $real = @()
+            $cross = @()
+            foreach ($e in $entries) {
+                if ($e.Msg -match $restrictRx) { continue }
+                $isCross = $false
+                if ($e.Msg -cmatch "'([A-Za-z_][A-Za-z0-9_]*)[^']*' is not found") {
+                    $nm = $Matches[1]
+                    if ($declaredHere.ContainsKey($nm)) {
+                        $others = @($declaredHere[$nm] | Where-Object { $_ -ne $t })
+                        if ($others.Count) {
+                            $names = @($others | ForEach-Object { Split-Path $_ -Leaf } | Select-Object -Unique)
+                            $cross += "$nm (declared in $($names -join ', '))"
+                            $isCross = $true
                         }
                     }
                 }
-                if ($crossRefs.Count) {
-                    $skipCount++
-                    $uncheckedModules.Add($moduleName)
-                    Warn "$leaf - inconclusive: uses $($crossRefs -join ', ') - eval checks files one at a time, so a name declared in another file of this same selection cannot resolve here. Cross-file references are checked by a full load: 'dryrun' (seconds) or the restart."
-                } else {
-                    $failCount++
-                    Bad "$leaf - FAIL:"
-                    $meat | ForEach-Object { Write-Host "    $_" }
-                    if (@($meat | Where-Object { $_ -cmatch "'(MODULE|REQUIRE|NAMESPACE|PRIORITY)'" }).Count) {
-                        Info "    (a malformed or duplicated MODULE/REQUIRE/NAMESPACE/PRIORITY header was deliberately left in the text - headers are stripped only when well-formed and unique; fix the header itself, e.g. its terminating ';')"
-                    }
-                }
+                if (-not $isCross) { $real += $e }
             }
+            if ($real.Count -or $unknown.Count) {
+                $failCount++
+                Bad "$leaf - FAIL: real error(s) in the code, not a pre-check limitation:"
+                foreach ($e in $real) {
+                    Write-Host "    $stem`:$($e.Line)`:$($e.Col) $($e.Msg)"
+                    foreach ($x in $e.Extra) { Write-Host "        $x" }
+                }
+                foreach ($u in $unknown) { Write-Host "    $u" }
+                if (@($real | Where-Object { $_.Msg -cmatch "'(MODULE|REQUIRE|NAMESPACE|PRIORITY)'" }).Count) {
+                    Info "    (a malformed or duplicated MODULE/REQUIRE/NAMESPACE/PRIORITY header was deliberately left in the text - headers are stripped only when well-formed and unique; fix the header itself, e.g. its terminating ';')"
+                }
+                if ($restr.Count) {
+                    # A first-pass restriction batched behind parse errors:
+                    # the errors above are real, AND the file needs the full
+                    # loader once they are fixed.
+                    $uncheckedModules.Add($moduleName)
+                    Info "    (eval also stopped at line $($restr[0].Line) - $($restr[0].Msg) - so nothing after that line was checked; once the errors above are fixed the file still needs 'dryrun', see the summary)"
+                }
+                if ($cross.Count) {
+                    Info "    (not counted as errors: $($cross -join ', ') - declared in this project, unresolved by eval; the full load tells why)"
+                }
+                continue
+            }
+            if ($restr.Count) {
+                $skipCount++
+                $needsDryCount++
+                $uncheckedModules.Add($moduleName)
+                $r0 = $restr[0]
+                $cover = if ($r0.Msg -match $firstPassRx) {
+                    "eval's first pass stops there: syntax checked for lines 1-$($r0.Line) only, names checked nowhere"
+                } else {
+                    "syntax OK (whole file); names checked only in the statements before line $($r0.Line), nothing after it"
+                }
+                Skip "$leaf - unsupported by eval precheck: $($r0.Msg) (line $($r0.Line)) - $cover. Not an error in the file: the construct is legal in a module, eval just refuses to load it.$metaCaveat"
+                NeedsDryrun "$leaf - requires the full module loader (module '$moduleName')."
+                continue
+            }
+            # Only cross-file references left.
+            $skipCount++
+            $needsDryCount++
+            $uncheckedModules.Add($moduleName)
+            Skip "$leaf - not checkable by eval precheck: uses $($cross -join ', ') - eval lints one file at a time against the LOADED schema and could not resolve them: that module is not loaded on the running server yet (a new / freshly edited module), or the declaration there does not match this use (signature; a '+' implementation of a non-ABSTRACT). Not a verdict on the file - the full load tells which."
+            NeedsDryrun "$leaf - requires the full module loader (module '$moduleName')."
         }
     }
     Write-Host ""
@@ -3904,22 +4055,37 @@ function Cmd-Precheck {
     if ($unchecked.Count) {
         $dryHint = "dryrun -TopModule `"$($unchecked -join ',')`""
     }
-    if ($failCount) {
-        Bad "$failCount of $($targets.Count) file(s) failed the pre-check."
-        Info "Name errors surface ONE per call (parse errors come all at once) - fix, re-run precheck until clean."
-        if ($dryHint) { Info "The unchecked/skipped files above stay unproven either way - once precheck is clean, run '$dryHint' to load-check them (seconds, live server untouched), then the usual tail: unscoped 'dryrun' gate, restart to apply." }
-        else { Info "Then gate with 'dryrun' (REQUIRE completeness is beyond eval's reach - it sees every loaded module) and restart to apply." }
-        exit 1
-    } elseif ($skipCount -or $nameBlind) {
-        if ($skipCount) { Warn "$skipCount of $($targets.Count) file(s) not fully checked (each reason above - coverage there ranges from partial name checking down to none)." }
-        if ($nameBlind) { Warn "Syntax passed everywhere it was checked, but names went UNCHECKED in $nameBlind of $($targets.Count) file(s) (load-only constructs) - 'is not found' errors there are exactly what a restart would still hit." }
-        if ($dryHint) {
-            Info "Cheap full check of the unchecked modules above: '$dryHint' - real load fidelity (names, REQUIRE closure, META / EXTEND FORM) in seconds, the running server untouched."
-            Info "Then, before the restart that applies the schema: REQUIRE each new module from the top module (under a configured logics.topModule - the standard layout - an unwired module is invisible to the restart and the unscoped dryrun alike), then gate with an unscoped 'dryrun' (a scoped pass does not check dependents) and restart."
-        }
-    } else {
-        Ok "All $($targets.Count) file(s) pass. This proves syntax (+ names where eval reached them) - REQUIRE completeness is beyond eval either way, so gate with 'dryrun' (seconds), then restart to apply the schema."
+    $dryTail = "Then, before the restart that applies the schema: REQUIRE each new module from the top module (under a configured logics.topModule - the standard layout - an unwired module is invisible to the restart and the unscoped dryrun alike), gate with an unscoped 'dryrun' (a scoped pass does not check dependents) and restart."
+    if ($nullCmpCount) {
+        Warn "$nullCmpCount comparison(s) with the NULL literal flagged above: not a FAIL (the load accepts them), but each one is a condition that can never hold - fix them before trusting a PASS."
     }
+    if ($failCount) {
+        Bad "$failCount of $($targets.Count) file(s) FAILED: real errors eval found in the code (parse errors / unknown names / structure), not pre-check limitations. Fix them and re-run precheck."
+        if ($sawFirstOnly) { Info "This server reports ONE semantic error per file per call (parse errors come batched) - re-run precheck after each fix until clean." }
+        if ($skipCount) { NeedsDryrun "$skipCount file(s) are beyond eval precheck ([SKIP] above - limitations, not errors)." }
+        if ($dryHint) { Info "Once precheck is clean, run '$dryHint' to load-check what eval could not (seconds, live server untouched), then the usual tail: unscoped 'dryrun' gate, restart to apply." }
+        else { Info "Then gate with 'dryrun' (REQUIRE completeness is beyond eval's reach - it sees every loaded module) and restart to apply." }
+        if ($toolErrCount) { Warn "$toolErrCount file(s) got no verdict at all (endpoint / request problem above)." }
+        exit 1
+    }
+    if ($toolErrCount) {
+        Warn "No verdict for $toolErrCount of $($targets.Count) file(s): the endpoint could not be used (see above) - fix that and re-run. Exit code 3 = no verdict (deliberately distinct from 1 = real errors)."
+        if ($okCount) { Ok "$okCount file(s) did pass before that." }
+        if ($needsDryCount -and $dryHint) { NeedsDryrun "$needsDryCount file(s) need the full module loader either way: '$dryHint'." }
+        exit 3
+    }
+    if ($skipCount) {
+        if ($okCount) { Ok "$okCount of $($targets.Count) file(s) fully checked by eval - no errors." }
+        if ($needsDryCount -and $dryHint) {
+            NeedsDryrun "$needsDryCount of $($targets.Count) file(s) need the full module loader - a limitation of this pre-check, NOT an error in the code (nothing eval could check was wrong). Run: '$dryHint' - real load fidelity (names, REQUIRE closure, META / EXTEND FORM) in seconds, the running server untouched."
+            Info $dryTail
+        }
+        if ($skipCount -gt $needsDryCount) {
+            Skip "$($skipCount - $needsDryCount) file(s) skipped as eval probes (headerless, declare run()) - not modules, nothing to dry-run."
+        }
+        return
+    }
+    Ok "All $($targets.Count) file(s) pass. This proves syntax (+ names where eval reached them) - REQUIRE completeness is beyond eval either way, so gate with 'dryrun' (seconds), then restart to apply the schema."
 }
 
 function Cmd-Api {
@@ -4231,26 +4397,44 @@ version and dies on every plugin update.
                  RUNNING dev server (~30 ms/file). -Files 'a.lsf','b.lsf'
                  (project-relative or absolute); default: every .lsf under
                  src/main. Strips MODULE/REQUIRE headers, posts to /eval.
-                 Verdicts say what was proven: files with load-only
-                 constructs (CLASS / persistent DATA / WHEN / CONSTRAINT)
-                 get syntax-only coverage - names NOT checked - and
-                 EXTEND FORM / '() + { }' files can't be linted at all. A
-                 file that is ENTIRELY META definitions / @-usages / EXTEND
-                 FORM is reported upfront as RESTART-ONLY (eval compiles none
-                 of it - ambiguity/constraint errors included); precheck
-                 still checks its structure (MODULE header, META/END balance,
-                 bracket balance). When module files or names went unchecked,
-                 the summary prints the exact scoped 'dryrun -TopModule ...'
-                 command that checks them in seconds (a headerless run()
-                 probe keeps only its per-file warning - not a module, not
-                 dry-runnable). NEW modules are mostly such
-                 load-only declarations, so for new code iterate on the
-                 scoped dryrun; precheck's name coverage pays off on files
-                 free of load-only constructs (computed properties, actions,
-                 FORMs - one CLASS anywhere blinds the whole file's names).
-                 REQUIRE completeness is never checked (eval sees every
-                 loaded module) - a missing REQUIRE surfaces only at
-                 restart or dryrun.
+                 Four verdicts, each saying what was proven:
+                   [OK]    eval compiled the file - syntax and names proven.
+                   [FAIL]  a REAL error in the code: parse error, unknown
+                           name, unclosed META, missing MODULE header.
+                   [SKIP]  eval cannot check the file (or the rest of it) -
+                           a limitation of this pre-check, NOT an error:
+                           a construct the eval module refuses (CLASS,
+                           TABLE, INDEX, persistent DATA options, WHEN, ON,
+                           CONSTRAINT, ...), a construct that crashes its
+                           compiler (EXTEND FORM / EXTEND CLASS, DESIGN or
+                           NAVIGATOR edits of existing elements, '+ { }' /
+                           '+=' of an existing ABSTRACT), a name declared in
+                           another project file the server has not loaded,
+                           a file that is ENTIRELY META / @-usages / EXTEND
+                           FORM (structure still checked), or a file that
+                           declares run() (eval would EXECUTE it).
+                   [NEEDS DRYRUN]  follows every [SKIP]: the full module
+                           loader checks it; the summary prints the exact
+                           scoped 'dryrun -TopModule "<modules>"' command.
+                 Coverage behind a [SKIP]: CLASS / TABLE stop eval's first
+                 pass (syntax checked only up to that line, names nowhere);
+                 every other refused construct stops the main pass (whole
+                 file parsed, names checked only in the statements before
+                 it). Every file is also scanned statically for comparisons
+                 with the NULL literal (x != NULL / x == NULL, and x = NULL
+                 inside a condition): they compile clean but are ALWAYS
+                 NULL - the condition silently never holds - flagged with
+                 line:col as [WARN], never a FAIL.
+                 Exit codes: 0 = no real error found ([OK] / [SKIP] /
+                 [NEEDS DRYRUN] only - the summary is never red for
+                 pre-check limitations), 1 = at least one [FAIL], 3 = no
+                 verdict (the endpoint could not be used: auth, wrong path,
+                 connection). NEW modules are mostly refused declarations,
+                 so for new code iterate on the scoped dryrun; precheck's
+                 name coverage pays off on files free of them (computed
+                 properties, actions, FORMs). REQUIRE completeness is never
+                 checked (eval sees every loaded module) - a missing REQUIRE
+                 surfaces only at restart or dryrun.
   dryrun         Full-fidelity validation of the project without starting
                  it - the inner validation loop for NEW code (scoped via
                  -TopModule) and the gate before a restart. Launches the
@@ -4268,8 +4452,10 @@ version and dies on every plugin update.
                  this run only, limiting the check to the REQUIRE closure
                  (faster on many-module projects); a comma-separated list
                  is allowed (quote it: -TopModule "A,B").
-                 Exit code 0 = logic OK, 1 = validation failed (one semantic
-                 error per run, like a restart; parse errors come batched).
+                 Exit code 0 = logic OK, 1 = validation failed (parse AND
+                 semantic errors come batched - dryRun implies
+                 batchScriptErrors - unlike a restart, which stops at the
+                 first semantic error).
                  The restart is still what APPLIES the schema.
   versions       List lsFusion versions on download.lsfusion.org and aliases.
 
