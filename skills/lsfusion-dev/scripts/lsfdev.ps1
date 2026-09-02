@@ -3721,10 +3721,6 @@ function Cmd-Precheck {
     $skipCount = 0          # [SKIP] verdicts (eval limitation or policy skip)
     $needsDryCount = 0      # ... of which are modules a scoped dryrun loads
     $toolErrCount = 0       # no verdict at all: endpoint / IO problem
-    # Comparisons with the NULL literal flagged by the static scan below -
-    # never a FAIL (the server compiles them clean), but always a bug worth
-    # a line in the summary so a PASS is not mistaken for "no findings".
-    $nullCmpCount = 0
     # The server's "first error only" trailer, in both wordings the platform
     # has used - when it is absent the server batches semantic errors
     # (settings.batchScriptErrors) and the "ONE per call" hint would lie.
@@ -3826,38 +3822,6 @@ function Cmd-Precheck {
             }
             if ($balanceNotes.Count) {
                 Warn "$leaf - brackets look unbalanced outside comments/strings ($($balanceNotes -join '; ')) - if the restart fails with a parse error, start here (META fragments can legitimately unbalance, so this alone is not a FAIL)."
-            }
-            # Comparison with the NULL literal. 'x != NULL', 'x == NULL' and
-            # 'x = NULL' compile without a word, but the NULL operand
-            # propagates through the comparison exactly as through any other
-            # operator, so the result is NULL WHATEVER x holds (measured on
-            # 7.0-SNAPSHOT: IF s() != NULL with s() = 'abc' takes the ELSE
-            # branch) - a FILTER / SHOWIF / IF / WHERE built on it is
-            # silently empty and nothing in the load reports it. The static
-            # pattern is trivial to catch, so catch it here, before eval.
-            # '==' / '!=' next to NULL have no legitimate reading. A single
-            # '=' does - EXPORT columns 'col = NULL', SEEK / DIALOG OBJECTS
-            # 'o = NULL', DESIGN 'showIf = NULL' - so it is flagged only in
-            # a condition context: after IF / WHERE / AND / OR / NOT /
-            # FILTER / SHOWIF / ... on the same line with no ',' ';' '{' or
-            # another '=' in between, or with THEN / AND / OR / XOR right
-            # after it. Measured on ~17k .lsf files (ERP + system modules):
-            # every strict-form hit was a real bug, the guarded '=' form
-            # produced no false positive. '<-' / '+=' end in '-' / '+', so
-            # the lookbehind keeps assignments out. Scanned on the
-            # structural shadow: a caption 'x = NULL' or a FORMULA string
-            # cannot trigger, and line:col still match the file.
-            $nullCmpRx = '(?:==|!=)\s*NULL\b|\bNULL\s*(?:==|!=)' +
-                '|(?<=\b(?:IF|WHERE|AND|OR|NOT|XOR|WHEN|FILTER|FILTERS|SHOWIF|READONLYIF|DISABLEIF|THEN|ELSE|CONSTRAINT)\b[^;{},=\r\n]*)(?<![<>!=+*/-])=\s*NULL\b' +
-                '|(?<![<>!=+*/-])=\s*NULL\s*(?=(?:THEN|AND|OR|XOR)\b)'
-            foreach ($nm in [regex]::Matches($structShadow, $nullCmpRx)) {
-                $nullCmpCount++
-                $before = $structShadow.Substring(0, $nm.Index)
-                $ln = ([regex]::Matches($before, "`n")).Count + 1
-                $col = $nm.Index - $before.LastIndexOf("`n")
-                $srcLine = @($raw -split "`r?`n")[$ln - 1].Trim()
-                if ($srcLine.Length -gt 120) { $srcLine = $srcLine.Substring(0, 120) + " ..." }
-                Warn "$leaf`:$ln`:$col - comparison with NULL is ALWAYS NULL: '$($nm.Value.Trim())' never holds, so the condition built on it is silently empty (and the server compiles it without a warning). Test NULL-ness as a condition instead - 'IF prop(...)' / 'NOT prop(...)' - for a value of ANY class, not only BOOLEAN. | $srcLine"
             }
             if ((-not $cov.Residual) -and ($cov.HasMeta -or $cov.HasUsage -or $cov.HasExtend)) {
                 # The main-file shape that would otherwise burn a precheck
@@ -4056,9 +4020,6 @@ function Cmd-Precheck {
         $dryHint = "dryrun -TopModule `"$($unchecked -join ',')`""
     }
     $dryTail = "Then, before the restart that applies the schema: REQUIRE each new module from the top module (under a configured logics.topModule - the standard layout - an unwired module is invisible to the restart and the unscoped dryrun alike), gate with an unscoped 'dryrun' (a scoped pass does not check dependents) and restart."
-    if ($nullCmpCount) {
-        Warn "$nullCmpCount comparison(s) with the NULL literal flagged above: not a FAIL (the load accepts them), but each one is a condition that can never hold - fix them before trusting a PASS."
-    }
     if ($failCount) {
         Bad "$failCount of $($targets.Count) file(s) FAILED: real errors eval found in the code (parse errors / unknown names / structure), not pre-check limitations. Fix them and re-run precheck."
         if ($sawFirstOnly) { Info "This server reports ONE semantic error per file per call (parse errors come batched) - re-run precheck after each fix until clean." }
@@ -4419,12 +4380,7 @@ version and dies on every plugin update.
                  Coverage behind a [SKIP]: CLASS / TABLE stop eval's first
                  pass (syntax checked only up to that line, names nowhere);
                  every other refused construct stops the main pass (whole
-                 file parsed, names checked only in the statements before
-                 it). Every file is also scanned statically for comparisons
-                 with the NULL literal (x != NULL / x == NULL, and x = NULL
-                 inside a condition): they compile clean but are ALWAYS
-                 NULL - the condition silently never holds - flagged with
-                 line:col as [WARN], never a FAIL.
+                 file parsed, names checked only in the statements before it).
                  Exit codes: 0 = no real error found ([OK] / [SKIP] /
                  [NEEDS DRYRUN] only - the summary is never red for
                  pre-check limitations), 1 = at least one [FAIL], 3 = no
