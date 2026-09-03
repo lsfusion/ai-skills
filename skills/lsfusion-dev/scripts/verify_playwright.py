@@ -3,7 +3,8 @@
 
 Drives a headless Chromium: screenshots the landing / login page, attempts to
 log in with the supplied credentials, screenshots the authenticated UI, dumps
-the final DOM and the browser console, then writes everything to
+the final DOM and the browser console (console.* messages AND uncaught page
+exceptions, which Playwright reports separately), then writes everything to
 ``--output-dir``.
 
 A JSON summary is printed on stdout so the calling PowerShell script can
@@ -19,7 +20,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 try:
     from playwright.sync_api import (
@@ -54,6 +55,15 @@ BENIGN_CONSOLE_SUBSTRINGS = (
     # --open-script-file) triggers the SPA's beforeunload confirm, which
     # headless Chromium blocks for lack of a user gesture. Expected.
     "beforeunload' confirmation panel",
+    # The same Push API refusal seen from the other side: the app's
+    # pushManager.subscribe() rejects, and nobody catches it, so it arrives
+    # as an uncaught promise rejection on every page load in headless
+    # Chromium - measured 2x per verify run on a healthy app: AbortError in
+    # a throwaway context, NotAllowedError in the persistent --session-port
+    # profile. Matched on the browser's own error name + message, so an app
+    # error that merely contains 'permission denied' is not swallowed too.
+    "AbortError: Registration failed - permission denied",
+    "NotAllowedError: Registration failed - permission denied",
 )
 
 # Console [error] prefixes that ARE first-class diagnoses, extracted from the
@@ -73,6 +83,249 @@ CUSTOM_VIEW_ERROR_PREFIXES = (
     ("jsx-transform", "lsFusion .jsx transform failed for "),
     ("custom-view",   "lsFusion custom view: "),
 )
+
+# Uncaught page exceptions are NOT console messages: Playwright's console
+# stream carries console.* calls only, while an exception nobody caught - a
+# web resource that dies while loading (a SyntaxError: the WHOLE file never
+# runs, every function it defines is missing), a handler that throws - is a
+# separate 'pageerror' event. The DevTools console shows both kinds; until
+# this tag existed verify-console.txt showed one, so a dead script left no
+# trace beyond the later "'X' is not a component" it caused. Recorded as
+#   [pageerror] Uncaught SyntaxError: <message>  @ <resource url>:<line>:<col>
+# (location present when the CDP event carries it - see _wire_page_errors).
+PAGE_ERROR_TAG = "[pageerror]"
+
+# --do screenshot:<name> writes <stem>-<name>.png; these names belong to the
+# run's own artifacts (<stem>-login.png, <stem>-dom.html, ...) and a step must
+# not clobber them.
+RESERVED_SHOT_NAMES = frozenset(
+    {"login", "app", "open", "click", "dblclick", "do", "dom", "console", "phase"})
+
+# assert-text: the VALUES a matched element carries - its own (a field
+# matched directly) plus those of the visible form controls INSIDE it, so a
+# container selector (a panel, a form, a custom component's root) sees the
+# text its fields show. innerText never includes input values and a
+# container has no .value of its own, so before this a filled input inside
+# the matched container was invisible to the assertion (reported: only the
+# element's own text counted). A value counts only when the field SHOWS it
+# - text-like inputs, textarea, select, and the button-type inputs
+# (button / submit / reset), whose value IS their visible label: a
+# password field never displays its value (and the failure diagnosis
+# prints what was collected, so it must not be collected), and checkbox /
+# radio / hidden / file / image values are not displayed text.
+_MATCH_VALUES_JS = """
+els => els.map(e => {
+  if (!e) return '';
+  const vis = el => { const r = el.getClientRects()[0];
+                      const cs = getComputedStyle(el);
+                      return !!r && r.width > 0.5 && r.height > 0.5 &&
+                             cs.visibility !== 'hidden' && cs.display !== 'none'; };
+  const NOT_SHOWN = ['password', 'hidden', 'checkbox', 'radio', 'file', 'image'];
+  const shows = el => el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' ||
+                      (el.tagName === 'INPUT' && !NOT_SHOWN.includes((el.type || '').toLowerCase()));
+  const val = el => { let v = (el.value == null) ? '' : String(el.value);
+                      if (el.tagName === 'SELECT' && el.selectedOptions && el.selectedOptions.length)
+                        v += ' ' + (el.selectedOptions[0].label || '');
+                      return v; };
+  const parts = [];
+  if (e.tagName && shows(e)) parts.push(val(e));
+  if (e.querySelectorAll)
+    for (const c of e.querySelectorAll('input, textarea, select'))
+      if (shows(c) && vis(c)) parts.push(val(c));
+  return parts.join(' ');
+})
+"""
+
+# --open-script-file: what a PWTimeout means at each step of the direct
+# open. Every step is a page LOAD except the redirect wait while the URL is
+# still /eval/action - there the platform answered with the script's error
+# text instead of the redirect, which is a script failure, not a load one.
+_OPEN_STAGE_TIMEOUT = {
+    "goto": "the /eval/action request did not finish loading",
+    "redirect": "no redirect to /main after the action",
+    "reload": "the /push-notification reload did not finish loading",
+    "redirect-after-reload": "no redirect to /main even after the reload",
+    "settle": "the opened form did not settle",
+}
+
+
+def _format_exception_details(d: dict) -> str:
+    """One console-style line - plus the JS stack when there is one - out of
+    a CDP Runtime.exceptionThrown payload, the way DevTools prints it:
+    'Uncaught <Name>: <message>  @ <url>:<line>:<col>'. CDP positions are
+    0-based; DevTools (and the Babel positions in the .jsx stub) are 1-based,
+    so they are shifted to match. The location is exactly what Playwright's
+    pageerror event drops (it keeps name + message + stack only) and, for a
+    compile-time SyntaxError, the only thing that says WHICH resource died -
+    such an error has no stack at all."""
+    text = str(d.get("text") or "").strip()
+    exc = d.get("exception") or {}
+    desc = exc.get("description")
+    if desc is None and "value" in exc:          # throw 'string' / throw 42
+        desc = str(exc["value"])
+    desc = str(desc or "").strip()
+    first, _, rest = desc.partition("\n")
+    # text is 'Uncaught' / 'Uncaught (in promise)' for runtime errors (the
+    # description carries name + message + stack) and the WHOLE 'Uncaught
+    # SyntaxError: ...' for compile errors (whose description repeats it).
+    if first and text.endswith(first):
+        head = text
+    else:
+        head = " ".join(x for x in (text, first) if x)
+    url = str(d.get("url") or "")
+    frames = (d.get("stackTrace") or {}).get("callFrames") or []
+    if not url and frames:
+        url = str(frames[0].get("url") or "")
+    if url:
+        line, col = d.get("lineNumber"), d.get("columnNumber")
+        pos = ""
+        if isinstance(line, int) and not isinstance(line, bool):
+            pos = f":{line + 1}"
+            if isinstance(col, int) and not isinstance(col, bool):
+                pos += f":{col + 1}"
+        head += f"  @ {url}{pos}"
+    return head + ("\n" + rest if rest.strip() else "")
+
+
+def _first_line(s) -> str:
+    return str(s or "").strip().split("\n", 1)[0].strip()
+
+
+def _cdp_exception_key(d: dict) -> str:
+    """The 'Name: message' an exception shows as through Playwright's
+    pageerror event, derived from the CDP payload the same way Playwright
+    does (exception.description, else the thrown value, else the text) -
+    the pairing key between the two subscriptions below."""
+    exc = d.get("exception") or {}
+    desc = exc.get("description")
+    if desc is None and "value" in exc:
+        desc = str(exc["value"])
+    if not desc:
+        desc = str(d.get("text") or "")
+    return _first_line(desc)
+
+
+class _PageErrorMerger:
+    """Two subscriptions, one record per exception.
+
+    CDP Runtime.exceptionThrown on a private session carries the resource
+    and position but sees the MAIN target only; Playwright's pageerror sees
+    the main target AND its workers / out-of-process iframes but carries
+    name + message + stack only. Both fire for a main-target exception, in
+    no guaranteed order (two inspector sessions, two delivery paths). Events
+    are paired by their 'Name: message' key within a short window: a
+    pageerror arriving after its CDP twin is dropped; a pageerror recorded
+    before its twin is UPGRADED in place to the located line; an unpaired
+    pageerror (a worker / iframe origin, or a key the two sides render
+    differently) stays as recorded. Each pairing consumes its entry, so
+    repeats (one per page load) keep their count. The in-place upgrade
+    reaches the final dump (_finish rewrites the file from the list); the
+    append-only mirror keeps the plain line - a watchdog kill still leaves
+    the exception on disk, just without its location."""
+
+    WINDOW_S = 5.0
+
+    def __init__(self, console_lines: list, mirror):
+        self._lines = console_lines
+        self._mirror = mirror
+        self._pending: list = []   # [key, source, line index, monotonic time]
+
+    def note(self, text: str) -> None:
+        self._add(PAGE_ERROR_TAG + " " + text)
+
+    def _add(self, line: str) -> int:
+        self._lines.append(line)
+        self._mirror(line)
+        return len(self._lines) - 1
+
+    def _take_twin(self, key: str, source: str):
+        """Pop the oldest pending entry of the OTHER source with this key."""
+        now = time.monotonic()
+        self._pending = [p for p in self._pending if now - p[3] <= self.WINDOW_S]
+        for i, p in enumerate(self._pending):
+            if p[0] == key and p[1] != source:
+                return self._pending.pop(i)
+        return None
+
+    def on_cdp(self, ev: dict, wired_at_ms: float) -> None:
+        ts = ev.get("timestamp")
+        if isinstance(ts, (int, float)) and ts < wired_at_ms:
+            return                      # replayed by Runtime.enable - not this run's
+        d = ev.get("exceptionDetails") or {}
+        line = PAGE_ERROR_TAG + " " + _format_exception_details(d)
+        key = _cdp_exception_key(d)
+        twin = self._take_twin(key, "cdp")
+        if twin is not None:
+            self._lines[twin[2]] = line     # upgrade the plain pageerror line
+            return
+        idx = self._add(line)
+        self._pending.append([key, "cdp", idx, time.monotonic()])
+
+    def on_pageerror(self, err) -> None:
+        name = str(getattr(err, "name", None) or "")
+        msg = str(getattr(err, "message", None) or err)
+        head = f"{name}: {msg}" if name else msg
+        key = _first_line(head)
+        if self._take_twin(key, "pageerror") is not None:
+            return                      # its located CDP line is already recorded
+        line = PAGE_ERROR_TAG + " Uncaught " + head
+        # The stack repeats name + message on its first line; keep the frames.
+        stack = str(getattr(err, "stack", None) or "")
+        frames = "\n".join(s for s in stack.split("\n") if s.startswith("    at"))
+        if frames:
+            line += "\n" + frames
+        idx = self._add(line)
+        self._pending.append([key, "pageerror", idx, time.monotonic()])
+
+
+def _wire_page_errors(page, console_lines: list, mirror) -> str:
+    """Route uncaught page exceptions into the console dump (appending to
+    ``console_lines`` and mirroring each new line to disk via ``mirror``).
+
+    Playwright's pageerror is always subscribed - it is the only channel for
+    worker / out-of-process-iframe exceptions - and a private CDP session's
+    Runtime.exceptionThrown is added for the main target because its payload
+    names the resource and position: pageerror is built from the same payload
+    but keeps name / message / stack only, and a compile-time SyntaxError (a
+    web resource that never ran) has no stack, so through pageerror alone it
+    arrives as a bare message with no hint of which file died. The two are
+    merged by _PageErrorMerger. Returns the sources wired ('cdp+pageerror',
+    or 'pageerror' when the CDP session cannot be opened).
+
+    Runtime.enable replays the exceptions V8 still holds for the page, each
+    with its ORIGINAL timestamp (measured: an exception thrown 1 s before
+    the enable arrived right after it, stamped 1 s earlier) - in session
+    mode that is the previous invocation's page load - so events stamped
+    before this wiring are dropped. A real event can never predate the
+    wiring (it happens after the enable, which follows this line); epoch
+    ms on the same host clock, with 100 ms of slack for clock granularity.
+    That keeps each run's dump to what happened during that run."""
+    merger = _PageErrorMerger(console_lines, mirror)
+    wired_at = time.time() * 1000 - 100
+
+    # Both listeners run inside Playwright's event dispatch: an exception
+    # escaping them would surface there, not here - so a payload that does
+    # not parse is recorded as such instead of being allowed to raise.
+    def _on_pageerror(err):
+        try:
+            merger.on_pageerror(err)
+        except Exception as e:  # noqa: BLE001 - listener must never raise
+            merger.note(f"(unparseable pageerror event: {e})")
+
+    def _on_thrown(ev):
+        try:
+            merger.on_cdp(ev, wired_at)
+        except Exception as e:  # noqa: BLE001 - listener must never raise
+            merger.note(f"(unparseable Runtime.exceptionThrown event: {e})")
+
+    page.on("pageerror", _on_pageerror)
+    try:
+        cdp = page.context.new_cdp_session(page)
+        cdp.on("Runtime.exceptionThrown", _on_thrown)
+        cdp.send("Runtime.enable")
+        return "cdp+pageerror"
+    except PWError:
+        return "pageerror"
 
 
 def _split_pos(spec: str):
@@ -165,9 +418,14 @@ _INPUT_VALUE_JS = """
                       const cs = getComputedStyle(el);
                       return !!r && r.width > 0.5 && r.height > 0.5 &&
                              cs.visibility !== 'hidden' && cs.display !== 'none'; };
+  // only fields that SHOW their value (same rule as assert-text): a password
+  // field never does, checkbox/radio/hidden/file/image values are no text;
+  // button-type inputs display theirs as the label, so they count
+  const NOT_SHOWN = ['password', 'hidden', 'checkbox', 'radio', 'file', 'image'];
   for (const root of roots)
     for (const el of root.querySelectorAll('input, textarea, select')) {
       if (!vis(el)) continue;
+      if (el.tagName === 'INPUT' && NOT_SHOWN.includes((el.type || '').toLowerCase())) continue;
       let v = '' + (el.value == null ? '' : el.value);
       if (el.tagName === 'SELECT' && el.selectedOptions && el.selectedOptions.length)
         v = v + ' ' + (el.selectedOptions[0].label || '');
@@ -536,8 +794,8 @@ def _classify_click_error(msg: str):
 
 
 def _describe_do_action_failure(verb: str, sel: str, err) -> str:
-    """One actionable line for a failed -Do click/dblclick/hover instead of
-    Playwright's bare 'Timeout 15000ms exceeded'. The element was already
+    """One actionable line for a failed -Do click/dblclick/rclick/hover instead
+    of Playwright's bare 'Timeout 15000ms exceeded'. The element was already
     resolved VISIBLE by _resolve_visible, so the interesting part is WHY it
     never became actionable — the same classification the text-based --click
     gets. The not-enabled case gets the lsFusion reading (reported cost of
@@ -743,6 +1001,8 @@ def main() -> int:
                     help="generic interaction step, run in order AFTER the "
                          "--click/--double-click navigation; repeatable. "
                          "Forms: click:<selector>, dblclick:<selector>, "
+                         "rclick:<selector> (right button - the real "
+                         "contextmenu event), "
                          "hover:<selector>, drag:<selector>=><selector> "
                          "(raw mouse gesture: mousedown/mousemove/mouseup - "
                          "drag-to-draw UIs), dnd:<selector>=><selector> "
@@ -757,20 +1017,24 @@ def main() -> int:
                          "multiline textarea/rich-text ones where Enter is a "
                          "newline), "
                          "press:<key>, eval:<js>, wait:<ms>, "
+                         "screenshot:<name> (saves <stem>-<name>.png at that "
+                         "point of the chain; letters, digits, '.', '_' - no "
+                         "dash), "
                          "assert-count:<selector>=><n> (exactly n visible "
                          "matches), assert-text:<selector>=><substring> "
-                         "(some visible match's text or input value contains "
-                         "it, case-insensitive; both assertions poll up to "
-                         "5 s). <selector> is any "
+                         "(some visible match's text, its own value, or the "
+                         "value of a visible input/textarea/select inside it "
+                         "contains the substring, case-insensitive; both "
+                         "assertions poll up to 5 s). <selector> is any "
                          "Playwright selector (css, text=..., :has-text(...)), "
                          "which is what reaches buttons/inputs inside CUSTOM "
                          "(React) components that the text-based --click "
                          "cannot hit; interaction verbs resolve to the first "
                          "VISIBLE match (hidden docked-tab duplicates are "
                          "skipped and reported) while the assert-* verbs "
-                         "consider ALL visible matches; hover/drag/dnd/click "
-                         "selectors accept an @x,y offset from the element's "
-                         "top-left corner")
+                         "consider ALL visible matches; click/dblclick/rclick/"
+                         "hover/drag/dnd selectors accept an @x,y offset from "
+                         "the element's top-left corner")
     ap.add_argument("--do-file", default="",
                     help="UTF-8 file with a JSON array of --do steps. The "
                          "robust transport for steps carrying quotes/spaces "
@@ -927,12 +1191,21 @@ def main() -> int:
         "do": {
             "requested": bool(args.do_actions),
             "steps": [],
+            "screenshots": [],   # <stem>-<name>.png written by screenshot: steps
             "error": None,
         },
         "session": {
             "requested": bool(args.session_port),
             "navigated": True,
         },
+        # Page loads that ran out of time, one label each: the navigation
+        # without a 'load' event, a /login page that never rendered its form,
+        # the direct open's redirect to /main, a 'Loading' indicator that
+        # stayed on screen. The caller pairs them with the web client's
+        # server-side error log - a load that never completes is usually
+        # explained there, not in the (often silent) browser console.
+        "load_timeouts": [],
+        "page_error_source": "",  # cdp+pageerror | pageerror - see _wire_page_errors
         "artifacts": {
             "login_screenshot":    str(login_png),
             "app_screenshot":      str(app_png),
@@ -949,6 +1222,17 @@ def main() -> int:
     # the report points at verify-dom.html as the FAILURE-TIME DOM, so the
     # end-of-run dump must not clobber it with post -Do/-DoubleClick state.
     dom_failure_dumped = False
+
+    def _loading_stuck(where: str) -> None:
+        # wait_for_selector(state="detached") returns at once when nothing
+        # matches, so 60 s here means an element with that text really did
+        # stay in the DOM the whole time: the platform's loading indicator
+        # that never went away - or, rarely, a caption that merely contains
+        # the word (the label says so instead of overclaiming).
+        result["load_timeouts"].append(
+            f"{where}: an element with text 'Loading' stayed on the page for "
+            "60 s (the loading indicator never went away - unless some "
+            "caption merely contains that word)")
 
     try:
         with sync_playwright() as p:
@@ -977,19 +1261,31 @@ def main() -> int:
                         ctx_kwargs["locale"] = args.locale.strip()
                     context = browser.new_context(**ctx_kwargs)
                     page = context.new_page()
-                def _on_console(m):
-                    line = f"[{m.type}] {m.text}"
-                    console_lines.append(line)
+                def _mirror(line: str) -> None:
                     # Mirror to disk immediately: a watchdog-killed run never
                     # reaches _finish(), and the start-of-run wipe has already
                     # destroyed the PREVIOUS console dump - without this a
-                    # hang leaves zero console evidence behind.
+                    # hang leaves zero console evidence behind. errors=
+                    # "replace": page text can carry a lone UTF-16 surrogate
+                    # (throw String.fromCharCode(0xD800)), which strict UTF-8
+                    # refuses - and this runs inside Playwright's event
+                    # dispatch, where nothing may raise.
                     try:
-                        with console_path.open("a", encoding="utf-8") as cf:
+                        with console_path.open("a", encoding="utf-8",
+                                               errors="replace") as cf:
                             cf.write(line + "\n")
-                    except OSError:
+                    except Exception:  # noqa: BLE001 - listener must never raise
                         pass
-                page.on("console", _on_console)
+
+                def _record(line: str) -> None:
+                    console_lines.append(line)
+                    _mirror(line)
+                page.on("console", lambda m: _record(f"[{m.type}] {m.text}"))
+                # Uncaught exceptions travel separately from console messages
+                # (Playwright's 'pageerror'); without this a web resource that
+                # died with a SyntaxError left NO line in the console dump.
+                result["page_error_source"] = _wire_page_errors(
+                    page, console_lines, _mirror)
 
                 # In session mode a page that is already anywhere on the app is
                 # continued as-is - no reload, so the open form / JS state from
@@ -1023,6 +1319,9 @@ def main() -> int:
                     try:
                         page.goto(args.url, wait_until="load", timeout=args.timeout)
                     except PWError as e:
+                        if isinstance(e, PWTimeout):
+                            result["load_timeouts"].append(
+                                f"navigate: no 'load' event within {args.timeout} ms")
                         result["error"] = f"navigation failed: {e}"
                         return _finish(result, console_lines, console_path)
 
@@ -1052,6 +1351,8 @@ def main() -> int:
                         page.wait_for_selector(f"{pwd_sel}:visible", timeout=45000)
                         pwd_visible = True
                     except PWTimeout:
+                        result["load_timeouts"].append(
+                            "login page: no password field rendered within 45 s")
                         result["error"] = ("login page did not render its form: the URL is /login "
                                            "but no password field became visible within 45 s")
                     # Re-shoot now that the page had time to render - the
@@ -1141,19 +1442,26 @@ def main() -> int:
                     base = args.url if args.url.endswith("/") else args.url + "/"
                     eval_url = urljoin(base, "eval/action") + "?script=" + quote(open_script)
                     _phase(f"open-script: {open_script[:80]}")
+                    # Which step was in flight when the open failed - see
+                    # _OPEN_STAGE_TIMEOUT for what a timeout means at each.
+                    stage = "goto"
                     try:
                         page.goto(eval_url, wait_until="load", timeout=args.timeout)
+                        stage = "redirect"
                         try:
                             page.wait_for_url("**/main*", timeout=15000)
                         except PWTimeout:
                             if "/push-notification" in page.url:
                                 result["open"]["reloaded"] = True
+                                stage = "reload"
                                 page.reload(wait_until="load", timeout=args.timeout)
+                                stage = "redirect-after-reload"
                                 page.wait_for_url("**/main*", timeout=30000)
                             else:
                                 # still on /eval/action - the script failed;
                                 # let the outer handler capture the error body
                                 raise
+                        stage = "settle"
                         # Same generous settle as the click-through: the first
                         # open of a form after a restart is lazy and slow.
                         # THIS is where a form that wedges the client hangs
@@ -1163,7 +1471,7 @@ def main() -> int:
                         try:
                             page.wait_for_selector("text=Loading", state="detached", timeout=60000)
                         except PWTimeout:
-                            pass
+                            _loading_stuck("open-wait")
                         try:
                             page.wait_for_load_state("networkidle", timeout=30000)
                         except PWTimeout:
@@ -1178,7 +1486,16 @@ def main() -> int:
                             result["open"]["expect_found"] = bool(where)
                             result["open"]["expect_where"] = where
                     except (PWTimeout, PWError) as e:
-                        if "/eval/action" in page.url:
+                        at = page.url
+                        # The script-error case, precisely: the redirect wait
+                        # TIMED OUT (the platform answered with text instead
+                        # of redirecting) with the tab still on the
+                        # /eval/action PATH. A substring test would also
+                        # match a /login redirect carrying it as a query
+                        # parameter, and a crash (a non-timeout error) is no
+                        # script error - both belong to the branch below.
+                        if (stage == "redirect" and isinstance(e, PWTimeout)
+                                and urlparse(at).path == urlparse(eval_url).path):
                             # No redirect happened: the script failed and the
                             # response body is the server error text.
                             body = ""
@@ -1187,12 +1504,21 @@ def main() -> int:
                             except PWError:
                                 pass
                             result["open"]["error"] = f"script error: {body or e}"
-                        elif "/push-notification" in page.url:
-                            result["open"]["error"] = (
-                                "stuck on /push-notification even after a reload - "
-                                "the service worker did not deliver the action to the app")
                         else:
-                            result["open"]["error"] = f"open flow failed: {e}"
+                            # Any other timeout is a page load that ran out of
+                            # time (the /eval/action request itself included -
+                            # a goto that never reaches 'load' is not a script
+                            # error, whatever URL the tab shows).
+                            if isinstance(e, PWTimeout):
+                                result["load_timeouts"].append(
+                                    "open-script: " + _OPEN_STAGE_TIMEOUT[stage]
+                                    + f" - page at {at} when the wait expired")
+                            if stage == "redirect-after-reload" and "/push-notification" in at:
+                                result["open"]["error"] = (
+                                    "stuck on /push-notification even after a reload - "
+                                    "the service worker did not deliver the action to the app")
+                            else:
+                                result["open"]["error"] = f"open flow failed: {e}"
                     result["open"]["landed_url"] = page.url
                     # Cross-check: is the form the script names the one on
                     # screen? (--open-expect alone is satisfiable by the same
@@ -1351,7 +1677,7 @@ def main() -> int:
                         try:
                             page.wait_for_selector("text=Loading", state="detached", timeout=60000)
                         except PWTimeout:
-                            pass
+                            _loading_stuck("click")
                         try:
                             page.wait_for_load_state("networkidle", timeout=30000)
                         except PWTimeout:
@@ -1422,7 +1748,7 @@ def main() -> int:
                         try:
                             page.wait_for_selector("text=Loading", state="detached", timeout=60000)
                         except PWTimeout:
-                            pass
+                            _loading_stuck("double-click")
                         try:
                             page.wait_for_load_state("networkidle", timeout=30000)
                         except PWTimeout:
@@ -1485,7 +1811,7 @@ def main() -> int:
                         try:
                             verb, _, rest = raw.partition(":")
                             verb = verb.strip().lower()
-                            if verb in ("click", "dblclick", "hover"):
+                            if verb in ("click", "dblclick", "rclick", "hover"):
                                 sel, pos = _split_pos(rest)
                                 loc, note = _resolve_visible(page, sel)
                                 if note:
@@ -1498,6 +1824,11 @@ def main() -> int:
                                         loc.click(**kw)
                                     elif verb == "dblclick":
                                         loc.dblclick(**kw)
+                                    elif verb == "rclick":
+                                        # Right button: the real contextmenu
+                                        # event (grid / row context menus) -
+                                        # no synthetic dispatchEvent needed.
+                                        loc.click(button="right", **kw)
                                     else:
                                         loc.hover(**kw)
                                 except (PWTimeout, PWError) as e:
@@ -1851,9 +2182,7 @@ def main() -> int:
                                             # collected too.
                                             inner = vis_loc.all_inner_texts()
                                             vals = vis_loc.evaluate_all(
-                                                "els => els.map(e => "
-                                                "(e && e.value != null) ? "
-                                                "String(e.value) : '')")
+                                                _MATCH_VALUES_JS)
                                             texts = [
                                                 " ".join((t + " " + v).split())
                                                 for t, v in zip(
@@ -1882,6 +2211,41 @@ def main() -> int:
                                             f"found: {shown}")
                                     step["detail"] = (
                                         f"text {needle!r} present - as expected")
+                            elif verb == "screenshot":
+                                # A mid-chain screenshot: <stem>-<name>.png,
+                                # so ONE chain documents several screens (a
+                                # menu opened by rclick:, the state after
+                                # press:Escape) instead of one run per screen
+                                # - the post-chain <stem>-do.png is still
+                                # taken. The name takes NO dash: a stem may
+                                # contain dashes, and only a dash-free name
+                                # makes <stem>-<name>.png split unambiguously
+                                # at its last dash - otherwise stem 'orders'
+                                # + 'archive-menu' and stem 'orders-archive'
+                                # + 'menu' would silently share one file. The
+                                # run's own artifact names are reserved so a
+                                # step cannot clobber them ('app' under stem
+                                # 'orders' would be orders-app.png).
+                                name = rest.strip()
+                                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._]{0,63}", name):
+                                    raise ValueError(
+                                        "screenshot needs 'screenshot:<name>' - "
+                                        "letters, digits, '.', '_' only, NO dash "
+                                        "(max 64 chars, starting with a letter or "
+                                        "digit); saved as <stem>-<name>.png, which "
+                                        "must split unambiguously at its last dash")
+                                if name.lower() in RESERVED_SHOT_NAMES:
+                                    raise ValueError(
+                                        f"screenshot name {name!r} is reserved for "
+                                        "the run's own artifacts ("
+                                        + ", ".join(sorted(RESERVED_SHOT_NAMES))
+                                        + ") - pick another name")
+                                shot = out_dir / f"{stem}-{name}.png"
+                                page.screenshot(path=str(shot))
+                                result["do"]["screenshots"].append(str(shot))
+                                step["detail"] = (
+                                    f"saved {shot} "
+                                    f"({shot.stat().st_size / 1024:.1f} KB)")
                             elif verb == "press":
                                 page.keyboard.press(rest.strip())
                             elif verb == "eval":
@@ -1893,8 +2257,9 @@ def main() -> int:
                             else:
                                 raise ValueError(
                                     f"unknown verb {verb!r} - use click/dblclick/"
-                                    "hover/drag/dnd/mouse/fill/type/edit/press/"
-                                    "eval/wait/assert-count/assert-text")
+                                    "rclick/hover/drag/dnd/mouse/fill/type/edit/"
+                                    "press/eval/wait/screenshot/assert-count/"
+                                    "assert-text")
                             step["ok"] = True
                         except (PWTimeout, PWError, ValueError) as e:
                             step["detail"] = str(e).split("\n")[0]
@@ -1928,10 +2293,19 @@ def main() -> int:
 
 
 def _finish(result: dict, console_lines: list[str], console_path: Path) -> int:
-    console_path.write_text("\n".join(console_lines), encoding="utf-8")
+    # errors="replace": same reason as in _record (a lone surrogate in page
+    # text must not cost the JSON report); an unwritable file must not either.
+    try:
+        console_path.write_text("\n".join(console_lines), encoding="utf-8",
+                                errors="replace")
+    except OSError:
+        pass
+    # Errors as the DevTools console would show them: console.error lines
+    # AND uncaught exceptions (the [pageerror] lines) - the browser paints
+    # both red; verify used to count only the first kind.
     result["console_errors"] = sum(
         1 for l in console_lines
-        if l.startswith("[error]")
+        if (l.startswith("[error]") or l.startswith(PAGE_ERROR_TAG))
         and not any(b in l for b in BENIGN_CONSOLE_SUBSTRINGS)
     )
     # Custom-view failures get their own structured entries (still included in
@@ -1955,6 +2329,26 @@ def _finish(result: dict, console_lines: list[str], console_path: Path) -> int:
                 entry["count"] += 1
                 break
     result["custom_view_errors"] = fails
+    # Uncaught exceptions, same treatment: deduplicated with a count (an init
+    # resource that dies at load dies once per page load), the message kept
+    # whole (a runtime error carries its JS stack on the following lines).
+    # Benign ones (the headless Push API refusal) stay in the dump but out of
+    # the report, like their console counterparts.
+    page_errors: list[dict] = []
+    by_pe: dict[str, dict] = {}
+    for l in console_lines:
+        if not l.startswith(PAGE_ERROR_TAG):
+            continue
+        if any(b in l for b in BENIGN_CONSOLE_SUBSTRINGS):
+            continue
+        body = l[len(PAGE_ERROR_TAG):].lstrip()
+        entry = by_pe.get(body)
+        if entry is None:
+            entry = {"message": body, "count": 0}
+            by_pe[body] = entry
+            page_errors.append(entry)
+        entry["count"] += 1
+    result["page_errors"] = page_errors
     print(json.dumps(result, indent=2))
     return 0 if not result["error"] else 1
 

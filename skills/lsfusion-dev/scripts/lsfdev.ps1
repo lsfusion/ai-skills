@@ -105,15 +105,24 @@ function Skip($text) { Write-Host "  [SKIP] $text" -ForegroundColor Cyan }
 function NeedsDryrun($text) { Write-Host "  [NEEDS DRYRUN] $text" -ForegroundColor Magenta }
 function Info($text) { Write-Host "  $text" }
 
-function Read-FileText([string]$path) {
-    if (-not (Test-Path $path)) { return "" }
+# $null when the file is missing OR cannot be read (locked without share,
+# access denied) - for callers that must tell "empty" from "unreadable".
+function Read-FileTextOrNull([string]$path) {
+    if (-not (Test-Path $path)) { return $null }
     try {
         $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
         $sr = New-Object IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
         $t = $sr.ReadToEnd()
         $sr.Dispose(); $fs.Dispose()
         return $t
-    } catch { return "" }
+    } catch { return $null }
+}
+
+# "" for a missing or unreadable file - the forgiving reader for log tails.
+function Read-FileText([string]$path) {
+    $t = Read-FileTextOrNull $path
+    if ($null -eq $t) { return "" }
+    return $t
 }
 
 function Tail-Text([string]$text, [int]$n) {
@@ -2654,8 +2663,128 @@ function Note-BenignLogLines([string]$text) {
     if ($text -match 'ERROR\s+MainDispatchServlet\s+-\s+Removing navigator') {
         Info "Note: 'ERROR MainDispatchServlet - Removing navigator ...' is the web client's NORMAL session cleanup (a browser tab or verify session closed), logged at ERROR level by the platform - not an application failure."
     }
+    if ($text -match 'ERROR\s+MainDispatchServlet\s+-\s+Destroying (navigator|session) for user') {
+        Info "Note: 'ERROR MainDispatchServlet - Destroying navigator/session for user ...' is the web client's NORMAL cleanup of an expired or closed web session (NavigatorProviderImpl / SessionProviderImpl), logged at ERROR level by the platform - not an application failure."
+    }
     if ($text -match 'ERROR Log4j API could not find a logging provider') {
         Info "Note: 'Log4j API could not find a logging provider' is benign - the web client logs through Tomcat's JULI; Log4j's probe simply reports that no Log4j backend is present."
+    }
+}
+
+# The web client's own error log - tomcat\logs\gwtlog-err.log, log4j's
+# 'errorlog' appender (WARN and up), which is also where every exception the
+# browser reports back lands (LogClientExceptionActionHandler logs it at
+# ERROR). Shown by verify when a page load timed out: a load that never
+# completes is usually explained here while the browser console stays silent
+# (measured: the answer sat in this file while the report showed an empty
+# console). Only what the run APPENDED is presented as current - the file is
+# persistent and size-rolled, so older entries would resurface as today's
+# problems otherwise; when nothing was appended, the last lines are still
+# shown, labeled as older, because the cause may have been logged before the
+# run (a resource that fails does so on every page load).
+# Does an uncaught-exception line point at the component's defining
+# resource? EXACT matches only: the location's file stem equals the name
+# (web/init/Chart.jsx is served as .../Chart.js?version=...:line:col), or the
+# message names it as a whole identifier ('Chart is not defined') - a plain
+# substring would blame ChartUtils.js for a missing 'Chart'.
+function Test-PageErrorNamesComponent([string]$firstLine, [string]$name) {
+    if (-not $firstLine -or -not $name) { return $false }
+    $msg = $firstLine; $loc = ""
+    $at = $firstLine.LastIndexOf('  @ ')
+    if ($at -ge 0) { $msg = $firstLine.Substring(0, $at); $loc = $firstLine.Substring($at + 4).Trim() }
+    if ($loc) {
+        $path = $loc -replace '\?.*$', ''           # the query (?version=...) and anything after it
+        $path = $path -replace ':\d+(:\d+)?$', ''   # a trailing :line:col
+        $file = @($path -split '[/\\]')[-1]
+        $stem = $file -replace '\.[A-Za-z0-9]+$', ''
+        if ($stem -ceq $name) { return $true }
+    }
+    return [bool]($msg -cmatch ('(?<![\w$])' + [regex]::Escape($name) + '(?![\w$])'))
+}
+
+# Is the URL's host this machine? Loopback and the computer name answer at
+# once; anything else is resolved and compared with the machine's own
+# interface addresses (a NIC address like 192.168.1.13 reaches the same
+# Tomcat). A resolution failure means "not local".
+function Test-LocalUri([Uri]$u) {
+    if (-not $u) { return $false }
+    if ($u.IsLoopback) { return $true }
+    $h = "$($u.DnsSafeHost)"
+    if (-not $h) { return $false }
+    if ($h -ieq $env:COMPUTERNAME) { return $true }
+    try {
+        $mine = @()
+        foreach ($ni in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) { $mine += ($ua.Address.ToString() -replace '%.*$', '') }
+        }
+        foreach ($a in @([Net.Dns]::GetHostAddresses($h))) {
+            $s = $a.ToString() -replace '%.*$', ''
+            if ([Net.IPAddress]::IsLoopback($a) -or ($mine -contains $s)) { return $true }
+        }
+    } catch { }
+    return $false
+}
+
+function Get-LogSnapshot([string]$path) {
+    # Length + a head fingerprint: the run's delta is what lies past the
+    # length, valid only while the head still matches (a rolled/recreated
+    # file that grew past the old length would otherwise pass a bare length
+    # check and hide its new entries). A file that does not exist yet is a
+    # legitimate empty baseline (everything Tomcat writes later is new); one
+    # that exists but cannot be read is NO baseline (ok = $false) - the
+    # report must not then present the whole file as this run's appendix.
+    if (-not (Test-Path $path)) { return @{ ok = $true; chars = 0; head = "" } }
+    $t = Read-FileTextOrNull $path
+    if ($null -eq $t) { return @{ ok = $false; chars = 0; head = "" } }
+    return @{ ok = $true; chars = $t.Length; head = $t.Substring(0, [Math]::Min(256, $t.Length)) }
+}
+
+function Show-WebClientErrorLog([string]$path, $pre) {
+    $rel = ".lsfusion-dev\tomcat\logs\gwtlog-err.log"
+    if (-not $pre) { $pre = @{ ok = $false; chars = 0; head = "" } }
+    if (-not (Test-Path $path)) {
+        Info "Web client error log ($rel): not present - the local Tomcat has not written one yet."
+        return
+    }
+    $text = Read-FileTextOrNull $path
+    $cap = 25
+    $clip = { param($s) if ($s.Length -gt 400) { $s.Substring(0, 397) + '...' } else { $s } }
+    if ($null -eq $text) {
+        Info "Web client error log ($rel): present but could NOT be read (locked without sharing, or access denied) - open it directly."
+        return
+    }
+    if (-not $pre.ok) {
+        # No baseline, so which lines are new is unknown - say so, show the tail.
+        $tailLines = @(Tail-Text $text 10 | Where-Object { $_.Trim() })
+        if ($tailLines.Count) {
+            Info "Web client error log ($rel): could not be read BEFORE the run, so which lines are new is unknown - its last lines:"
+            $tailLines | ForEach-Object { Write-Host "    $(& $clip $_)" }
+            Note-BenignLogLines ($tailLines -join "`n")
+        } else {
+            Info "Web client error log ($rel): empty."
+        }
+        return
+    }
+    # The snapshot must still be the file's prefix for the length delta to be
+    # this run's appendix; otherwise the file rolled - show it whole.
+    $isPrefix = ($text.Length -ge $pre.chars) -and (($pre.head -eq "") -or $text.StartsWith($pre.head, [StringComparison]::Ordinal))
+    $delta = if ($isPrefix) { $text.Substring($pre.chars) } else { $text }
+    $lines = @($delta -split "`r?`n" | Where-Object { $_.Trim() })
+    if ($lines.Count) {
+        $shown = if ($lines.Count -gt $cap) { $lines[($lines.Count - $cap)..($lines.Count - 1)] } else { $lines }
+        $capNote = if ($lines.Count -gt $cap) { " (last $cap of $($lines.Count) lines)" } else { "" }
+        Info "Web client error log ($rel) - appended DURING this run${capNote}:"
+        $shown | ForEach-Object { Write-Host "    $(& $clip $_)" }
+        Note-BenignLogLines ($shown -join "`n")
+    } else {
+        $older = @(Tail-Text $text 5 | Where-Object { $_.Trim() })
+        if ($older.Count) {
+            Info "Web client error log ($rel): nothing appended during this run - its last lines (OLDER, from before the run):"
+            $older | ForEach-Object { Write-Host "    $(& $clip $_)" }
+            Note-BenignLogLines ($older -join "`n")
+        } else {
+            Info "Web client error log ($rel): empty."
+        }
     }
 }
 
@@ -2801,8 +2930,11 @@ function Cmd-Verify {
         # PS 5.1: Get-Content -Raw returns $null for a zero-byte file.
         $doText = "$(Get-Content -Raw -Encoding UTF8 -LiteralPath $DoFile)"
         if ($doText.TrimStart().StartsWith('[')) {
-            foreach ($item in @($doText | ConvertFrom-Json)) {
-                if ($null -eq $item) { continue }
+            # PS 5.1 hands a JSON array back as ONE Object[] item (measured:
+            # the string check below then failed on every JSON DoFile) -
+            # unroll it through ForEach-Object.
+            foreach ($item in @(@($doText | ConvertFrom-Json) | ForEach-Object { $_ })) {
+                if ($null -eq $item) { throw "DoFile JSON must be an array of step STRINGS; got a null element." }
                 if ($item -isnot [string]) { throw "DoFile JSON must be an array of step STRINGS; got an element of type $($item.GetType().Name)." }
                 if ($item) { $doSteps += $item }
             }
@@ -2812,10 +2944,10 @@ function Cmd-Verify {
         Info "DoFile : $($doSteps.Count) step(s) from $DoFile"
     }
     $doSteps += @($Do | Where-Object { $_ })
-    foreach ($g in @($doSteps | Where-Object { $_ -match ',\s*(wait|click|dblclick|hover|drag|dnd|mouse|fill|type|edit|press|eval|assert-count|assert-text):' })) {
+    foreach ($g in @($doSteps | Where-Object { $_ -match ',\s*(wait|click|dblclick|rclick|hover|drag|dnd|mouse|fill|type|edit|press|eval|screenshot|assert-count|assert-text):' })) {
         Warn "-Do step looks like SEVERAL steps glued together by a comma: '$g'. A nested 'powershell -Command' collapses array commas into one argument - pass steps as -Do 'a','b' from a direct shell, or one per line via -DoFile. It executes as ONE step."
     }
-    if ($doSteps.Count) { Info "Do     : $($doSteps.Count) generic step(s) after navigation (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/assert-count/assert-text by Playwright selector; interaction verbs use the first VISIBLE match, assert-* all visible matches)" }
+    if ($doSteps.Count) { Info "Do     : $($doSteps.Count) generic step(s) after navigation (click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text by Playwright selector; interaction verbs use the first VISIBLE match, assert-* all visible matches)" }
     Info "View   : ${ViewportWidth}x${ViewportHeight}$(if ($Locale) { ", locale $Locale" })"
     if ($outStem -ne "verify") { Info "Output : artifact stem '$outStem' ($outStem-*.png, $domFile, $outStem-console.txt) - this run overwrites only its own set" }
 
@@ -2863,6 +2995,26 @@ function Cmd-Verify {
     Info "Budget : $verifyBudget s for the whole run (watchdog; override with -Timeout <seconds>)"
     if ($verifyBudget -lt 15) { Warn "A budget under 15 s rarely lets even the browser launch finish - expect a watchdog kill." }
 
+    # Snapshot the web client's error log BEFORE the run: on a load timeout
+    # (helper-reported, or the watchdog kill) the report shows what the run
+    # appended there - see Show-WebClientErrorLog. Only the LOCAL Tomcat's
+    # log can explain the local web client; an explicit -Url that is not the
+    # local web URL points at another server, whose logs are not here.
+    $gwtErrLog = Join-Path $StateDir "tomcat\logs\gwtlog-err.log"
+    $localTarget = -not $ScriptBound.ContainsKey("Url")
+    if (-not $localTarget) {
+        # An explicit -Url still means the local Tomcat when it points at this
+        # machine's web port (localhost / 127.0.0.1 / ::1 / this host's name
+        # or one of its interface addresses), whatever path or query follows
+        # - host + port identify the server.
+        try {
+            $tu = [Uri]"$target"
+            $localTarget = ($tu.Port -eq [int]$cfg.webPort) -and (Test-LocalUri $tu)
+        } catch { $localTarget = $false }
+    }
+    $preGwtErr = if ($localTarget) { Get-LogSnapshot $gwtErrLog } else { $null }
+    $runStart = Get-Date
+
     $pyOut = Join-Path $StateDir "verify-stdout.json"
     $pyErrFile = Join-Path $StateDir "verify-stderr.txt"
     Remove-Item $pyOut, $pyErrFile -Force -ErrorAction SilentlyContinue
@@ -2896,9 +3048,12 @@ function Cmd-Verify {
             Bad "verify did not finish within $verifyBudget s - and the watchdog could NOT kill python PID $($pyProc.Id) (still alive; kill it manually: taskkill /T /F /PID $($pyProc.Id))."
         }
         $phaseTxt = (Read-FileText (Join-Path $StateDir "$outStem-phase.txt")).Trim()
+        $hungStep = ""
         if ($phaseTxt -match '^(\d+)s\t(.*)$') {
-            Info "Hung step  : $($Matches[2])  (entered at t+$($Matches[1]) s, killed at t+$verifyBudget s)"
+            $hungStep = $Matches[2]
+            Info "Hung step  : $hungStep  (entered at t+$($Matches[1]) s, killed at t+$verifyBudget s)"
         } elseif ($phaseTxt) {
+            $hungStep = $phaseTxt
             Info "Hung step  : $phaseTxt"
         }
         Info "This usually means the page WEDGED the web client (a form that blocks the browser's renderer)."
@@ -2909,6 +3064,14 @@ function Cmd-Verify {
             $ap = Join-Path $StateDir $af
             if (Test-Path $ap) { $kept += "$af ($([math]::Round((Get-Item $ap).Length / 1KB, 1)) KB)" }
         }
+        # screenshot:<name> steps write <stem>-<name>.png at their point of
+        # the chain - list the ones THIS run wrote before the kill as well
+        # (by write time, so another stem sharing the prefix cannot leak in).
+        $known = @($loginShot, "$outStem-app.png", $openShot, $clickShot, $dblShot, $doShot)
+        foreach ($f in @(Get-ChildItem -LiteralPath $StateDir -Filter "$outStem-*.png" -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.LastWriteTime -ge $runStart -and ($known -notcontains $_.Name) })) {
+            $kept += "$($f.Name) ($([math]::Round($f.Length / 1KB, 1)) KB)"
+        }
         if ($kept.Count) { Info "Artifacts written before the hang: $($kept -join ', ') (in $StateDir)" }
         else { Info "Artifacts: none were written before the hang (it hit before the first screenshot)." }
         $consoleTail = @(Tail-Text (Read-FileText (Join-Path $StateDir "$outStem-console.txt")) 8)
@@ -2918,6 +3081,11 @@ function Cmd-Verify {
         } else {
             Info "Browser console: empty so far (a renderer stuck in a busy loop emits nothing)."
         }
+        # An overrun is a load that never completed - the web client's server
+        # side usually knows why: what it logged during the run.
+        Warn "Load timeout - the whole run overran its $verifyBudget s budget$(if ($hungStep) { " while: $hungStep" })"
+        if ($localTarget) { Show-WebClientErrorLog $gwtErrLog $preGwtErr }
+        else { Info "(-Url targets another server: read ITS tomcat/logs/gwtlog-err.log - the web client's error log - for what happened during the run.)" }
         if ($Session -and (Test-Path $PwSessionPid)) {
             Stop-Tracked $PwSessionPid @() "Persistent verify-session browser (it kept the wedged page)"
             Info "Session browser stopped - reopen with 'verify -Session' after fixing the form."
@@ -3183,7 +3351,15 @@ function Cmd-Verify {
     }
     Info "Open the PNGs with the Read tool to see what was rendered."
 
-    if ($r.login_attempted) {
+    $errText = "$($r.error)"
+    if ($errText -like 'navigation failed:*' -or $errText -like 'login page did not render*') {
+        # Nothing landed, or a /login page never rendered its form - a
+        # login/landing verdict would be fiction here (the 'no login form =
+        # devmode auto-authenticated' reading below would even sound like
+        # a pass); the Playwright error below carries the outcome.
+        $why = if ($errText -like 'navigation failed:*') { "the navigation never completed" } else { "the login page never rendered its form" }
+        Info "Landing page: not judged - $why (see below)."
+    } elseif ($r.login_attempted) {
         if ($r.logged_in) { Ok "Login flow succeeded as '$vUser' - the authenticated screenshot shows the app." }
         else {
             Warn "Login was attempted but the password field is still visible - check credentials (-User/-Password) and the login screenshot."
@@ -3198,6 +3374,26 @@ function Cmd-Verify {
         $checkFails.Add("no login form (devmode off)")
     } else {
         Ok "No login form on the landing page - devmode auto-authenticated as '$($cfg.adminUser)', the screenshot shows the running app."
+    }
+
+    # Uncaught page exceptions, each as its own line BEFORE the custom-view
+    # diagnoses: they are the cause those diagnoses usually trace back to.
+    # Playwright reports them separately from console messages ('pageerror'),
+    # so until the helper recorded them a web resource that died with a
+    # SyntaxError left no trace in the console dump - only the later "'X' is
+    # not a component" it caused. The helper writes them as [pageerror]
+    # lines, with the resource and 1-based position after '@' when the CDP
+    # event carried them (a compile-time error has no stack, so that
+    # location is the only thing naming the file).
+    $pgErrs = @(); if ($r.PSObject.Properties['page_errors']) { $pgErrs = @($r.page_errors) }
+    foreach ($pe in $pgErrs) {
+        $peLines = @("$($pe.message)" -split "`r?`n")
+        $times = if ([int]$pe.count -gt 1) { " (x$($pe.count))" } else { "" }
+        $more = if ($peLines.Count -gt 1) { " [JS stack: $($r.artifacts.console)]" } else { "" }
+        Warn "Uncaught page exception$($times): $($peLines[0])$more"
+    }
+    if ($pgErrs.Count) {
+        Info "An uncaught exception is a script that DIED at that point: a SyntaxError while a web resource loads means the WHOLE file never ran (nothing it defines exists on the page); a runtime error at a file's top level stops it at that statement (what came before it did run); one raised inside a handler aborted just that handler. The resource and position follow '@' (1-based, as DevTools shows them). These are the red lines of the browser's own console; the console.* lines counted below are the other kind."
     }
 
     # Custom-view failures out of the console, each as its own diagnosis line
@@ -3215,6 +3411,7 @@ function Cmd-Verify {
     $cvErrs = @(); if ($r.PSObject.Properties['custom_view_errors']) { $cvErrs = @($r.custom_view_errors) }
     $sawJsxFail = $false
     $sawNotComponent = $false
+    $notComponentNames = @()
     foreach ($cv in $cvErrs) {
         $cvLines = @("$($cv.message)" -split "`r?`n")
         $times = if ([int]$cv.count -gt 1) { " (x$($cv.count))" } else { "" }
@@ -3225,7 +3422,8 @@ function Cmd-Verify {
             $more = if ($cvLines.Count -gt 1) { " [full message with the source frame: $($r.artifacts.console)]" } else { "" }
             Warn ".jsx transform FAILED$($times): $($cvLines[0])$more"
         } else {
-            if ("$($cv.message)" -match 'is not a component') { $sawNotComponent = $true }
+            if ("$($cv.message)" -match "'([^']+)' is not a component") { $sawNotComponent = $true; $notComponentNames += $Matches[1] }
+            elseif ("$($cv.message)" -match 'is not a component') { $sawNotComponent = $true }
             $more = if ($cvLines.Count -gt 1) { " [full message: $($r.artifacts.console)]" } else { "" }
             Warn "Custom view error$($times): $($cvLines[0])$more"
         }
@@ -3234,18 +3432,56 @@ function Cmd-Verify {
         Info "A broken .jsx is served as that console-error stub INSTEAD of its script, so the component function never gets defined and every form using it renders an EMPTY custom container (short inline error in it) - that blank area on the screenshot is THIS failure, not a layout or data problem. Fix the .jsx at the position in the message and re-run: devmode serves web resources fresh on every page load, no restart needed."
     } elseif ($sawNotComponent) {
         Info "The named function is not a drawable component on this page: typo in the .lsf 'custom'/CUSTOM name, the defining web resource not loaded/registered, or its script died earlier (then the cause is usually a line above or in $($r.artifacts.console)). The affected container renders EMPTY except a short inline error."
+        if ($pgErrs.Count) {
+            # Correlate by name before blaming: a resource is conventionally
+            # named after the component it defines (web/init/BrokenView.jsx
+            # -> 'BrokenView'), so an exception located in a file of that
+            # exact stem comes from the file that should have defined it -
+            # or the message names the identifier outright ('X is not
+            # defined'). Exact matches only (Test-PageErrorNamesComponent);
+            # an unrelated exception is only something to check, not the cause.
+            $named = @()
+            foreach ($n in $notComponentNames) {
+                foreach ($pe in $pgErrs) {
+                    $first = @("$($pe.message)" -split "`r?`n")[0]
+                    if (Test-PageErrorNamesComponent $first $n) { $named += $n; break }
+                }
+            }
+            if ($named.Count) {
+                Info "The uncaught page exception above located in a file named '$($named -join "', '")' (or naming that identifier) comes from the resource that should define that component - it died before defining it (a file that fails to compile defines nothing)."
+            } else {
+                Info "Check whether one of the uncaught page exceptions above comes from the resource meant to define it (the location after '@' names the file): a file that dies before defining the function is the usual cause; an unrelated exception is not."
+            }
+        }
     } elseif ($cvErrs.Count) {
         Info "A custom (React) view reported a render-time error - its container has likely rendered empty or wrong; the message above (full text in $($r.artifacts.console)) is the diagnosis, not the screenshot."
     }
     if ($r.console_errors -gt 0) {
         # Diagnostics, not an assertion: console errors are reported but do
         # not flip the exit code (apps routinely log noise there); the
-        # custom-view lines above are included in this count.
-        Warn "Browser console reported $($r.console_errors) error(s) - see $($r.artifacts.console)."
+        # uncaught-exception and custom-view lines above are included in
+        # this count.
+        Warn "Browser console reported $($r.console_errors) error(s) (console.error + uncaught exceptions) - see $($r.artifacts.console)."
     }
     if ($r.error) {
         Bad "Playwright reported: $($r.error)"
         $checkFails.Add("playwright error")
+    }
+    # Page loads that ran out of time (helper-recorded: the navigation without
+    # a 'load' event, a /login page that never rendered its form, the direct
+    # open that never reached /main, a 'Loading' indicator that stayed on
+    # screen 60 s). Each is named, then the web client's error log follows -
+    # a load that never completes is usually explained on the web client's
+    # server side (a client-reported exception, a failed resource) while the
+    # browser console shows nothing. Diagnostics: the timeouts that fail a
+    # check (navigation, login, open) are already in $checkFails via their
+    # own error; a stuck indicator alone does not flip the exit.
+    $loadTimeouts = @(); if ($r.PSObject.Properties['load_timeouts']) { $loadTimeouts = @($r.load_timeouts) }
+    if ($loadTimeouts.Count) {
+        Write-Host ""
+        foreach ($lt in $loadTimeouts) { Warn "Load timeout - $lt" }
+        if ($localTarget) { Show-WebClientErrorLog $gwtErrLog $preGwtErr }
+        else { Info "(-Url targets another server: read ITS tomcat/logs/gwtlog-err.log - the web client's error log - for what happened during the run.)" }
     }
 
     # STRICT exit contract: 0 = every requested check passed; 2 = at least
@@ -4340,6 +4576,13 @@ version and dies on every plugin update.
                  -Timeout <s> overrides): a page that wedges the web client
                  (blocked renderer) is killed with the hung step named and
                  the browser-console tail printed - exit 1, artifacts kept.
+                 <stem>-console.txt holds console.* messages AND uncaught
+                 page exceptions ([pageerror] lines with resource:line:col
+                 - e.g. a web resource that died while loading); both are
+                 reported. On a load timeout (navigation, login page, direct
+                 open, a 'Loading' indicator stuck 60 s, the watchdog kill)
+                 the report adds what tomcat\logs\gwtlog-err.log - the web
+                 client's error log - received during the run.
   open           Open the web UI in the default browser.
   api            Call the Action API (-Script "<code>" or -ScriptFile "<path>").
                  Use -ScriptFile for any script with non-ASCII text (UTF-8 safe).
@@ -4508,15 +4751,17 @@ Common options:
                         reach buttons/inputs inside CUSTOM (React) components
                         that text-based -Click cannot hit. Each step is
                         verb:rest with any Playwright selector (css, text=...,
-                        button:has-text(...)); click/dblclick/hover/drag/dnd
-                        selectors accept an @x,y offset from the element's
-                        top-left corner:
+                        button:has-text(...)); click/dblclick/rclick/hover/
+                        drag/dnd selectors accept an @x,y offset from the
+                        element's top-left corner:
                           click:<sel>[@x,y]         dblclick:<sel>[@x,y]
-                          hover:<sel>[@x,y]         drag:<sel>[@x,y]=><sel>[@x,y]
+                          rclick:<sel>[@x,y]        hover:<sel>[@x,y]
+                          drag:<sel>[@x,y]=><sel>[@x,y]
                           dnd:<sel>[@x,y]=><sel>[@x,y]
                           mouse:down[@x,y]  mouse:up[@x,y]  mouse:move@x,y[,steps]
                           fill:<sel>=><value>       type:<sel>=><value>
                           edit:<caption|sel>=><val> press:<key>  eval:<js>  wait:<ms>
+                          screenshot:<name>         (-> <stem>-<name>.png, mid-chain)
                           assert-count:<sel>=><n>   assert-text:<sel>=><substring>
                         'drag' is a raw mouse gesture (mousedown/mousemove/
                         mouseup - drag-to-draw UIs); 'dnd' speaks HTML5
@@ -4548,8 +4793,22 @@ Common options:
                         primitives (move glides in 12 interpolated steps by
                         default so busy pages still see the path); 'type'
                         presses real keys (React inputs that ignore fill);
-                        eval returns its value into the report. Failed
-                        click/dblclick/hover steps are CLASSIFIED (disabled
+                        eval returns its value into the report; rclick is
+                        the right button (the real contextmenu event, for
+                        grid/row context menus); screenshot:<name> saves
+                        <stem>-<name>.png at that point of the chain, so one
+                        chain documents several screens (the opened menu,
+                        the state after press:Escape) instead of one run per
+                        screen - the post-chain <stem>-do.png is still
+                        taken. The name takes letters, digits, '.', '_' and
+                        NO dash - a stem may contain dashes, and only a
+                        dash-free name makes <stem>-<name>.png split
+                        unambiguously at its last dash (stem 'orders' +
+                        'archive-menu' and stem 'orders-archive' + 'menu'
+                        would otherwise share one file); the run's own
+                        artifact names (login, app, open, click, dblclick,
+                        do, dom, console, phase) are reserved. Failed
+                        click/dblclick/rclick/hover steps are CLASSIFIED (disabled
                         the whole wait = server-side DISABLEIF, often an
                         uncommitted value; covered by a named overlay;
                         became hidden; disappeared) instead of a bare
@@ -4558,9 +4817,12 @@ Common options:
                         newline there. The assert-*
                         steps are native checks: assert-count passes when
                         EXACTLY n visible matches exist, assert-text when some
-                        visible match's text or input value contains the
-                        substring (case-insensitive); both poll up to 5 s and
-                        fail the step (and the strict verify exit) otherwise.
+                        visible match's text, its own value, or the value of
+                        a visible input/textarea/select INSIDE it contains
+                        the substring (case-insensitive - a container
+                        selector sees what its fields show); both poll up to
+                        5 s and fail the step (and the strict verify exit)
+                        otherwise.
                         Chain stops at the first failed step. Screenshot goes
                         to verify-do.png (stem follows -OutPrefix). Example:
                           verify -Click "Schedule" -Do "edit:Comment=>Ivanov","drag:.task-a=>.task-b","click:text=Book","assert-count:.task-card=>3"
@@ -4575,7 +4837,9 @@ Common options:
   -OutPrefix <stem>     'verify': filename stem for this run's artifacts -
                         <stem>-open.png, <stem>-do.png, <stem>-dom.html,
                         <stem>-console.txt, ... (default 'verify'). Every run
-                        wipes and rewrites its own stem's files, so when
+                        wipes and rewrites its own stem's STANDARD files (the
+                        screenshot:<name> files of -Do chains stay until the
+                        same name overwrites them), so when
                         checking several forms in a loop pass a per-form
                         stem (e.g. -OutPrefix items) or only the last run's
                         screenshots survive. Letters, digits, '.', '_', '-'.

@@ -17,6 +17,10 @@ configuration, or when you need to change ports/versions.
     │                       (app id = db.name; the download itself is not
     │                       kept; webapps/ROOT holds only a redirect page
     │                       to /<app id>/)
+    │   └── logs/gwtlog-err.log   the web client's error log (log4j WARN+,
+    │                       incl. every exception the browser reports back);
+    │                       verify prints what a run appended to it on any
+    │                       load timeout
     ├── server.out.log / server.err.log
     ├── tomcat.out.log
     ├── server.pid / tomcat.pid
@@ -41,11 +45,17 @@ configuration, or when you need to change ports/versions.
     ├── verify-do.png             state after the -Do interaction steps
     ├── pw-session.pid / pw-session-profile/     persistent verify -Session
     │                             browser (killed by verify -EndSession / stop)
-    └── verify-dom.html / verify-console.txt
+    └── verify-dom.html / verify-console.txt   (console.* lines plus
+                                  [pageerror] uncaught exceptions with
+                                  resource:line:col)
     (the verify- stem of all of these follows -OutPrefix: a run with
     -OutPrefix items writes items-open.png, items-dom.html, ... and leaves
-    the sets of other prefixes untouched - how batch runs keep per-form
-    evidence)
+    the standard sets of other prefixes untouched - how batch runs keep
+    per-form evidence. -Do screenshot:<name> steps add <stem>-<name>.png
+    files that only the same stem + name overwrites: the name takes no
+    dash, so the file splits unambiguously at its last dash and can alias
+    neither another stem's standard artifact nor another stem's custom
+    screenshot; the standard names themselves are reserved)
 ```
 
 The application server runs with the **project folder as its working

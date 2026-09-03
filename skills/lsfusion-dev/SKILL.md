@@ -212,7 +212,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `keep-running` | Exempt this project from the **session-end auto-stop** (the plugin's hooks stop the servers a Claude session started ~60 min after that session's process ended without being resumed — see [Servers, sessions and other processes on the box](#servers-sessions-and-other-processes-on-the-box)). `-Off` re-enables it. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server); `Auto-stop: OFF` when `keep-running` is set. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-OutPrefix <stem>` renames the whole artifact set of a run (`<stem>-open.png`, …) so a batch loop over several forms keeps per-form evidence instead of overwriting `verify-*.png` each run. `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption; `screenshot:<name>` saves `<stem>-<name>.png` mid-chain, so one chain documents several screens) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-OutPrefix <stem>` renames the whole artifact set of a run (`<stem>-open.png`, …) so a batch loop over several forms keeps per-form evidence instead of overwriting `verify-*.png` each run. `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. `<stem>-console.txt` also carries **uncaught page exceptions** (`[pageerror]` lines with `resource:line:col` — e.g. a web resource that died while loading), reported as their own `[WARN]` lines and tied to the `'X' is not a component` they cause; on any **load timeout** (navigation, login page, direct open, a stuck `Loading` indicator, the watchdog kill) the report appends what `tomcat/logs/gwtlog-err.log` — the web client's error log — received during the run. |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. Exit codes are trustworthy: **0** = HTTP success, **1** = request failed (HTTP error / connection refused), **3** = client timeout (no verdict — deliberately distinct from 1). |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and gives each file one of four verdicts: **`[OK]`** (eval compiled it — syntax and names proven), **`[FAIL]`** (a real error in the code: parse error, unknown name, unclosed META, missing header), **`[SKIP]`** (eval *cannot* check it — a limitation of the pre-check, never an error: a construct the eval module refuses such as `CLASS` / `WHEN` / `CONSTRAINT`, one that crashes its compiler such as `EXTEND FORM`, a name declared in another project file the server has not loaded, an all-META/`EXTEND FORM` file, a file declaring `run()`), each `[SKIP]` followed by **`[NEEDS DRYRUN]`** — the full module loader checks it, and the summary prints the exact scoped `dryrun -TopModule "…"` command. The summary is red and the exit code 1 **only for `[FAIL]`**; a run whose only findings are pre-check limitations ends in `[NEEDS DRYRUN]` with exit 0 (exit 3 = no verdict, the endpoint could not be used). New-module code is mostly refused declarations, so iterate on the scoped `dryrun` there and keep precheck for files eval can fully check. See the `precheck` part of step 4. |
@@ -234,7 +234,7 @@ war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
 `-DoubleClick`, `-OutPrefix` (verify: per-run artifact filename stem — batch
 runs keep per-form screenshots), `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
-`-Do` (verify: generic click/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/assert-count/assert-text
+`-Do` (verify: generic click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text
 steps by Playwright selector, first visible match — see step 5), `-DoFile`
 (verify: `-Do` steps from a file — JSON array or one per line; survives
 nested quoting), `-AllowWarnings` (verify: report-only exit 0 — by default
@@ -1238,9 +1238,10 @@ checking the unit-test output.
    UI. The workhorse is `verify` — it exists in every harness, and the
    rest of this step documents it. **If the session exposes an in-app
    browser** (Claude Desktop's Browser pane — `mcp__Claude_Browser__*`
-   tools — or a similar browser-automation surface), do the
-   *interactive, content-level* part there instead; the split is
-   specified in **"In-app browser vs `verify`"** at the end of this
+   tools — or a similar browser-automation surface), it may complement
+   `verify` for *reading* a rendered page — but `verify` comes first,
+   and the pane gets ONE attempt: the split and its bail-out signatures
+   are specified in **"In-app browser vs `verify`"** at the end of this
    step. Either way the log → API → UI order stays.
 
    `verify` drives **Playwright** (headless Chromium) to:
@@ -1249,7 +1250,9 @@ checking the unit-test output.
      from `-User` / `-Password`, default `admin` / empty — and screenshot
      the result → `.lsfusion-dev/verify-app.png`,
    - dump the final DOM → `verify-dom.html` and the browser console →
-     `verify-console.txt`.
+     `verify-console.txt` — `console.*` messages **and uncaught page
+     exceptions** (`[pageerror]` lines; Playwright delivers those
+     separately from the console stream, the DevTools console shows both).
 
    In devmode lsFusion auto-authenticates, so there is **no login form**
    and the landing screenshot already shows the navigator + forms. The
@@ -1332,7 +1335,8 @@ checking the unit-test output.
      judge `verify-open.png` (and pass `-AllowWarnings` if that run must
      exit 0).
    - **Checking several forms in a row? Pass `-OutPrefix <stem>` per run.**
-     Every verify run wipes and rewrites its artifact set, so a batch loop
+     Every verify run wipes and rewrites its standard artifact set (the
+     `screenshot:<name>` files of `-Do` chains are left alone), so a batch loop
      without it keeps only the *last* form's `verify-open.png` — the
      evidence of the other runs is gone. With a per-form stem each run
      writes its own set (`items-open.png`, `items-dom.html`,
@@ -1395,11 +1399,14 @@ checking the unit-test output.
      button — with several, use a button-specific class/attribute from
      `verify-dom.html`;
    - `hover:<selector>` — real mouse-over (tooltips, hover-revealed handles);
+   - `rclick:<selector>` — right button: the real `contextmenu` event
+     (grid/row context menus) — no synthetic `dispatchEvent` via `eval:`
+     needed;
    - `drag:<selector>=><selector>` — a **real mouse gesture**: `mousedown` on
      the source, intermediate `mousemove`s, `mouseup` on the target — what
      drag-to-draw UIs (Gantt dependency links, resize handles, sliders)
-     actually listen for. `click`/`dblclick`/`hover`/`drag`/`dnd` selectors
-     accept an `@x,y` offset from the element's top-left corner
+     actually listen for. `click`/`dblclick`/`rclick`/`hover`/`drag`/`dnd`
+     selectors accept an `@x,y` offset from the element's top-left corner
      (`drag:.task-a@120,8=>.task-b@4,8` starts from a bar's edge connector);
    - `dnd:<selector>=><selector>` — **HTML5 drag-and-drop**, the OTHER drag
      protocol: real `DragEvent`s (`dragstart` → `dragover` → `drop` →
@@ -1442,10 +1449,23 @@ checking the unit-test output.
      property) fails with that diagnosis instead of typing into the void;
    - `press:<key>` (e.g. `Enter`), `eval:<js>` (result lands in the report),
      `wait:<ms>`;
+   - `screenshot:<name>` — a screenshot **at that point of the chain** →
+     `<stem>-<name>.png` (letters, digits, `.`, `_` — **no dash**: a stem
+     may contain dashes, and only a dash-free name makes the file split
+     unambiguously at its last dash, otherwise stem `orders` +
+     `archive-menu` and stem `orders-archive` + `menu` would silently share
+     one file; the run's own artifact names — `login`, `app`, `open`,
+     `click`, `dblclick`, `do`, `dom`, `console`, `phase` — are reserved).
+     One chain can document
+     several screens — the menu opened by `rclick:`, the state after
+     `press:Escape` — instead of one run per screen; the post-chain
+     `verify-do.png` is still taken;
    - `assert-count:<selector>=><n>` / `assert-text:<selector>=><substring>` —
      **native assertions**: exactly `n` visible matches / some visible
-     match's text **or input value** contains the substring
-     (case-insensitive). Both poll up to 5 s (a render lagging the previous
+     match's text, **its own value, or the value of any visible
+     `input`/`textarea`/`select` inside it** contains the substring
+     (case-insensitive) — so a container selector (a panel, a form, a
+     component root) sees what its fields show. Both poll up to 5 s (a render lagging the previous
      action isn't a failure), then fail the step — and with it the strict
      `verify` exit — with a concrete diagnosis (`3 visible match(es),
      expected 4`; the texts actually found). Prefer these over eyeballing
@@ -1468,7 +1488,9 @@ checking the unit-test output.
 
    The chain stops at the first failed step; each step's ok/error (and every
    `eval` result) is printed, and the post-chain state goes to
-   `verify-do.png`. Non-ASCII values in `-Do` cross the same argv boundary as
+   `verify-do.png`; each `screenshot:<name>` step reports the file it wrote
+   (earlier runs' custom screenshots are not wiped — only the standard set
+   is — so trust the step lines, not a directory listing). Non-ASCII values in `-Do` cross the same argv boundary as
    `api -Script` — when calling through bash + `powershell.exe`, put Cyrillic
    text in an `eval:` step or run the command via an in-process PowerShell
    tool instead (see the UTF-8 pitfall in step 4). **Steps with commas or
@@ -1486,9 +1508,25 @@ checking the unit-test output.
    `[WARN]` lines. `-AllowWarnings` restores report-only exit 0; tool-level
    errors (missing python, bad usage) exit 1 either way. Browser console
    errors are reported but never flip the exit code (apps log noise there)
-   — with one upgrade: **custom-view failures get their own `[WARN]`
-   diagnosis lines above the total counter** (they stay included in its
-   count). A broken `.jsx` web resource
+   — with two upgrades. **Uncaught page exceptions get their own `[WARN]
+   Uncaught page exception: <Name>: <message> @ <resource>:<line>:<col>`
+   lines** (deduplicated, `(xN)` for repeats). Playwright delivers them
+   separately from the console stream (`pageerror`), so before they were
+   recorded a web resource that died while loading (a `SyntaxError`: the
+   **whole file never ran**, nothing it defines exists on the page) left
+   no trace in `verify-console.txt` beyond the `'X' is not a component` it
+   caused later; now the exception is listed *above* that diagnosis, and
+   when it is located in a file named exactly after the missing component
+   (a resource is named after what it defines: `…/web/init/BrokenView.js`
+   for `'BrokenView'`) or its message names that identifier, the report
+   says that file died before defining it — otherwise it only tells you to
+   check. The resource and 1-based position after `@` name the file — a
+   compile-time error has no stack, so that is the only thing that does;
+   exceptions from web workers and cross-origin iframes (delivered by
+   Playwright only, no CDP location) appear without one. And
+   **custom-view failures get their own
+   `[WARN]` diagnosis lines above the total counter** (both kinds stay
+   included in its count). A broken `.jsx` web resource
    is served by the platform as a `console.error` stub *instead of* its
    script, so the report prints `.jsx transform FAILED: … <resource>:
    <Babel error + source position>` (and any render-time `Custom view
@@ -1511,6 +1549,22 @@ checking the unit-test output.
    (tool failure; `-AllowWarnings` does not soften it), artifacts written
    before the hang stay on disk, and in `-Session` mode the session browser
    is closed too (it held the wedged page and would poison the next call).
+
+   **A load that times out is usually explained on the web client's server
+   side — the report goes there for you.** Every page-load timeout is
+   named as a `[WARN] Load timeout - …` line — the navigation without a
+   `load` event, a `/login` page that never rendered its form, a direct
+   open that never reached `/main`, a `Loading` indicator still on screen
+   after 60 s — and the watchdog kill counts as one too. Each is followed
+   by the tail of `.lsfusion-dev/tomcat/logs/gwtlog-err.log`, the web
+   client's error log (log4j WARN+, also where every exception the browser
+   reports back is logged): **only what the run appended**, labeled as
+   such, or the last lines explicitly marked as older when nothing was
+   appended — in exactly these cases the browser console tends to be
+   silent while that file has the answer (measured). Local web client
+   only; with an explicit `-Url` to another server read *its*
+   `gwtlog-err.log`. The `Removing navigator session…` ERROR lines in it
+   are normal session cleanup, and the report says so.
 
    **Iterating on a multi-step scenario? Add `-Session`.** By default every
    `verify` run starts a fresh browser and pays the navigation (and the slow
@@ -1591,20 +1645,47 @@ checking the unit-test output.
    in-app browser as tools (Claude Desktop's Browser pane:
    `mcp__Claude_Browser__*` — `navigate`, `computer`, `read_page`,
    `get_page_text`, `find`, `form_input`, `read_console_messages`,
-   `read_network_requests`). When present, prefer it for **interactive,
-   content-level** checks and keep `verify` for the cases below; when
-   absent (terminal CLI, headless runs, subagents, CI), `verify` is the
-   only path. In one line: **the pane for content and behaviour,
-   `verify` for layout, gestures, and artifacts.**
+   `read_network_requests`). **`verify` is the default path for checking
+   a form** — direct open at production viewport, assertions, artifacts
+   on disk, one call. The pane is a convenience for *reading* a page
+   that is already rendering (its text / DOM / console) and for quick
+   clicks — and on some machines it does not work at all, so the rule
+   is: **one attempt; on the first failure signature below, stop and run
+   `verify` — do not retry, resize, or reload your way through it.**
+   Measured cost of doing otherwise on one box: five wasted calls, after
+   which `verify` did the entire check — direct open, screenshots, DOM
+   checks, scrolling, a card click, typing into a search — in one run.
+   When the pane is absent (terminal CLI, headless runs, subagents, CI),
+   `verify` is the only path.
 
-   What works in the pane (measured against 7.0-SNAPSHOT):
+   Pane failure signatures — each means "switch to `verify` now":
+   - **"The tab for this application is already opened. Please check
+     it"** after navigating to `<base>/eval/action?script=…` (the
+     platform's `push.notification.tab.already.opened` page): the direct
+     open's 302 landed on `/push-notification` and the service worker
+     did not hand the action to an app tab — not registered in the pane
+     profile, or the pane holds another tab on the app. Loading the base
+     URL first is part of the ONE attempt, not a recovery step; this page
+     is the stop signal (`verify`'s own open handles the same case with a
+     built-in reload).
+   - **Screenshots timing out** (~5 s each measured on one box, ~30 s
+     each right after the pane opens on another) while
+     `navigate`/`read_page`/JS work — interaction actions are gated on
+     one prior successful screenshot, so nothing interactive will run;
+     stop signal.
+   - **A navigator entry outside the viewport** even after
+     `resize_window` — and the pane's viewport is not the layout under
+     test anyway.
+
+   What works in the pane, when it works (measured against 7.0-SNAPSHOT):
    - **Direct form open is the same URL mechanism.** Load the app base
      URL first (that registers the service worker), then navigate to
      `<base>/eval/action?script=<SHOW ... DOCKED;>` (URL-encoded) — the
      302 → `/push-notification` → service-worker → `/main` dance works
      in the pane and the form opens exactly as with `-OpenScript`. All
      the `-OpenScript` rules above (DOCKED, namespace-qualified names,
-     script errors returned as text) apply verbatim.
+     script errors returned as text) apply verbatim; the "already
+     opened" page above is its failure mode.
    - **Assert by reading, not by pre-declared matchers.**
      `get_page_text` / `read_page` return the rendered text — check the
      caption / cell values off that instead of betting an `-OpenExpect`
@@ -1622,7 +1703,8 @@ checking the unit-test output.
      appear only after a reload; any reload boots a new server-side
      navigator and closes open forms).
 
-   Where the pane is NOT sufficient — use `verify` (measured):
+   Where the pane is NOT sufficient even when it works — use `verify`
+   (measured):
    - **Layout at production viewport.** Pane screenshots come back
      ~800 px wide regardless of viewport (1920×1080 → 800×450; dense
      grids illegible), and region zoom is unsupported. To judge
@@ -1640,11 +1722,10 @@ checking the unit-test output.
    - **Evidence.** The pane leaves nothing on disk — no PNGs to attach,
      no JSON verdict, nothing re-runnable. When the user needs proof or
      a repeatable check, run `verify` even after eyeballing the pane.
-   - **Capture flake.** Right after the pane opens, screenshots can
-     time out (~30 s each) while `navigate`/`read_page`/JS run fine —
-     and interaction actions are gated on one prior successful
-     screenshot. Verify via `read_page`/`get_page_text` meanwhile, or
-     fall back to `verify`; don't fight the capture loop.
+   - **Capture flake.** A screenshot timeout is a stop signal (see the
+     signatures above): `read_page`/`get_page_text` may still answer, but
+     nothing interactive runs until a capture succeeds, and waiting for
+     one is exactly the loop that wasted the calls — go to `verify`.
    - **No password entry.** Typing credentials in the pane is
      off-limits for the agent. Irrelevant in devmode (auto-auth, no
      login form), blocking on a non-devmode target — there `verify` / a
