@@ -409,9 +409,11 @@ def _any_visible(loc) -> bool:
 # The optional sid scopes the search to one form's subtree (the element with
 # that lsfusion-form attribute value) - null means the whole document.
 _INPUT_VALUE_JS = """
-([needle, sid]) => {
+([needle, sid, css]) => {
   const n = (needle || '').toLowerCase();
-  const roots = sid
+  const roots = css
+      ? [...document.querySelectorAll(css)]
+      : sid
       ? [...document.querySelectorAll('[lsfusion-form="' + CSS.escape(sid) + '"]')]
       : [document];
   const vis = el => { const r = el.getClientRects()[0];
@@ -436,18 +438,21 @@ _INPUT_VALUE_JS = """
 """
 
 
-def _expect_probe(page, expect: str, sid: str = "") -> str:
+def _expect_probe(page, expect: str, sid: str = "", scope_css: str = "") -> str:
     """One-shot --open-expect sample - visible text OR a visible input's
     value - optionally scoped to the subtree of the form whose lsfusion-form
-    attribute equals sid. Returns 'text' / 'input-value' / ''."""
-    scope = page.locator(f'[lsfusion-form="{sid}"]') if sid else page
+    attribute equals sid, or (scope_css) to the elements a CSS selector
+    names - the way to scope to ONE form instance, see _instance_scope.
+    Returns 'text' / 'input-value' / ''."""
+    css = scope_css or (f'[lsfusion-form="{sid}"]' if sid else "")
+    scope = page.locator(css) if css else page
     try:
         if _any_visible(scope.get_by_text(expect)):
             return "text"
     except PWError:
         pass
     try:
-        if page.evaluate(_INPUT_VALUE_JS, [expect, sid or None]):
+        if page.evaluate(_INPUT_VALUE_JS, [expect, sid or None, scope_css or None]):
             return "input-value"
     except PWError:
         pass
@@ -469,6 +474,140 @@ def _wait_expect(page, expect: str, timeout_ms: int = 45000) -> str:
         if time.time() >= deadline:
             return ""
         page.wait_for_timeout(800)
+
+
+# --double-click outcome: what the platform did with the gesture. Same DOM
+# ground truth as the open check below (a new visible top-level
+# [lsfusion-form] root, or a switch of the active docked tab, is an opened
+# form), plus the in-place-editor probe the edit: verb uses: the editor takes
+# focus. The grid's invisible focus/paste catcher is an <input> too
+# (aria-hidden, 1x1 px, opacity 0 - measured in the DOM of every grid), so
+# focus there is NOT an editor - only a visible control counts.
+_ACTIVE_EDITOR_JS = """
+() => { const a = document.activeElement;
+        if (!a) return null;
+        const t = a.tagName.toLowerCase();
+        const control = t === 'input' || t === 'textarea' || t === 'select';
+        if (!control && !a.isContentEditable) return null;
+        if (a.getAttribute('aria-hidden') === 'true') return null;
+        const r = a.getBoundingClientRect();
+        const cs = getComputedStyle(a);
+        if (!(r.width > 2 && r.height > 2) || cs.opacity === '0'
+            || cs.visibility === 'hidden' || cs.display === 'none') return null;
+        return control ? t : 'contenteditable'; }
+"""
+
+
+def _active_editor(page) -> str:
+    """Tag of the visible in-place editor that currently has focus ('input',
+    'textarea', 'select', 'contenteditable'), '' when none."""
+    try:
+        got = page.evaluate(_ACTIVE_EDITOR_JS)
+    except PWError:
+        return ""
+    return str(got) if got else ""
+
+
+def _classify_double_click(page, before, dc) -> None:
+    """Fill dc['outcome'] (form | editor | none | unknown) and its evidence
+    from the live DOM, against the form state taken right before the
+    gesture. A form "opened" when a root INSTANCE is visible now that was
+    not visible before (identity from _FORM_STATE_JS, never the sID): a new
+    form, a second instance of an already-visible form (same sID), or a
+    hidden docked instance the gesture activated (same sID and caption as
+    its sibling) all count; a tab that merely shifted position because
+    another tab closed does not. The editor probe runs only when no form
+    appeared: a card that opens with a focused input is a form, not an
+    editor."""
+    after = _collect_form_state(page)
+    opened, tab_changed = [], False        # opened: [(instance id, sID)]
+    if after is not None and before is not None:
+        seen = set(before["visible_ids"])
+        opened = [(i, s) for i, s in zip(after["visible_ids"], after["visible_forms"])
+                  if i not in seen]
+        tab_changed = (after["active_tab"] is not None
+                       and after["active_tab"] != before["active_tab"])
+    if after is not None:
+        dc["active_tab"] = after["active_tab"]
+    dc["opened_forms"] = [s for _, s in opened]
+    dc["opened_ids"] = [i for i, _ in opened]
+    dc["tab_changed"] = tab_changed
+    editor = ""
+    if opened:
+        dc["outcome"] = "form"
+    else:
+        editor = _active_editor(page)
+        if editor:
+            dc["outcome"] = "editor"
+        elif after is None or before is None:
+            dc["outcome"] = "unknown"
+        else:
+            dc["outcome"] = "none"
+    dc["editor"] = editor
+
+
+# Scope a probe to ONE form instance: its id from _FORM_STATE_JS is stamped
+# onto the root as an attribute the CSS-based probe can select, so a sibling
+# instance with the same sID stays out of the search.
+_MARK_INSTANCE_JS = """
+(id) => { for (const el of document.querySelectorAll('[lsfusion-form]'))
+            if (el.__lsfVerifyId === id) {
+              el.setAttribute('data-lsf-verify-scope', String(id));
+              return true; }
+          return false; }
+"""
+
+
+def _instance_scope(page, inst: str) -> str:
+    """CSS selector for the root of form instance `inst` (an id from
+    _FORM_STATE_JS - [0-9a-z:] only, safe inside the quoted attribute
+    selector), '' when the instance is gone."""
+    try:
+        if page.evaluate(_MARK_INSTANCE_JS, inst):
+            return f'[data-lsf-verify-scope="{inst}"]'
+    except PWError:
+        pass
+    return ""
+
+
+def _judge_double_click_expect(page, dc) -> None:
+    """--double-click-expect is satisfied only by a form INSTANCE the gesture
+    opened: its sID, text / an input value inside that instance's own
+    subtree, or - when the active docked tab changed its caption - that
+    caption. Everything is judged against the LIVE DOM: an instance that
+    closed again is skipped (and the caption channel needs at least one
+    opened instance still on screen - a tab caption can outlive its root
+    during teardown), the text probe is scoped to the one root the gesture
+    made visible (a sibling instance with the same sID does not count), so
+    a card that closed between classification and judgement cannot pass on
+    the cached snapshot. A page-wide hit without an opened instance is
+    recorded as found-elsewhere, never as a pass - the text is usually the
+    very cell that was double-clicked."""
+    exp = dc["expect"]
+    norm = lambda s: re.sub(r"\s+", " ", (s or "")).strip().lower()
+    where = ""
+    if dc["outcome"] == "form":
+        live = _collect_form_state(page)
+        live_ids = set(live["visible_ids"]) if live is not None else set()
+        alive = False
+        for inst, sid in zip(dc["opened_ids"], dc["opened_forms"]):
+            if inst not in live_ids:
+                continue                      # closed again - no evidence
+            alive = True
+            if sid == exp:
+                where = "form-sid"
+                break
+            css = _instance_scope(page, inst)
+            hit = _expect_probe(page, exp, scope_css=css) if css else ""
+            if hit:
+                where = hit
+                break
+        if (not where and alive and dc["tab_changed"] and live is not None
+                and norm(live["active_tab"]) == norm(exp)):
+            where = "tab"
+    dc["expect_found"] = bool(where)
+    dc["expect_where"] = where
+    dc["expect_found_elsewhere"] = False if where else bool(_expect_probe(page, exp))
 
 
 # --open-script ground truth: which form is really on screen. The --open-expect
@@ -496,7 +635,22 @@ _FORM_STATE_JS = """
                       const cs = getComputedStyle(el);
                       return !!r && r.width > 0.5 && r.height > 0.5 &&
                              cs.visibility !== 'hidden' && cs.display !== 'none'; };
-  const state = {tabs: [], active_tab: null, visible_forms: [], hidden_forms: []};
+  // Instance identity: a counter stamped on the root element itself (an
+  // expando survives between evaluate calls for the life of the element),
+  // so two instances of one form - same sID, same caption - stay apart and
+  // a hidden docked instance that becomes visible again is recognizable.
+  // The id carries a per-DOCUMENT generation token: a gesture whose handler
+  // navigates (new document, counter reset) must not hand the new roots
+  // the ids of the old ones.
+  const tag = el => { if (!el.__lsfVerifyId) {
+                        if (!window.__lsfVerifyGen)
+                          window.__lsfVerifyGen = Date.now().toString(36)
+                              + Math.random().toString(36).slice(2, 8);
+                        window.__lsfVerifySeq = (window.__lsfVerifySeq || 0) + 1;
+                        el.__lsfVerifyId = window.__lsfVerifyGen + ':' + window.__lsfVerifySeq; }
+                      return el.__lsfVerifyId; };
+  const state = {tabs: [], active_tab: null, visible_forms: [], hidden_forms: [],
+                 visible_ids: [], hidden_ids: []};
   const bar = [...document.querySelectorAll('.forms-container .tab-bar')]
       .find(b => !b.closest('[lsfusion-form]'));
   if (bar)
@@ -508,7 +662,9 @@ _FORM_STATE_JS = """
   for (const el of document.querySelectorAll('[lsfusion-form]')) {
     if (el.parentElement && el.parentElement.closest('[lsfusion-form]')) continue;
     const sid = el.getAttribute('lsfusion-form') || '';
-    (vis(el) ? state.visible_forms : state.hidden_forms).push(sid);
+    const id = tag(el);
+    if (vis(el)) { state.visible_forms.push(sid); state.visible_ids.push(id); }
+    else { state.hidden_forms.push(sid); state.hidden_ids.push(id); }
   }
   return state;
 }
@@ -527,6 +683,10 @@ def _collect_form_state(page):
                                else str(got.get("active_tab"))),
                 "visible_forms": [str(s) for s in (got.get("visible_forms") or [])],
                 "hidden_forms": [str(s) for s in (got.get("hidden_forms") or [])],
+                # instance ids ('<document generation>:<n>'), parallel to the
+                # two sID lists (_FORM_STATE_JS)
+                "visible_ids": [str(i) for i in (got.get("visible_ids") or [])],
+                "hidden_ids": [str(i) for i in (got.get("hidden_ids") or [])],
             }
     except PWError:
         pass
@@ -994,9 +1154,24 @@ def main() -> int:
                          "screenshot the result; chain with '>' for tab-then-"
                          "entry navigation, e.g. \"Master data > Items\"")
     ap.add_argument("--double-click", default="",
-                    help="after the click-through, double-click a grid row by "
-                         "visible text to open its edit card, then screenshot "
-                         "it; e.g. \"Coffee beans\"")
+                    help="after the direct open / click-through, double-click "
+                         "the grid cell with this visible text (e.g. \"Coffee "
+                         "beans\") and screenshot the result. A GESTURE: what "
+                         "it does is decided per cell by the platform - an "
+                         "editable cell starts its in-place editor, a "
+                         "read-only cell of an object whose class has an edit "
+                         "form opens that form, a CHANGEMOUSE binding runs "
+                         "its action, a CUSTOM renderer decides itself. The "
+                         "outcome is classified (form / editor / none) in "
+                         "the JSON result; assert a form with "
+                         "--double-click-expect")
+    ap.add_argument("--double-click-expect", default="",
+                    help="with --double-click: the form the double-click must "
+                         "OPEN - its sID, its tab caption, or text inside it "
+                         "(visible text or a visible input's value). Only a "
+                         "form that appeared because of the gesture counts; "
+                         "text elsewhere on the page is reported as "
+                         "found-elsewhere and does not pass")
     ap.add_argument("--do", dest="do_actions", action="append", default=[],
                     help="generic interaction step, run in order AFTER the "
                          "--click/--double-click navigation; repeatable. "
@@ -1085,6 +1260,13 @@ def main() -> int:
             setattr(args, k, v)
     if not args.url or not args.output_dir:
         print(json.dumps({"error": "--url and --output-dir are required (directly or via --args-file)"}))
+        return 2
+    if str(args.double_click_expect).strip() and not str(args.double_click).strip():
+        # Same rule on both sides of the args-file boundary: an assertion
+        # nobody evaluates must not turn into a strict exit 0.
+        print(json.dumps({"error": "--double-click-expect requires a non-blank "
+                                   "--double-click (it asserts on the form the "
+                                   "gesture opens)"}))
         return 2
 
     if args.do_file:
@@ -1187,6 +1369,18 @@ def main() -> int:
             "reason": None,
             "blocked_by": "",
             "forced": False,
+            # What the platform did with the gesture (see the double-click
+            # block): form | editor | none | unknown
+            "outcome": "",
+            "opened_forms": [],   # sIDs of the root instances visible after the gesture, not before
+            "opened_ids": [],     # their instance ids ('<generation>:<n>', _FORM_STATE_JS), parallel
+            "active_tab": None,   # forms-strip tab active after the gesture
+            "tab_changed": False,
+            "editor": "",         # input | textarea | select | contenteditable
+            "expect": args.double_click_expect.strip(),
+            "expect_found": False,
+            "expect_where": "",   # form-sid | tab | text | input-value
+            "expect_found_elsewhere": False,  # on the page, not on an opened form
         },
         "do": {
             "requested": bool(args.do_actions),
@@ -1699,28 +1893,81 @@ def main() -> int:
                             pass
                     page.screenshot(path=str(click_png))
 
-                # Optional double-click: open a grid row's edit card by the
-                # visible text of any cell in that row, then screenshot it. Runs
-                # after the click-through, so -Click opens the list form and
-                # -DoubleClick opens a specific card from it. The first card
-                # open is lazy - reuse the same generous waits as the click-
-                # through.
+                # Optional double-click: a GESTURE on the grid cell with the
+                # given visible text, run after the open / click-through so
+                # -OpenScript or -Click brings up the list form first. What
+                # the platform does with it is decided per cell (web client
+                # GKeyStroke.isEditObjectEvent): an EDITABLE cell starts its
+                # in-place editor (CHANGE) and opens nothing; a read-only
+                # cell of an object whose class has an edit form opens that
+                # form (editObject); a CHANGEMOUSE binding runs its own
+                # action; a CUSTOM renderer decides itself; in a dialog it
+                # is OK. Measured 2026-09-07: one call opened an editor on
+                # an editable grid and the auto EDIT form on the same grid
+                # shown READONLY. So the outcome is CLASSIFIED from the DOM
+                # (new visible [lsfusion-form] root / changed active tab =
+                # form; a focused visible control = editor; else none), and
+                # --double-click-expect asserts on a form that appeared
+                # because of the gesture - never on the gesture itself. The
+                # first form open is lazy - same generous waits as the
+                # click-through.
                 if result["double_click"]["requested"]:
                     dbl = args.double_click.strip()
+                    dc = result["double_click"]
                     _phase(f"double-click: {dbl[:80]}")
                     try:
                         # Same locator discipline as the click-through: exact
                         # first, substring only when the exact text matched
                         # NOTHING (cell text carries surrounding whitespace),
                         # classification and the force fallback act on the
-                        # locator that actually resolved.
+                        # locator that actually resolved. The target is
+                        # resolved VISIBLE before the gesture and the form
+                        # baseline is taken right before delivering it: a
+                        # locator that had to wait for the list form to finish
+                        # rendering would otherwise leave that form out of
+                        # the baseline, and the gesture would be credited
+                        # with "opening" it.
                         done = False
                         last_err = None
                         reason, blocked_by = "", ""
+                        before = None
+                        def _deliver(force: bool) -> None:
+                            # the baseline is taken right before the input
+                            # goes out - the actionability checks either
+                            # just held (trial below) or are skipped (force)
+                            nonlocal before
+                            before = _collect_form_state(page)
+                            loc.dblclick(timeout=3000 if force else 10000, force=force)
+
                         for exact in (True, False):
                             loc = page.get_by_text(dbl, exact=exact).first
                             try:
-                                loc.dblclick(timeout=10000)
+                                # Actionability only (attached, visible,
+                                # stable, enabled, receives events) - nothing
+                                # is dispatched. A cell under a loading glass
+                                # fails HERE, so the baseline is never taken
+                                # while a delivery still waits for it; the
+                                # error log is the real dblclick's, so the
+                                # reason taxonomy is unchanged.
+                                loc.dblclick(trial=True, timeout=10000)
+                            except (PWTimeout, PWError) as e:
+                                last_err = e
+                                reason, blocked_by = _classify_click_error(str(e))
+                                if reason == "not_found":
+                                    continue
+                                if reason == "intercepted":
+                                    try:
+                                        _deliver(force=True)
+                                        done = True
+                                        result["double_click"]["forced"] = True
+                                    except (PWTimeout, PWError) as e2:
+                                        # keep the interception classification;
+                                        # the force error text alone would
+                                        # re-classify as not_found.
+                                        last_err = e2
+                                break
+                            try:
+                                _deliver(force=False)   # the checks just held
                                 done = True
                                 break
                             except (PWTimeout, PWError) as e:
@@ -1730,20 +1977,17 @@ def main() -> int:
                                     continue
                                 if reason == "intercepted":
                                     try:
-                                        loc.dblclick(timeout=3000, force=True)
+                                        _deliver(force=True)
                                         done = True
                                         result["double_click"]["forced"] = True
                                     except (PWTimeout, PWError) as e2:
-                                        # keep the interception classification;
-                                        # the force error text alone would
-                                        # re-classify as not_found.
                                         last_err = e2
                                 break
                         if not done:
                             result["double_click"]["reason"] = reason
                             result["double_click"]["blocked_by"] = blocked_by
                             raise last_err
-                        result["double_click"]["target"] = dbl
+                        dc["target"] = dbl
                         page.wait_for_timeout(700)
                         try:
                             page.wait_for_selector("text=Loading", state="detached", timeout=60000)
@@ -1754,6 +1998,33 @@ def main() -> int:
                         except PWTimeout:
                             pass
                         page.wait_for_timeout(2500)
+                        # Classify, then keep sampling: a form that opens
+                        # lazily (cold build, 10-40 s) can still be on its way
+                        # after networkidle, and a card's root can render
+                        # before the data its expect names. Without an expect
+                        # the loop leaves as soon as the outcome is form or
+                        # editor; with one it keeps going until the expect is
+                        # met (an editor outcome is final either way). A
+                        # positive result is then CONFIRMED by a second
+                        # snapshot >= 1.2 s later - the open check's
+                        # discipline - so a card that closed again, or a
+                        # transient state, cannot stand as the verdict.
+                        deadline = time.time() + (40 if dc["expect"] else 6)
+                        while True:
+                            _classify_double_click(page, before, dc)
+                            if dc["expect"]:
+                                _judge_double_click_expect(page, dc)
+                                settled = dc["expect_found"] or dc["outcome"] == "editor"
+                            else:
+                                settled = dc["outcome"] in ("form", "editor")
+                            if settled or time.time() >= deadline:
+                                break
+                            page.wait_for_timeout(800)
+                        if dc["outcome"] == "form" and (dc["expect_found"] or not dc["expect"]):
+                            page.wait_for_timeout(1200)
+                            _classify_double_click(page, before, dc)
+                            if dc["expect"]:
+                                _judge_double_click_expect(page, dc)
                     except (PWTimeout, PWError) as e:
                         result["double_click"]["error"] = f"double-click on {dbl!r} failed: {e}"
                         if result["double_click"]["reason"] is None:
@@ -2044,15 +2315,7 @@ def main() -> int:
                                 for _ in range(2):
                                     cell.dblclick(timeout=15000)
                                     page.wait_for_timeout(400)
-                                    editor = page.evaluate(
-                                        "() => { const a = document.activeElement;"
-                                        " if (!a) return null;"
-                                        " const t = a.tagName.toLowerCase();"
-                                        " if (t === 'input' || t === 'textarea'"
-                                        "     || t === 'select') return t;"
-                                        " if (a.isContentEditable)"
-                                        "   return 'contenteditable';"
-                                        " return null; }")
+                                    editor = _active_editor(page)
                                     if editor:
                                         break
                                     page.wait_for_timeout(800)

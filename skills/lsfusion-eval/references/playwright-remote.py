@@ -4,16 +4,18 @@ Reference: drive a deployed lsFusion install via Playwright.
 This is a copy-and-adapt template for visually verifying a deployed lsFusion
 server (any URL, local or remote, devmode ON or OFF). Use it when:
 
-- the lsfusion-dev `verify` command isn't enough — it's local-only and takes
-  a single landing screenshot;
+- the lsfusion-dev `verify` command isn't enough — it's local-only (its
+  direct open, click-through, -Do steps and asserts stop at the dev install);
 - you need to prove to a human (not just yourself) that a feature looks
   right end-to-end on the deployed app — screenshots of the actual rendered
   UI are unambiguous in a way that API counts are not.
 
 Prereqs:
 - Python 3.9+
-- `pip install playwright && python -m playwright install chromium`
-  (one-time; lsfusion-dev's verify does the same install if you ran it before)
+- `pip install "playwright>=1.51" && python -m playwright install chromium`
+  (one-time; lsfusion-dev's verify installs playwright too, but an OLDER
+  install needs `pip install -U "playwright>=1.51"`: open_detail_via_edit()
+  uses Locator.filter(visible=True), added in 1.51)
 
 Run:
     python playwright-remote.py
@@ -30,8 +32,13 @@ wrote it — leave them in):
 - After clicking anything that opens a card, lsFusion paints a `Loading`
   overlay BEFORE the form renders. A naive `wait_for_timeout(2000)`
   screenshots the spinner; wait for the overlay to detach first.
-- Grid rows do NOT open the detail card on double-click. Click the row to
-  select it, then click the `Edit` toolbar button at the bottom-right.
+- A double-click on a grid row is NOT "open the card": the platform decides
+  per cell (editable -> in-place editor; read-only + class edit form -> the
+  card; CHANGEMOUSE -> that action; CUSTOM -> whatever it renders). Open a
+  card deterministically with `open_by_script()` (SHOW EDIT ... DOCKED), or
+  select the row and click the form's own `Edit` toolbar action, scoped to
+  that form (`open_detail_via_edit(page, form_sid=..., caption=...)`), and
+  prove it with `visible_forms()` before/after.
 - If a column you care about isn't on-screen (lsFusion grids scroll
   horizontally), focus the grid and press `End` a few times.
 - Navigator items show a tooltip on hover (`sID:`, `Path:`) that LINGERS
@@ -43,6 +50,7 @@ wrote it — leave them in):
 """
 import sys
 from pathlib import Path
+from urllib.parse import quote, urljoin
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # --- Adapt these for your target ----------------------------------------------
@@ -94,30 +102,131 @@ def login(page):
         return False                                # devmode ON — no form
 
 
-def open_detail_via_edit(page):
-    """Open the detail card for whatever row is currently selected in a grid.
-    lsFusion does NOT respond to double-click — the canonical action is the
-    'Edit' button in the form's bottom toolbar. Waits for the 'Loading'
-    overlay to detach before returning."""
-    # Try button selectors first (more specific), then a text fallback
-    clicked = False
-    for sel in ['button:has-text("Edit")', 'div[role="button"]:has-text("Edit")']:
-        btn = page.locator(sel).first
-        if btn.count() > 0:
-            btn.click(timeout=3000)
-            clicked = True
-            break
-    if not clicked:
-        page.get_by_text("Edit", exact=True).last.click(timeout=3000)
-
-    # Wait for the loading overlay to vanish. The text 'Loading' may itself
-    # be localized — wrap in a try and fall back to a generous fixed wait.
+def wait_loading(page, timeout=15000):
+    """Wait for lsFusion's `Loading` overlay to detach, then for network idle
+    and a final paint. The word may be localized — the try falls back to the
+    fixed waits so the script still produces output (maybe of the spinner)."""
     try:
-        page.wait_for_selector("text=Loading", state="detached", timeout=15000)
+        page.wait_for_selector("text=Loading", state="detached", timeout=timeout)
     except PWTimeout:
         pass
-    page.wait_for_load_state("networkidle", timeout=15000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PWTimeout:
+        pass  # a live app (websocket, polling) may never go idle - not a failure
     page.wait_for_timeout(2000)  # final paint
+
+
+def new_forms(before, after):
+    """sIDs with MORE visible instances after than before - instance-aware,
+    so a second window of a form that was already open (same sID) counts."""
+    return [s for s in dict.fromkeys(after) if after.count(s) > before.count(s)]
+
+
+def visible_forms(page):
+    """sIDs of the forms on screen. Every form layout root carries
+    lsfusion-form="<sID>" (the canonical name for named forms, _FORM_<n> for
+    auto-generated EDIT/LIST forms); inactive docked forms stay in the DOM
+    hidden, and a form nested inside another one (EMBEDDED) is content of its
+    parent. Snapshot before and after an action to PROVE a form opened — a
+    new sID is an opened form; a screenshot alone proves nothing."""
+    return page.evaluate("""() => {
+      const vis = el => { const r = el.getClientRects()[0];
+                          const cs = getComputedStyle(el);
+                          return !!r && r.width > 0.5 && r.height > 0.5 &&
+                                 cs.visibility !== 'hidden' && cs.display !== 'none'; };
+      const out = [];
+      for (const el of document.querySelectorAll('[lsfusion-form]')) {
+        if (el.parentElement && el.parentElement.closest('[lsfusion-form]')) continue;
+        if (vis(el)) out.push(el.getAttribute('lsfusion-form') || '');
+      }
+      return out;
+    }""")
+
+
+def open_by_script(page, script, timeout=60000):
+    """Open a form DIRECTLY: navigate to <base>/eval/action?script=<action>
+    (form-open-url.md next to this file). The server pushes the action as a
+    notification — 302 to /push-notification, the service worker (registered
+    by the first visit of the base URL in this context) hands it to the app,
+    the tab lands on /main with the form open, exactly as the user would see
+    it. Parameterizable down to one object's edit card and independent of
+    what any cell does on double-click:
+        open_by_script(page, "FOR Shop.name(Shop.Item i) = 'Coffee beans' "
+                             "DO SHOW EDIT Shop.Item = i DOCKED;")
+    Use DOCKED (production layout) and namespace-qualified names. The page
+    reloads, so forms opened earlier are gone; the app's beforeunload confirm
+    is blocked by headless Chromium (no user gesture) — expected. A script
+    error comes back as a 500 page instead of the redirect: its body is the
+    compile error. Returns the sIDs of the forms on screen afterwards - an
+    empty list means nothing rendered within the readiness window, so check
+    it, don't just screenshot."""
+    base = URL if URL.endswith("/") else URL + "/"
+    page.goto(urljoin(base, "eval/action") + "?script=" + quote(script),
+              wait_until="load", timeout=timeout)
+    try:
+        page.wait_for_url("**/main*", timeout=15000)
+    except PWTimeout:
+        if "/push-notification" in page.url:
+            # virgin context: the worker was not yet in control — one reload
+            page.reload(wait_until="load", timeout=timeout)
+            page.wait_for_url("**/main*", timeout=30000)
+        else:
+            # still on /eval/action — the script failed, the body says why
+            raise RuntimeError("open_by_script: " + page.inner_text("body")[:400])
+    # the first open of a form after a restart builds it lazily (10–40 s);
+    # readiness = a visible form root, not network idle (a live app may
+    # never go idle)
+    wait_loading(page, timeout=45000)
+    try:
+        page.wait_for_selector("[lsfusion-form]", state="visible", timeout=45000)
+    except PWTimeout:
+        pass
+    return visible_forms(page)
+
+
+def open_detail_via_edit(page, form_sid=None, caption="Edit", within=None):
+    """Open the card of the row currently selected in a grid through the
+    form's own `Edit` toolbar action (the EDIT property of that form).
+    form_sid scopes the search to that form's layout root
+    ([lsfusion-form="<sID>"]) so another form's button is never clicked;
+    within= narrows it further to a selector INSIDE the form (a form with
+    several grids has several Edit actions - the first one is not "the"
+    one). caption is the action's VISIBLE, localized caption ('Edit',
+    'Редактировать', 'Edytuj', ...) — read it off a screenshot, don't assume
+    English; it must match EXACTLY ('Edit settings' is not 'Edit') and
+    UNIQUELY among the visible controls of the scope — two matches raise
+    instead of guessing. Prefer open_by_script() when the card is all you
+    need: no row selection, no captions, no dependence on the grid. Returns
+    the sIDs of the forms that appeared (instance-aware)."""
+    before = visible_forms(page)
+    scope = page.locator(f'[lsfusion-form="{form_sid}"]') if form_sid else page
+    if within:
+        scope = scope.locator(within)
+    # role-based: native <button>s and button-like divs alike, by exact
+    # accessible name - no localized caption interpolated into a selector.
+    # One strict, UNINDEXED locator: its count is validated and the same
+    # locator is clicked, so a button that appears between the check and the
+    # click makes Playwright's strict mode refuse instead of clicking the
+    # wrong one (an indexed .all()[0] would silently drift).
+    # filter(visible=True) needs Playwright >= 1.51 (see Prereqs).
+    btn = scope.get_by_role("button", name=caption, exact=True).filter(visible=True)
+    if btn.count() == 0:
+        btn = scope.get_by_text(caption, exact=True).filter(visible=True)
+    n = btn.count()
+    if n != 1:
+        raise RuntimeError(
+            f"open_detail_via_edit: {n} visible '{caption}' controls in "
+            f"scope (form_sid={form_sid!r}, within={within!r}) - narrow the scope "
+            "with within=<container selector> or pass the exact localized caption; "
+            "nothing was clicked")
+    btn.click(timeout=3000)   # strict: refuses if it no longer resolves to one
+    wait_loading(page)
+    opened = new_forms(before, visible_forms(page))
+    if not opened:
+        print(f"  !! '{caption}' clicked but no new form is on screen — wrong "
+              "caption or scope? read the screenshot, don't trust the click")
+    return opened
 
 
 def scroll_grid_right(page, anchor_text, times=15):
@@ -171,9 +280,16 @@ def navigate_and_capture():
             shot(page, "03b-items-list-rightcols.png")
 
             print("[4] open one item card")
+            # Route A — the list form's own Edit action, scoped to that form
+            # (its sID, e.g. 'Shop.items') and its localized caption; add
+            # within='<container selector>' when the form has several grids:
             page.get_by_text(anchor_cell, exact=True).first.click()
             page.wait_for_timeout(300)
-            open_detail_via_edit(page)
+            opened = open_detail_via_edit(page, form_sid="<Module.listForm>", caption="Edit")
+            # Route B — no gesture at all, the card by object (parameterized):
+            #   opened = open_by_script(page, "FOR Shop.name(Shop.Item i) = "
+            #       "'<visible row label>' DO SHOW EDIT Shop.Item = i DOCKED;")
+            print(f"  forms opened: {opened}")
             shot(page, "04-item-detail.png")
             page.keyboard.press("Escape")
             page.wait_for_timeout(800)

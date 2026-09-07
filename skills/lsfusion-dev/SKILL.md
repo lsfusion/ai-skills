@@ -212,7 +212,7 @@ a running `verify -Session` browser, or anything else that happened before.
 | `keep-running` | Exempt this project from the **session-end auto-stop** (the plugin's hooks stop the servers a Claude session started ~60 min after that session's process ended without being resumed — see [Servers, sessions and other processes on the box](#servers-sessions-and-other-processes-on-the-box)). `-Off` re-enables it. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server); `Auto-stop: OFF` when `keep-running` is set. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<row text>"` double-clicks a grid row to open its edit card (→ `verify-dblclick.png`). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption; `screenshot:<name>` saves `<stem>-<name>.png` mid-chain, so one chain documents several screens) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-OutPrefix <stem>` renames the whole artifact set of a run (`<stem>-open.png`, …) so a batch loop over several forms keeps per-form evidence instead of overwriting `verify-*.png` each run. `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. `<stem>-console.txt` also carries **uncaught page exceptions** (`[pageerror]` lines with `resource:line:col` — e.g. a web resource that died while loading), reported as their own `[WARN]` lines and tied to the `'X' is not a component` they cause; on any **load timeout** (navigation, login page, direct open, a stuck `Loading` indicator, the watchdog kill) the report appends what `tomcat/logs/gwtlog-err.log` — the web client's error log — received during the run. |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<cell text>"` double-clicks that grid cell **as a gesture** and reports what the platform did with it — opened form / in-place editor / no reaction (→ `verify-dblclick.png`; by default an editable cell starts its in-place editor and only a read-only cell opens the object's edit form, while a `CHANGEMOUSE 'DBLCLK'` binding or a `CUSTOM` renderer overrides that — assert a card with `-DoubleClickExpect`, or open it deterministically with `-OpenScript "… SHOW EDIT <Class> = o DOCKED;"`, see step 5). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption; `screenshot:<name>` saves `<stem>-<name>.png` mid-chain, so one chain documents several screens) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-OutPrefix <stem>` renames the whole artifact set of a run (`<stem>-open.png`, …) so a batch loop over several forms keeps per-form evidence instead of overwriting `verify-*.png` each run. `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. `<stem>-console.txt` also carries **uncaught page exceptions** (`[pageerror]` lines with `resource:line:col` — e.g. a web resource that died while loading), reported as their own `[WARN]` lines and tied to the `'X' is not a component` they cause; on any **load timeout** (navigation, login page, direct open, a stuck `Loading` indicator, the watchdog kill) the report appends what `tomcat/logs/gwtlog-err.log` — the web client's error log — received during the run. |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. Exit codes are trustworthy: **0** = HTTP success, **1** = request failed (HTTP error / connection refused), **3** = client timeout (no verdict — deliberately distinct from 1). |
 | `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and gives each file one of four verdicts: **`[OK]`** (eval compiled it — syntax and names proven), **`[FAIL]`** (a real error in the code: parse error, unknown name, unclosed META, missing header), **`[SKIP]`** (eval *cannot* check it — a limitation of the pre-check, never an error: a construct the eval module refuses such as `CLASS` / `WHEN` / `CONSTRAINT`, one that crashes its compiler such as `EXTEND FORM`, a name declared in another project file the server has not loaded, an all-META/`EXTEND FORM` file, a file declaring `run()`), each `[SKIP]` followed by **`[NEEDS DRYRUN]`** — the full module loader checks it, and the summary prints the exact scoped `dryrun -TopModule "…"` command. The summary is red and the exit code 1 **only for `[FAIL]`**; a run whose only findings are pre-check limitations ends in `[NEEDS DRYRUN]` with exit 0 (exit 3 = no verdict, the endpoint could not be used). New-module code is mostly refused declarations, so iterate on the scoped `dryrun` there and keep precheck for files eval can fully check. See the `precheck` part of step 4. |
@@ -232,7 +232,7 @@ persisted),
 re-download the client war at the same version — the `-SNAPSHOT`
 war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-OpenScriptFile` / `-OpenExpect` (verify: direct form open), `-Click`,
-`-DoubleClick`, `-OutPrefix` (verify: per-run artifact filename stem — batch
+`-DoubleClick` / `-DoubleClickExpect`, `-OutPrefix` (verify: per-run artifact filename stem — batch
 runs keep per-form screenshots), `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
 `-Do` (verify: generic click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text
 steps by Playwright selector, first visible match — see step 5), `-DoFile`
@@ -1362,19 +1362,35 @@ checking the unit-test output.
 
    **To test the user's path, use `-Click` / `-DoubleClick`** — reach for
    them when the *navigation itself* is what you're verifying (the navigator
-   entry exists, is reachable, opens the right form), or to compose with a
-   direct open (`-OpenScript` to open a list form, then `-DoubleClick` a row
-   to open its card like a user would):
+   entry exists, is reachable, opens the right form), or when the user's
+   double-click gesture on a grid cell is what you're testing (`-OpenScript`
+   or `-Click` brings up the list form, `-DoubleClick` double-clicks a cell
+   there):
 
    ```
    lsfdev.ps1 verify -Click "Master data > Items"
-   lsfdev.ps1 verify -Click "Master data > Items" -DoubleClick "Coffee beans"
+   lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -DoubleClick "Coffee beans" -DoubleClickExpect "Shop.item"
    ```
 
    `-Click` clicks navigator entries by their visible text (chain with `>`
-   for tab-then-entry) → `verify-click.png`; `-DoubleClick` then
-   double-clicks the grid row containing that text and screenshots its edit
-   card → `verify-dblclick.png`.
+   for tab-then-entry) → `verify-click.png`. **`-DoubleClick` is a gesture,
+   not "open the card"** — what a double-click does is decided per cell by
+   the platform (web client `GKeyStroke.isEditObjectEvent`, measured on 7.0):
+   an **editable** cell starts its **in-place editor** (the `CHANGE` event)
+   and opens no form; a **read-only** cell of an object whose class has an
+   edit form (declared `EDIT` form or the auto-generated one) opens that
+   form (`editObject`); a property with `CHANGEMOUSE 'DBLCLK'` runs *that*
+   action instead, editable or not; a `CUSTOM` renderer decides itself; in a `DIALOG` a double-click
+   is *OK* (`System.formOk` is bound to it). So `verify` **classifies the
+   outcome** after the gesture — `opened form <sID> (active tab '…')`,
+   `in-place editor`, or `no visible reaction` — screenshots it →
+   `verify-dblclick.png`, and never fails on the outcome by itself. **To
+   assert that a card opened, add `-DoubleClickExpect "<form sID | tab
+   caption | text inside the card>"`** — it passes only on a form the
+   double-click opened (unmet = failed check, exit 2). When the card itself
+   is what you need to see, skip the gesture: the direct open `-OpenScript
+   "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i
+   DOCKED;" -OpenExpect "…"` opens it regardless of the list's cell state.
 
    **To drive elements `-Click` cannot reach — buttons/inputs inside `CUSTOM`
    (React) components, filters, dialogs — pass `-Do`**: an ordered list of
@@ -1503,7 +1519,8 @@ checking the unit-test output.
    **`verify` is strict by default: exit 0 means every requested check
    passed.** Any failed check — `-OpenExpect` not found or found on the
    wrong form, a WARNed open check, a failed `-Click`/`-DoubleClick`/`-Do`
-   step (assertions included), a login failure, a Playwright error — exits
+   step (assertions included), an unmet `-DoubleClickExpect`, a login
+   failure, a Playwright error — exits
    **2**, so scripts and CI can trust `$LASTEXITCODE` instead of parsing
    `[WARN]` lines. `-AllowWarnings` restores report-only exit 0; tool-level
    errors (missing python, bad usage) exit 1 either way. Browser console

@@ -29,6 +29,7 @@ param(
     [string]$OpenExpect = "",
     [string]$Click = "",
     [string]$DoubleClick = "",
+    [string]$DoubleClickExpect = "",
     [string[]]$Do = @(),
     [string]$DoFile = "",
     [string]$OutPrefix = "",
@@ -2919,7 +2920,20 @@ function Cmd-Verify {
     }
 
     if ($Click) { Info "Click  : '$Click' (navigator click-through before the final screenshot)" }
-    if ($DoubleClick) { Info "DblClick: '$DoubleClick' (double-click a grid row to open its edit card)" }
+    # Whitespace-only values count as absent on BOTH sides of the boundary:
+    # python strips them, so a blank -DoubleClick next to a -DoubleClickExpect
+    # would pass a bare truthiness guard here and then skip the whole
+    # double-click report - assertion included - for a strict exit 0.
+    $DoubleClick = "$DoubleClick".Trim()
+    $DoubleClickExpect = "$DoubleClickExpect".Trim()
+    if ($DoubleClick) {
+        Info "DblClick: '$DoubleClick' (double-click that grid cell - a GESTURE; what it does is decided per cell by the platform, the report classifies the outcome: opened form / in-place editor / no reaction)"
+        if ($DoubleClickExpect) { Info "Expect : '$DoubleClickExpect' (a form the double-click must open: its sID, its tab caption, or text inside it)" }
+    } elseif ($DoubleClickExpect) {
+        # Same rule as -OpenExpect: an assertion nobody evaluates must not
+        # pass strict verify silently.
+        throw "-DoubleClickExpect requires -DoubleClick (it asserts on the form the double-click opens)."
+    }
     # -Do steps: the repeatable parameter plus -DoFile (a JSON array OR one
     # step per line with '#' comments). The file form survives every quoting
     # layer - a nested 'powershell -Command' collapses array commas into ONE
@@ -2975,7 +2989,7 @@ function Cmd-Verify {
     $argSpec = @{
         url = "$target"; output_dir = "$StateDir"
         user = "$vUser"; password = "$vPass"
-        click = "$Click"; double_click = "$DoubleClick"
+        click = "$Click"; double_click = "$DoubleClick"; double_click_expect = "$DoubleClickExpect"
         open_script_file = "$openFileArg"; open_expect = "$OpenExpect"
         viewport_width = [int]$ViewportWidth; viewport_height = [int]$ViewportHeight
         locale = "$Locale"; session_port = [int]$sessionPort
@@ -3327,7 +3341,42 @@ function Cmd-Verify {
                 default       { Warn "Row found but never became clickable - check $dblShot." }
             }
         } elseif ($r.double_click.target) {
-            Ok "Double-clicked row '$($r.double_click.target)' - edit card in $dblShot"
+            # The gesture landed. What lsFusion did with it is decided per
+            # cell (web client GKeyStroke.isEditObjectEvent): an EDITABLE
+            # cell starts its in-place editor (CHANGE), a read-only cell of
+            # an object whose class has an edit form opens that form
+            # (editObject), a CHANGEMOUSE binding runs its own action, a
+            # CUSTOM renderer decides itself. Measured 2026-09-07: the same
+            # call opened an editor on an editable grid and the auto EDIT
+            # form on that grid shown READONLY - so the outcome is reported,
+            # never assumed.
+            $dc = $r.double_click
+            $opened = @($dc.opened_forms | Where-Object { $_ })
+            $tabNote = if ($dc.active_tab) { " (active tab '$($dc.active_tab)')" } else { "" }
+            switch ("$($dc.outcome)") {
+                'form' {
+                    $what = if ($opened.Count) { "form $($opened -join ', ')" } else { "a form instance (sID unreadable)" }
+                    Ok "Double-click on '$($dc.target)' opened $what$tabNote - $dblShot"
+                }
+                'editor' {
+                    Warn "Double-click on '$($dc.target)' opened an IN-PLACE EDITOR ($($dc.editor)) - NO form opened. The cell is editable, so lsFusion starts cell editing there; a double-click opens the object's edit form only on a read-only cell (or through an explicit CHANGEMOUSE binding). For a deterministic card open use -OpenScript ""FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;"" with -OpenExpect."
+                }
+                'none' {
+                    Warn "Double-click on '$($dc.target)' produced NO visible reaction (no form opened, no editor) - a CUSTOM renderer, an action without a double-click binding, or a cell the platform ignores; check $dblShot."
+                }
+                default {
+                    Warn "Double-click on '$($dc.target)' was delivered, but the outcome could not be classified (form state unreadable) - judge $dblShot yourself."
+                }
+            }
+            if ($dc.expect) {
+                if ($dc.expect_found) {
+                    Ok "Double-click expect: '$($dc.expect)' found ($($dc.expect_where)) on the form the double-click opened."
+                } else {
+                    $hint = if ($dc.expect_found_elsewhere) { " The text IS on the page, but not on a form this double-click opened - that does not count." } else { "" }
+                    Warn "Double-click expect: '$($dc.expect)' NOT satisfied - no form opened by the double-click has that sID, tab caption, or text.$hint"
+                    $checkFails.Add("double-click expect '$($dc.expect)' not satisfied")
+                }
+            }
         }
         if ($r.double_click.forced) {
             Warn "The double-click needed FORCE (an overlay was intercepting; hit-target check bypassed) - trust $dblShot for what actually opened."
@@ -4568,8 +4617,11 @@ version and dies on every plugin update.
   log            Print the server log tail and a verdict.
   verify         Playwright (headless Chromium) screenshot + DOM dump of the web UI.
                  -OpenScript "SHOW <form> DOCKED;" opens a form directly (no
-                 navigator clicking, parameterizable); -Click/-DoubleClick
-                 click through the navigator like a user would. With devmode
+                 navigator clicking, parameterizable); -Click clicks through
+                 the navigator like a user would; -DoubleClick double-clicks
+                 a grid cell and classifies what the platform did with it
+                 (opened form / in-place editor / no reaction) - assert a
+                 card with -DoubleClickExpect. With devmode
                  off it logs in through the real form - -User/-Password picks
                  the account (default: admin, empty password).
                  The WHOLE run is bounded by a watchdog (default 180 s;
@@ -4741,11 +4793,26 @@ Common options:
                         (e.g. -Click "Master data > Items"). Output goes to
                         verify-click.png (stem follows -OutPrefix); first
                         form open gets generous waits.
-  -DoubleClick <text>   'verify' only: after -Click navigation, double-click a
-                        grid row by visible cell text to open its edit card,
-                        then screenshot it (e.g. -DoubleClick "Coffee beans").
-                        Output goes to verify-dblclick.png (stem follows
-                        -OutPrefix).
+  -DoubleClick <text>   'verify' only: after the -OpenScript open / -Click
+                        navigation, double-click the grid cell with this
+                        visible text (e.g. -DoubleClick "Coffee beans") and
+                        screenshot the result -> verify-dblclick.png (stem
+                        follows -OutPrefix). A GESTURE, not "open the card":
+                        the platform decides per cell - an editable cell
+                        starts its in-place editor, a read-only cell of an
+                        object whose class has an edit form opens that form,
+                        a CHANGEMOUSE binding runs its action, a CUSTOM
+                        renderer decides itself. The report classifies the
+                        outcome (opened form <sID> / in-place editor / no
+                        reaction) and never fails on it by itself.
+  -DoubleClickExpect <text> 'verify': with -DoubleClick, assert that the
+                        double-click OPENED a form: the form's sID, its tab
+                        caption, or text inside it (visible text or a
+                        visible input's value). Unmet = failed check (exit 2
+                        unless -AllowWarnings). A deterministic card open
+                        needs no gesture at all: -OpenScript "FOR
+                        Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT
+                        Shop.Item = i DOCKED;" with -OpenExpect.
   -Do <step>[,<step>]   'verify' only: generic interaction steps, run in order
                         AFTER the -Click/-DoubleClick navigation - the way to
                         reach buttons/inputs inside CUSTOM (React) components

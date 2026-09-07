@@ -820,10 +820,25 @@ before writing your own.
   wait `networkidle` plus a 2–3 s settle for the SPA to render the
   navigator. When devmode is ON, there's no form — your fill calls will
   time out; treat that as a no-op, not a failure.
-- **Grid rows do NOT open the detail card on double-click.** The canonical
-  action is the `Edit` toolbar button in the bottom-right of the grid
-  toolbar, after selecting the row. New objects come from the `Service` /
-  `Product` / similar `+ Add` buttons next to `Edit`.
+- **A double-click on a grid row is not "open the card".** The platform
+  decides per cell: an *editable* cell starts its in-place editor (no form);
+  a *read-only* cell of an object whose class has an edit form (declared or
+  auto-generated) opens that form; a property with `CHANGEMOUSE 'DBLCLK'`
+  runs its own action; a `CUSTOM` renderer decides itself; in a dialog a
+  double-click is *OK*. Never script it as the route to a card, and never
+  assume it does nothing either — check what opened: every form layout root
+  carries `lsfusion-form="<sID>"`, a new visible one after the gesture is an
+  opened form (`visible_forms()` in the template). Deterministic route: the
+  direct open `SHOW EDIT <Class> = <obj> DOCKED` (URL mechanism above,
+  `open_by_script()` in the template) — parameterized, locale-free. Toolbar
+  route: select the row, then click the form's `Edit` action **inside that
+  form's subtree** (`[lsfusion-form="<sID>"]`) by its *localized* caption —
+  `open_detail_via_edit(page, form_sid=…, caption=…, within=…)` in the
+  template clicks the ONE visible control whose caption matches exactly
+  inside that scope (two matches raise instead of guessing — a form with
+  several grids needs `within=` narrowed to the grid's container); a
+  page-wide `button:has-text("Edit")` hits the first English `Edit` of any
+  form on the page. New objects come from the `+ Add` buttons next to it.
 - **The `Loading` overlay between actions.** After clicking `Edit`, lsFusion
   shows a `Loading` spinner before the card paints. A naive
   `wait_for_timeout(2000)` captures the spinner, not the form. Wait for the
