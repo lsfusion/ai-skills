@@ -58,6 +58,7 @@ param(
     [string]$Branch = "",
     [switch]$Force,
     [switch]$NoWeb,
+    [switch]$Web,
     [switch]$FullStart,
     [switch]$RefreshWar,
     # Run the server WITHOUT devmode: real login form in the web UI,
@@ -691,26 +692,6 @@ function Get-ZipBuildDate([string]$path) {
     } catch { return $null }
 }
 
-# Whether this platform build understands settings.dryRun: checks the Spring
-# wiring for it (<entry key="dryRun" .../> in the jar's root lsfusion.xml).
-# On a build without it the -D flag is silently IGNORED and a "dry run"
-# would come up as a REAL server - against the project's actual database and
-# ports. $null = could not inspect (rely on the runtime guard then).
-function Test-JarSupportsDryRun([string]$jarPath) {
-    if (-not ($jarPath -and (Test-Path $jarPath))) { return $null }
-    try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
-        try {
-            $entry = $zip.GetEntry("lsfusion.xml")
-            if (-not $entry) { return $null }
-            $reader = New-Object System.IO.StreamReader($entry.Open())
-            try { $xmlText = $reader.ReadToEnd() } finally { $reader.Dispose() }
-            return [bool]($xmlText -match 'key="dryRun"')
-        } finally { $zip.Dispose() }
-    } catch { return $null }
-}
-
 # The server jar actually in use: the Maven-resolved platform server artifact
 # (from the cached dependency classpath) in a Maven project, else the
 # lsfusion-server-<ver>.jar that setup downloaded. $null when not resolvable
@@ -1002,6 +983,39 @@ function Stop-Tracked([string]$pidFile, [int[]]$ports, [string]$label) {
     # "Previous application server|Tomcat stopped|was not running" in the tool
     # output as proof that a start/restart really touched this project's processes.
     if ($killed) { Ok "$label stopped." } else { Info "$label was not running." }
+}
+
+# Whether this project's Tomcat is up: its tracked PID alive, the web port
+# open and attributable to it (or ownership not verifiable) - the same
+# positive-ownership rule 'status' applies.
+function Test-TomcatUp($cfg) {
+    $tPid = 0
+    if (Test-Path $TomcatPid) { [int]::TryParse((Get-Content $TomcatPid -Raw -Encoding UTF8).Trim(), [ref]$tPid) | Out-Null }
+    if (-not (Process-Alive $tPid)) { return $false }
+    if (-not (Test-PortOpen $cfg.webPort)) { return $false }
+    $owners = @(Get-PortPids $cfg.webPort)
+    return (($owners -contains $tPid) -or -not $owners.Count)
+}
+
+# After an application-server-only restart: Tomcat was left running and the
+# web client reconnects to the new server by itself - confirm it still
+# answers, and say what an open browser tab needs (a reload: the previous
+# server's sessions are gone).
+function Confirm-WebAfterRestart($cfg) {
+    Head "Web client (Tomcat) left running"
+    $webUrl = Get-WebUrl $cfg
+    $code = 0
+    foreach ($try in 1..3) {
+        $code = Get-HttpProbeStatus $webUrl
+        if ($code -ge 200 -and $code -lt 400) { break }
+        Start-Sleep -Seconds 2
+    }
+    if ($code -ge 200 -and $code -lt 400) {
+        Ok "Web client still up: $webUrl - it reconnects to the restarted application server; reload any open browser tab (the previous server's sessions are gone)."
+        Info "Tomcat itself is restarted only by 'restart -Web' (after setup -RefreshWar or a changed -TomcatOpts / -WebPort) - never needed for .lsf edits."
+    } else {
+        Warn "Web client at $webUrl did not answer the probe (HTTP $code) - advisory only (the application server did restart, exit code unaffected): 'status' re-checks in a moment; 'restart -Web' restarts Tomcat as well."
+    }
 }
 
 # Start a JVM DETACHED from this shell's process tree, via the short-lived
@@ -2133,22 +2147,6 @@ function Cmd-DryRun {
     Report-ProjectLsfFiles
     $cp = Build-ServerClasspath $cfg $mode $java ".lsfusion-dev\dryrun-classes"
 
-    # Version gate: refuse to launch when the build provably lacks dryRun -
-    # an ignored flag would boot a REAL server right into the project's
-    # database (and collide with a running instance on the same ports).
-    $jarPath = if ($mode.Jar) { $mode.Jar } else { Get-ResolvedServerJar $cfg }
-    $support = Test-JarSupportsDryRun $jarPath
-    if ($support -eq $true) {
-        Info "Platform build supports dryRun (verified in the server jar)."
-    } elseif ($support -eq $false) {
-        Bad "This platform build does not support settings.dryRun - update the platform to a current 7.0-SNAPSHOT."
-        if ($mode.UseMaven) { Info "Update the Maven-resolved snapshot (mvn -U -DskipTests compile), then re-run dryrun." }
-        else { Info "Refresh the downloaded jar: delete '$jarPath' and re-run setup (it refetches missing artifacts)." }
-        throw "dry run not supported by this platform build (the flag would be silently ignored and a real server would start)."
-    } else {
-        Warn "Could not inspect the server jar for dryRun support - relying on the runtime guard (the run is killed if it starts for real)."
-    }
-
     # Top module scope: -TopModule forces logics.topModule for THIS run only
     # (a -D outranks the project's lsfusion.properties), so only that
     # module's REQUIRE closure (+ system modules) is loaded and checked -
@@ -2211,23 +2209,13 @@ function Cmd-DryRun {
     $proc.Id | Set-Content $dryPidFile
     Info "PID $($proc.Id). Waiting up to $Timeout s for the verdict..."
 
+    # The dry-run JVM exits on its own (0 = OK, nonzero = failed); the loop
+    # only bounds the wait.
     $deadline = (Get-Date).AddSeconds($Timeout)
     $verdict = "timeout"
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 2
         if ($proc.HasExited) { $verdict = "exited"; break }
-        # Runtime guard (backstop for an uninspectable jar): a platform that
-        # ignores the flag boots a real server - kill it the moment the
-        # startup marker appears instead of letting it run.
-        $log = (Read-FileText $dryOut) + "`n" + (Read-FileText $dryErr)
-        if ($log -match "Server has successfully started") { $verdict = "real-start"; break }
-        # Backstop: a platform build that DOES connect to PostgreSQL during
-        # the logic phase turns an unreachable server into an ENDLESS
-        # once-a-second retry loop (source: only SQLSTATE 08001/57P03
-        # retry; other connect errors abort startup on their own). Diagnose
-        # in seconds, not minutes; a current build opens no DB connection,
-        # so this never fires there.
-        if (@([regex]::Matches($log, "ERROR StartLogger - (Connection to .* refused|The connection attempt failed)")).Count -ge 3) { $verdict = "db-unreachable"; break }
     }
     # The 2 s poll granularity can time the loop out in the same tick the
     # JVM finished - prefer the real outcome over a spurious timeout.
@@ -2241,17 +2229,6 @@ function Cmd-DryRun {
     $outText = Read-FileText $dryOut
     $tailOut = Tail-Text $outText $Lines
     $tailErr = Tail-Text (Read-FileText $dryErr) 30
-    if ($verdict -eq "real-start") {
-        Bad "The platform IGNORED settings.dryRun and started a REAL server - it has been killed (PID $($proc.Id))."
-        Info "This platform build does not support dryRun. Update the platform to a current 7.0-SNAPSHOT, or validate via precheck + restart."
-        exit 1
-    }
-    if ($verdict -eq "db-unreachable") {
-        Bad "PostgreSQL is unreachable - the dry-run JVM has been killed (this platform build would retry the connection forever)."
-        $tailOut | Select-Object -Last 3 | ForEach-Object { Write-Host "    $_" }
-        Info "This platform build still connects to the DB during a dry run. Best fix: update the platform to a current 7.0-SNAPSHOT (dry runs then touch no DB at all); otherwise fix db.server in conf/settings.properties or start PostgreSQL, and re-run."
-        exit 1
-    }
     if ($verdict -eq "timeout") {
         Warn "No verdict within $Timeout s - the dry-run JVM has been killed. Recent log:"
         $tailOut | ForEach-Object { Write-Host "    $_" }
@@ -2275,11 +2252,11 @@ function Cmd-DryRun {
     } else {
         # A logic (.lsf) failure always carries the compiler's '[error]:'
         # block; a nonzero exit WITHOUT it is some other startup failure
-        # (DB auth thrown by the adapter, OOM, a platform bug) - don't
-        # misbrand that as a code error.
+        # (a -TopModule name that does not exist, OOM, a platform bug) -
+        # don't misbrand that as a code error.
         $logicFail = $outText -match '\[error\]:'
         if ($logicFail) { Bad "Dry run FAILED (exit $($proc.ExitCode)) - the logic does not compile/check. Error:" }
-        else { Bad "Dry run FAILED (exit $($proc.ExitCode)) without a compiler error - read the exception below (typical: a -TopModule name that does not exist, DB auth rejected, out of memory, a platform issue). Log:" }
+        else { Bad "Dry run FAILED (exit $($proc.ExitCode)) without a compiler error - read the exception below (typical: a -TopModule name that does not exist, out of memory, a platform issue). Log:" }
         # Show from just before the first ERROR line (the .lsf error text with
         # its file:line:col) and drop the startup preamble noise - the logged
         # 'Class path:' line alone is tens of KB (it is in dryrun-cmd.txt).
@@ -2294,26 +2271,10 @@ function Cmd-DryRun {
         }
         Write-Host ""
         if ($logicFail) {
-            # Current builds batch every semantic error into one dry run
-            # (settings.dryRun implies batchScriptErrors - measured: three
-            # planted name errors across two modules, all in one run); the
-            # "first error only" trailer marks an older build that still
-            # stops at the first one.
-            if ($outText -match 'Subsequent errors \(if any\) could not be found|Only the first error is reported') {
-                Info "This platform build is OUTDATED: it reports ONE semantic error per run (parse errors come batched) - fix and re-run. Current 7.0-SNAPSHOT builds report every semantic error in one dry run; update the platform. Sub-second single-file linting: precheck."
-            } else {
-                Info "Every semantic error the load hit is listed above (a dry run batches them, unlike a restart) - fix them all, then re-run. Sub-second single-file linting: precheck."
-            }
-        }
-        elseif ($TopModule -and $TopModule.Contains(',') -and $outText -match "Module '[^']*,[^']*' not found") {
-            # A stale build predating comma-list topModule reads the list as
-            # ONE module name (measured). The latest 7.0-SNAPSHOT is the
-            # assumed target, so the fix is updating the platform;
-            # per-module runs bridge the gap until then.
-            Info "This platform build is OUTDATED: it predates comma-separated topModule and read the whole list as ONE module name. Update the platform:"
-            if ($mode.UseMaven) { Info "  mvn -U -DskipTests compile, then re-run dryrun." }
-            else { Info "  delete '$jarPath' and re-run setup (it refetches missing artifacts)." }
-            Info "Until then: re-run per module ($(@($TopModule -split ',' | ForEach-Object { "-TopModule $($_.Trim())" }) -join ' / '))."
+            # A dry run batches every semantic error (settings.dryRun implies
+            # batchScriptErrors - measured: three planted name errors across
+            # two modules, all in one run), unlike a restart.
+            Info "Every semantic error the load hit is listed above (a dry run batches them, unlike a restart) - fix them all, then re-run. Sub-second single-file linting: precheck."
         }
         exit 1
     }
@@ -3835,37 +3796,90 @@ function Get-EvalCoverage([string]$structShadow) {
     }
 }
 
-# Blank out top-level module-header statements (MODULE / REQUIRE / NAMESPACE /
-# PRIORITY): eval compiles the text as a throwaway module that already depends
-# on every loaded module, so headers are both forbidden ("missing EOF at
-# 'MODULE'") and unnecessary. Every replaced character becomes a space, so the
-# LINE:COL positions in eval's errors still match the original file. Header
-# extents are located on the comment-blanked shadow, so a ';' inside a
-# comment cannot cut a REQUIRE list short and leave residue behind.
-function Strip-ModuleHeader([string]$text) {
-    $shadow = Get-CommentBlankedShadow $text
+# Blank out top-level module-header statements (MODULE / REQUIRE /
+# NAMESPACE): eval compiles the text as a throwaway module that already
+# depends on every loaded module, so those headers are both forbidden
+# ("missing EOF at 'MODULE'") and unnecessary. PRIORITY is KEPT: the eval
+# wrapper emits "MODULE <unique>; REQUIRE <every loaded module>;" and appends
+# the text (EvalUtils.wrapScript), so a leading PRIORITY simply continues that
+# header (grammar order: MODULE, REQUIRE, PRIORITY, NAMESPACE) and eval then
+# applies the file's priority list as the module does (measured: a file
+# with 'PRIORITY AmbA' using a name declared in both AmbA and AmbB passes;
+# with the header stripped eval reported the ambiguity). NAMESPACE is not
+# kept: it would put the throwaway module's declarations into the real
+# module's namespace, next to the server's loaded copy of the same file -
+# so the module's OWN-namespace precedence (it outranks the PRIORITY list
+# at load time) is reproduced instead by -PriorityFirst <namespace>: the
+# caller passes the module's namespace when the running server has it
+# loaded, and it goes FIRST in the PRIORITY list - prepended to the kept
+# statement, or as a new one right after REQUIRE; text is only ever added
+# on a header line, so every line number below stays intact. Every
+# replaced character becomes a space, so the LINE:COL positions in eval's
+# errors still match the original file. Header extents
+# come from the leading header block (Get-ModuleHeader: an anchored scan
+# from the top of the comment-blanked shadow), so neither a ';' inside a
+# comment nor a header-looking line inside a multi-line string literal can
+# cut a REQUIRE list short, blank string content, or leave residue behind -
+# and a header keyword deeper in the file is not a header: it stays in the
+# posted text and fails eval's parse, as it fails the loader's.
+function Strip-ModuleHeader([string]$text, [string]$PriorityFirst) {
     $chars = $text.ToCharArray()
     $blanked = @{}
-    foreach ($m in [regex]::Matches($shadow, '(?m)^[ \t]*(MODULE|REQUIRE|NAMESPACE|PRIORITY)\b[^;]*;')) {
-        # Blank only a WELL-FORMED header, and only the FIRST of each kind. A
-        # malformed one (say, a REQUIRE missing its ';') makes [^;]*; swallow
-        # the next declaration too, and a duplicate header is itself illegal -
-        # blanking either would false-PASS a file the restart rejects. Left in
-        # place they fail the eval parse loudly (the precheck FAIL branch
-        # explains that hint). Full ORDER validation is deliberately not
-        # attempted: a mis-remembered ordering rule here would produce false
-        # FAILs, which cost more trust than the rare uncaught misorder.
-        $kw = $m.Groups[1].Value
+    $ident = '[A-Za-z_][A-Za-z0-9_]*'
+    $hdr = @(Get-ModuleHeader (Get-CommentBlankedShadow $text))
+    foreach ($h in $hdr) {
+        $kw = $h.Keyword
+        if ($kw -eq 'PRIORITY') { continue }   # kept on purpose - see above
+        # Blank only a WELL-FORMED statement, and only the FIRST of each
+        # kind: a malformed one (a stray token in a REQUIRE list) or a
+        # duplicate is left in place and fails the eval parse loudly (the
+        # precheck FAIL branch explains that hint) - blanking it would
+        # false-PASS a file the restart rejects. Order and duplicates are
+        # also failed by precheck before eval, on the same parse.
         if ($blanked.ContainsKey($kw)) { continue }
-        $ident = '[A-Za-z_][A-Za-z0-9_]*'
-        $bodyPattern = if ($kw -eq 'REQUIRE' -or $kw -eq 'PRIORITY') { "$ident(\s*,\s*$ident)*" } else { $ident }
-        if ($m.Value -notmatch "^\s*$kw\s+$bodyPattern\s*;\s*$") { continue }
+        $bodyPattern = if ($kw -eq 'REQUIRE') { "^$ident(\s*,\s*$ident)*$" } else { "^$ident$" }
+        if ($h.Body -notmatch $bodyPattern) { continue }
         $blanked[$kw] = $true
-        for ($i = $m.Index; $i -lt $m.Index + $m.Length; $i++) {
+        for ($i = $h.Start; $i -le $h.End; $i++) {
             if ($chars[$i] -ne [char]"`r" -and $chars[$i] -ne [char]"`n") { $chars[$i] = [char]' ' }
         }
     }
-    return -join $chars
+    $out = -join $chars
+    if ($PriorityFirst) {
+        # The own namespace goes FIRST in the PRIORITY list: prepended to
+        # the kept statement, else a new statement right after REQUIRE (or
+        # MODULE) - where the grammar wants it, before the blanked NAMESPACE.
+        $prio = @($hdr | Where-Object { $_.Keyword -eq 'PRIORITY' } | Select-Object -First 1)
+        if ($prio.Count) {
+            $out = $out.Insert($prio[0].Start + 8, " $PriorityFirst,")
+        } else {
+            $anchor = @($hdr | Where-Object { $_.Keyword -eq 'REQUIRE' -or $_.Keyword -eq 'MODULE' } | Select-Object -Last 1)
+            if ($anchor.Count) { $out = $out.Insert($anchor[0].End + 1, " PRIORITY $PriorityFirst;") }
+        }
+    }
+    return $out
+}
+
+# The leading module header block of a comment-blanked shadow: the MODULE /
+# REQUIRE / PRIORITY / NAMESPACE statements in order of appearance, read
+# from the top until the first other statement. Header statements precede
+# every declaration and carry no string literals, so an anchored scan from
+# the top can never mistake a header-looking line inside a multi-line string
+# for a header, and needs no string masking. Order and duplicates are NOT
+# judged here - the caller does (precheck fails them before eval). Each
+# statement: Keyword; Body (the trimmed text between the keyword and ';');
+# Start (index of the keyword); End (index of the ';').
+function Get-ModuleHeader([string]$shadow) {
+    $stmts = New-Object 'System.Collections.Generic.List[object]'
+    $rx = New-Object System.Text.RegularExpressions.Regex '\G\s*(MODULE|REQUIRE|PRIORITY|NAMESPACE)\b([^;]*);'
+    $pos = 0
+    while ($true) {
+        $m = $rx.Match($shadow, $pos)
+        if (-not $m.Success) { break }
+        $stmts.Add(@{ Keyword = $m.Groups[1].Value; Body = $m.Groups[2].Value.Trim(); Start = $m.Groups[1].Index; End = $m.Index + $m.Length - 1 })
+        $pos = $m.Index + $m.Length
+    }
+    return $stmts
 }
 
 # Uri.EscapeDataString on .NET Framework (PS 5.1) throws on inputs longer
@@ -3947,8 +3961,29 @@ function Cmd-Precheck {
     }
 
     $headers = Get-EvalAuthHeaders $cfg
+    # Whether a namespace is loaded on the running server - one tiny eval per
+    # distinct namespace per run, cached: "PRIORITY <ns>; run() {}" compiles
+    # iff the namespace exists ("namespace 'X' was not found in required
+    # modules" otherwise). $null = no usable answer (transport problem).
+    # Ordinal keys: namespaces are case-sensitive ('Sales' and 'sales' are
+    # two namespaces), and a PowerShell hashtable literal is not.
+    $nsLoadedCache = New-Object System.Collections.Hashtable ([System.StringComparer]::Ordinal)
+    function Test-EvalNamespaceLoaded([string]$ns) {
+        if ($nsLoadedCache.ContainsKey($ns)) { return $nsLoadedCache[$ns] }
+        $verdict = $null
+        try {
+            $probe = ConvertTo-EscapedData "PRIORITY $ns;`r`nrun() {}"
+            $null = Invoke-WebRequest -Uri "http://localhost:$($cfg.httpPort)/eval?script=$probe" -Method Post -Headers $headers -UseBasicParsing -TimeoutSec 30
+            $verdict = $true
+        } catch {
+            $b = Get-ErrorResponseBody $_
+            if ($b -and $b -cmatch "namespace '$([regex]::Escape($ns))' was not found in required modules") { $verdict = $false }
+        }
+        $nsLoadedCache[$ns] = $verdict
+        return $verdict
+    }
     Info "POST http://localhost:$($cfg.httpPort)/eval (statements mode), $($targets.Count) file(s)."
-    Info "Verdicts: [OK] eval compiled it (syntax + names proven) | [FAIL] a real error in the code | [SKIP] eval cannot check it - a limitation of this pre-check, NOT an error - each followed by [NEEDS DRYRUN]: the full module loader checks it (the summary prints the exact scoped 'dryrun' command)."
+    Info "Verdicts: [OK] eval compiled it (syntax + names proven) | [FAIL] a real error in the code | [SKIP] eval cannot check it - a limitation of this pre-check, NOT an error | [WARN] an ambiguous name - eval resolves it against EVERY loaded module, the module only against its REQUIRE closure, so the full load decides - [SKIP] and [WARN] are each followed by [NEEDS DRYRUN]: the full module loader checks it (the summary prints the exact scoped 'dryrun' command)."
     Write-Host ""
     # Top-level names declared anywhere in THIS PROJECT (column-0
     # declarations and keyworded declarations, harvested off the
@@ -3968,15 +4003,43 @@ function Cmd-Precheck {
     $harvest = New-Object 'System.Collections.Generic.List[string]'
     $harvestSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($t in $targets) { if ($harvestSeen.Add($t)) { $harvest.Add($t) } }
-    foreach ($root in @(@("src\main\lsfusion", "src\main\resources") | ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ })) {
-        foreach ($f in @(Get-ChildItem $root -Recurse -Filter *.lsf -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })) {
-            if ($harvestSeen.Add($f)) { $harvest.Add($f) }
-        }
+    # The same roots start-server puts on the classpath (Build-ServerClasspath
+    # / the default target set above): the Maven source roots when they
+    # exist, else the loose top-level .lsf files of a flat project - so a
+    # targeted -Files run still sees its siblings' declarations and
+    # namespaces.
+    $harvestRoots = @(@("src\main\lsfusion", "src\main\resources") | ForEach-Object { Join-Path $ProjectDir $_ } | Where-Object { Test-Path $_ })
+    $harvestFiles = @()
+    if ($harvestRoots.Count) {
+        $harvestFiles = @($harvestRoots | ForEach-Object { Get-ChildItem $_ -Recurse -Filter *.lsf -ErrorAction SilentlyContinue } | ForEach-Object { $_.FullName })
+    } else {
+        $harvestFiles = @(Get-ChildItem $ProjectDir -File -Filter *.lsf -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
+    foreach ($f in $harvestFiles) {
+        if ($harvestSeen.Add($f)) { $harvest.Add($f) }
     }
     $declaredHere = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]' ([System.StringComparer]::Ordinal)
+    # Namespace owners: <namespace> -> the files whose module lives in it
+    # (the NAMESPACE header, else the module name). Tells whether a file's
+    # namespace is SHARED with other project modules - then the module's
+    # own-namespace precedence, which eval does not reproduce, can matter
+    # (see the PASS caveat). Read from the leading header block, which an
+    # anchored scan cannot confuse with string content (Get-ModuleHeader).
+    $nsOwners = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]' ([System.StringComparer]::Ordinal)
     foreach ($t in $harvest) {
         try {
             $sh = Get-CommentBlankedShadow ([IO.File]::ReadAllText($t))
+            $fileNs = $null
+            foreach ($h in @(Get-ModuleHeader $sh)) {
+                if ($h.Keyword -eq 'MODULE' -and -not $fileNs -and $h.Body -cmatch '^[A-Za-z_][A-Za-z0-9_]*$') { $fileNs = $h.Body }
+                if ($h.Keyword -eq 'NAMESPACE' -and $h.Body -cmatch '^[A-Za-z_][A-Za-z0-9_]*$') { $fileNs = $h.Body }
+            }
+            if ($fileNs) {
+                if (-not $nsOwners.ContainsKey($fileNs)) {
+                    $nsOwners[$fileNs] = New-Object 'System.Collections.Generic.List[string]'
+                }
+                if (-not $nsOwners[$fileNs].Contains($t)) { $nsOwners[$fileNs].Add($t) }
+            }
             # Column-0 property/action declarations, plus keyworded top-level
             # declarations whose names travel cross-file: classes, forms,
             # groups, windows, tables, metacodes.
@@ -4020,6 +4083,19 @@ function Cmd-Precheck {
     # uses ("<X> cannot be used in EVAL module" from emitEvalModuleError,
     # "... is forbidden in EVAL module" from the group / event paths).
     $restrictRx = 'cannot be used in EVAL module|is forbidden in EVAL module'
+    # Ambiguity verdicts of the resolver: "ambiguous name 'x', list of
+    # modules: ..." (inline list) or "ambiguous name 'x', was found in
+    # modules:" + one indented "<Module> (<element>)" candidate per line.
+    # Eval's throwaway module REQUIREs EVERY loaded module, so a name that
+    # is unique inside this module's REQUIRE closure can still be ambiguous
+    # server-wide; the file's own PRIORITY is honored (kept in the text),
+    # the narrower closure is not reproducible here. Reported as a WARN,
+    # never a FAIL: the full load decides (a real ambiguity fails there
+    # with the same message).
+    $ambigRx = "^ambiguous name '"
+    # The kept PRIORITY naming a namespace the running server has not
+    # loaded (a new module): a cross-file limitation, like a not-found name.
+    $nsNotFoundRx = "^namespace '([A-Za-z_][A-Za-z0-9_]*)' was not found in required modules"
     # CLASS and TABLE are refused in eval's FIRST pass (initMetaAndClasses),
     # which aborts right there: parse errors before the statement still come
     # batched with it, nothing after it is parsed, names are resolved
@@ -4086,6 +4162,49 @@ function Cmd-Precheck {
             # cover exactly what eval cannot see (META bodies compile only at
             # instantiation; EXTEND FORM / '() + {}' crash eval's compiler).
             $structShadow = Get-StructuralShadow $fileShadow
+            # Module header facts from the leading header block (an anchored
+            # scan from the top - Get-ModuleHeader - so a header-looking line
+            # inside a multi-line string literal never counts): the keywords
+            # in order of appearance, the PRIORITY list, the own namespace
+            # (the NAMESPACE header, else the module name).
+            $hdrStmts = @(Get-ModuleHeader $fileShadow)
+            $hdrSeq = @($hdrStmts | ForEach-Object { $_.Keyword })
+            $prioList = @()
+            $ownNs = $moduleName
+            foreach ($h in $hdrStmts) {
+                if ($h.Keyword -eq 'PRIORITY') { $prioList = @($h.Body -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+                if ($h.Keyword -eq 'NAMESPACE' -and $h.Body -cmatch '^[A-Za-z_][A-Za-z0-9_]*$') { $ownNs = $h.Body }
+            }
+            $hasPriority = [bool]($hdrSeq -ccontains 'PRIORITY')
+            $hasNamespace = [bool]($hdrSeq -ccontains 'NAMESPACE')
+            # Header order and uniqueness: the grammar is MODULE; [REQUIRE;]
+            # [PRIORITY;] [NAMESPACE;] - each at most once, in that order.
+            # The loader rejects anything else, but Strip-ModuleHeader blanks
+            # each statement on its own (and keeps PRIORITY), which could
+            # hide a misorder from eval - so it is a structural FAIL here.
+            $hdrOrder = @('MODULE', 'REQUIRE', 'PRIORITY', 'NAMESPACE')
+            $hdrPrev = -1
+            $hdrBad = $false
+            foreach ($k in $hdrSeq) {
+                $ix = [array]::IndexOf($hdrOrder, $k)
+                if ($ix -le $hdrPrev) { $hdrBad = $true }
+                $hdrPrev = $ix
+            }
+            if ($hdrBad) {
+                $failCount++
+                Bad "$leaf - FAIL: module header out of order or duplicated ($($hdrSeq -join ', ')) - the loader's grammar is MODULE; [REQUIRE;] [PRIORITY;] [NAMESPACE;], each at most once and in that order."
+                continue
+            }
+            # The module's own namespace in its PRIORITY list is rejected by
+            # the loader ("namespace 'X' has maximum priority level and
+            # should be deleted from the list") and invisible to eval, whose
+            # throwaway module carries another namespace - so it is checked
+            # here (namespaces are case-sensitive).
+            if ($prioList -ccontains $ownNs) {
+                $failCount++
+                Bad "$leaf - FAIL: PRIORITY lists the module's own namespace '$ownNs' - the loader rejects that (namespace '$ownNs' has maximum priority level and should be deleted from the list); eval cannot see it because its throwaway module has another namespace."
+                continue
+            }
             $cov = Get-EvalCoverage $structShadow
             if ($cov.MetaOpen -gt $cov.MetaEnd) {
                 $failCount++
@@ -4121,18 +4240,34 @@ function Cmd-Precheck {
                 NeedsDryrun "$leaf - requires the full module loader (module '$moduleName'): only a full load checks this file - 'dryrun' does it in seconds, live server untouched; don't re-run precheck for it."
                 continue
             }
-            # NAMESPACE / PRIORITY steer how ambiguous names resolve; they are
-            # stripped for the check, so a clean name pass can still resolve
-            # differently at restart - the verdict carries that caveat.
+            # The module's OWN namespace outranks its PRIORITY list at load
+            # time. NAMESPACE is stripped (see Strip-ModuleHeader), so that
+            # precedence is reproduced by putting the namespace FIRST in the
+            # kept / added PRIORITY - possible only when the running server
+            # has the namespace loaded, which is also the only case where it
+            # matters (a namespace nobody else has loaded has nothing to
+            # outrank). Wanted when the namespace can be shared: an explicit
+            # NAMESPACE header, or another project file living in this
+            # module's default (module-name) namespace. One server probe per
+            # namespace per run. (The PRIORITY header itself is kept in the
+            # posted text, so eval honors it - $hasPriority only steers the
+            # wording of an ambiguity WARN.)
+            $injectNs = $null
             $nsCaveat = ""
-            if ($fileShadow -cmatch '(?m)^[ \t]*(NAMESPACE|PRIORITY)\b') {
-                $nsCaveat = " (NAMESPACE/PRIORITY stripped for the check - ambiguous names can resolve differently at restart)"
+            $nsWanted = $hasNamespace
+            if (-not $nsWanted -and $nsOwners.ContainsKey($ownNs)) {
+                $nsWanted = (@($nsOwners[$ownNs] | Where-Object { $_ -ne $t }).Count -gt 0)
+            }
+            if ($nsWanted) {
+                $nsLoaded = Test-EvalNamespaceLoaded $ownNs
+                if ($nsLoaded -eq $true) { $injectNs = $ownNs }
+                elseif ($null -eq $nsLoaded) { $nsCaveat = " (the server did not confirm namespace '$ownNs', so the module's own-namespace precedence was not reproduced: a name it resolves that way can bind differently here)" }
             }
             $metaCaveat = ""
             if ($cov.HasMeta) {
                 $metaCaveat = " (declares META: bodies compile only at @-instantiation - a definition not instantiated in THIS file stays unchecked until a load whose scope instantiates it)"
             }
-            $scriptText = (Strip-ModuleHeader $raw) + "`r`nrun() {}"
+            $scriptText = (Strip-ModuleHeader $raw $injectNs) + "`r`nrun() {}"
             # Transport: small scripts ride the %XX query parameter (decodes
             # as UTF-8 - same reason as Cmd-Api), but System.Uri and the
             # server's request line cap out around 64 KB, so bigger payloads
@@ -4207,7 +4342,18 @@ function Cmd-Precheck {
                     $entries.Add(@{ Line = [int]$Matches[1]; Col = [int]$Matches[2]; Msg = $Matches[3].Trim(); Extra = @() })
                 } elseif ($entries.Count -and $line -match '^\s*(also at .*|and \d+ more)\s*$') {
                     $entries[$entries.Count - 1].Extra += ($Matches[1] -replace 'UNIQUE\d+NSNAME', $stem)
-                } elseif ($line -notmatch $noiseRx) {
+                } elseif ($line -match $noiseRx) {
+                    continue
+                } elseif ($entries.Count -and $entries[$entries.Count - 1].Msg -cmatch $ambigRx) {
+                    # The candidate list of an ambiguity verdict - one
+                    # "<Module> (<element> '<caption>' [<Module>(line:col)])"
+                    # per tab-indented line, and the caption may itself span
+                    # lines (a caption is any string literal), so EVERY
+                    # non-framing line up to the next positioned entry
+                    # belongs to the list; positioned errors keep their own
+                    # entries either way.
+                    $entries[$entries.Count - 1].Extra += $line.Trim()
+                } else {
                     $unknown += ($line -replace 'UNIQUE\d+NSNAME', $stem).Trim()
                 }
             }
@@ -4225,12 +4371,22 @@ function Cmd-Precheck {
             # is not found", "class 'X' is not found", "form 'f' ..." - the
             # bare identifier is captured.
             $restr = @($entries | Where-Object { $_.Msg -match $restrictRx })
+            $ambig = @($entries | Where-Object { $_.Msg -cmatch $ambigRx })
             $real = @()
             $cross = @()
             foreach ($e in $entries) {
                 if ($e.Msg -match $restrictRx) { continue }
+                if ($e.Msg -cmatch $ambigRx) { continue }
                 $isCross = $false
-                if ($e.Msg -cmatch "'([A-Za-z_][A-Za-z0-9_]*)[^']*' is not found") {
+                if (($hasPriority -or $injectNs) -and $e.Msg -cmatch $nsNotFoundRx) {
+                    # The kept (or injected) PRIORITY names a namespace no
+                    # loaded module declares: the module behind it is not on
+                    # the server yet - the full load resolves it against the
+                    # real graph.
+                    $cross += "namespace '$($Matches[1])' (named in PRIORITY; no loaded module declares it)"
+                    $isCross = $true
+                }
+                if (-not $isCross -and $e.Msg -cmatch "'([A-Za-z_][A-Za-z0-9_]*)[^']*' is not found") {
                     $nm = $Matches[1]
                     if ($declaredHere.ContainsKey($nm)) {
                         $others = @($declaredHere[$nm] | Where-Object { $_ -ne $t })
@@ -4252,7 +4408,7 @@ function Cmd-Precheck {
                 }
                 foreach ($u in $unknown) { Write-Host "    $u" }
                 if (@($real | Where-Object { $_.Msg -cmatch "'(MODULE|REQUIRE|NAMESPACE|PRIORITY)'" }).Count) {
-                    Info "    (a malformed or duplicated MODULE/REQUIRE/NAMESPACE/PRIORITY header was deliberately left in the text - headers are stripped only when well-formed and unique; fix the header itself, e.g. its terminating ';')"
+                    Info "    (a malformed or duplicated MODULE/REQUIRE/NAMESPACE header was deliberately left in the text - those are stripped only when well-formed and unique - and PRIORITY is always kept so that eval honors it; fix the header itself, e.g. its terminating ';')"
                 }
                 if ($restr.Count) {
                     # A first-pass restriction batched behind parse errors:
@@ -4264,6 +4420,32 @@ function Cmd-Precheck {
                 if ($cross.Count) {
                     Info "    (not counted as errors: $($cross -join ', ') - declared in this project, unresolved by eval; the full load tells why)"
                 }
+                if ($ambig.Count) {
+                    Info "    (not counted as errors: $(@($ambig | ForEach-Object { $_.Msg -replace ',.*$', '' }) -join ', ') - ambiguity is judged by the full load, see the [WARN] rule)"
+                }
+                continue
+            }
+            if ($ambig.Count) {
+                # Never a FAIL (see $ambigRx). Eval stops at the first
+                # semantic error, so nothing after the ambiguous statement
+                # was name-checked; the scoped dryrun checks the module
+                # against its real REQUIRE closure and fails there, with the
+                # same message, when the ambiguity is real.
+                $skipCount++
+                $needsDryCount++
+                $uncheckedModules.Add($moduleName)
+                $a0 = $ambig[0]
+                $applied = @()
+                if ($injectNs) { $applied += "own namespace '$injectNs' (first)" }
+                if ($hasPriority) { $applied += "PRIORITY list" }
+                $prioNote = if ($applied.Count) { "the file's $($applied -join ' and ') were applied in this check and do not settle it" } else { "the file declares no PRIORITY - if the full load reports the same, add 'PRIORITY <namespace>;' to the header or qualify the name" }
+                # Headline without the trailing "was found in modules:" -
+                # the candidates follow on their own lines.
+                $aHead = $a0.Msg -replace ',\s*was found in modules:\s*$', ''
+                Warn "$leaf - WARN: $aHead (line $($a0.Line)) - ambiguous in eval's view, which REQUIREs EVERY loaded module; this module sees only its REQUIRE closure, where the name may be unique ($prioNote). Not counted as an error - the full load decides. Names after line $($a0.Line) were not checked."
+                foreach ($x in $a0.Extra) { Write-Host "        $x" }
+                if ($restr.Count) { Info "    (eval also refused a construct at line $($restr[0].Line) - $($restr[0].Msg) - the same dryrun covers it)" }
+                NeedsDryrun "$leaf - requires the full module loader (module '$moduleName')."
                 continue
             }
             if ($restr.Count) {
@@ -4308,7 +4490,7 @@ function Cmd-Precheck {
     if ($failCount) {
         Bad "$failCount of $($targets.Count) file(s) FAILED: real errors eval found in the code (parse errors / unknown names / structure), not pre-check limitations. Fix them and re-run precheck."
         if ($sawFirstOnly) { Info "This server reports ONE semantic error per file per call (parse errors come batched) - re-run precheck after each fix until clean." }
-        if ($skipCount) { NeedsDryrun "$skipCount file(s) are beyond eval precheck ([SKIP] above - limitations, not errors)." }
+        if ($skipCount) { NeedsDryrun "$skipCount file(s) are beyond eval precheck ([SKIP] / [WARN] above - limitations, not errors)." }
         if ($dryHint) { Info "Once precheck is clean, run '$dryHint' to load-check what eval could not (seconds, live server untouched), then the usual tail: unscoped 'dryrun' gate, restart to apply." }
         else { Info "Then gate with 'dryrun' (REQUIRE completeness is beyond eval's reach - it sees every loaded module) and restart to apply." }
         if ($toolErrCount) { Warn "$toolErrCount file(s) got no verdict at all (endpoint / request problem above)." }
@@ -4586,10 +4768,13 @@ function Cmd-Help {
     Write-Host @"
 lsfdev.ps1 - lsFusion development CLI
 
-Stable path: every run refreshes a version-independent copy at
+Stable path - call THIS one, and put only it in notes and permission rules:
   %LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1
-Call THAT after the first run - the plugin-cache path embeds the plugin
-version and dies on every plugin update.
+  (cmd notation - PowerShell: `$env:LOCALAPPDATA, bash: `$LOCALAPPDATA;
+  'check' prints it spelled out, use that form in permission rules)
+The plugin's session-start hook installs it before the first call and every
+run refreshes it; it forwards to the newest installed skill copy. The
+plugin-cache path embeds the plugin version and dies on every update.
 
   clone          Clone an existing lsFusion project from a Git repository.
   check          Detect Java, PostgreSQL, Python, git and Maven.
@@ -4600,7 +4785,12 @@ version and dies on every plugin update.
   start-server   Start the application server and report a startup verdict.
   start-web      Start Tomcat with the web client.
   start          start-server then start-web.
-  restart        stop then start (use after editing .lsf files).
+  restart        Restart the APPLICATION SERVER only (stop + start-server)
+                 and leave a running Tomcat alone - the web client reconnects
+                 to the new server by itself; Tomcat is started only when it
+                 is not running. The command after editing .lsf files. -Web
+                 restarts Tomcat as well (after setup -RefreshWar or a changed
+                 -TomcatOpts / -WebPort - never needed for .lsf edits).
                  -NoDevMode and -JvmArgs "<flags>" apply to THIS run only
                  (config untouched) - flip a flag without re-running setup.
   stop           Stop the application server and Tomcat.
@@ -4652,11 +4842,18 @@ version and dies on every plugin update.
   precheck       Sub-second syntax + name check of .lsf files against the
                  RUNNING dev server (~30 ms/file). -Files 'a.lsf','b.lsf'
                  (project-relative or absolute); default: every .lsf under
-                 src/main. Strips MODULE/REQUIRE headers, posts to /eval.
-                 Four verdicts, each saying what was proven:
+                 src/main. Strips the MODULE/REQUIRE/NAMESPACE headers and
+                 KEEPS PRIORITY (eval's own wrapper header precedes it, so
+                 the file's priority list applies as in the module) and puts
+                 the module's own namespace FIRST in that list when the
+                 server has it loaded (NAMESPACE itself is stripped), so the
+                 own-namespace precedence applies too; posts to /eval.
+                 Verdicts, each saying what was proven:
                    [OK]    eval compiled the file - syntax and names proven.
                    [FAIL]  a REAL error in the code: parse error, unknown
-                           name, unclosed META, missing MODULE header.
+                           name, unclosed META, missing MODULE header, a
+                           header out of order or duplicated, a PRIORITY
+                           listing the module's own namespace.
                    [SKIP]  eval cannot check the file (or the rest of it) -
                            a limitation of this pre-check, NOT an error:
                            a construct the eval module refuses (CLASS,
@@ -4669,14 +4866,19 @@ version and dies on every plugin update.
                            a file that is ENTIRELY META / @-usages / EXTEND
                            FORM (structure still checked), or a file that
                            declares run() (eval would EXECUTE it).
-                   [NEEDS DRYRUN]  follows every [SKIP]: the full module
-                           loader checks it; the summary prints the exact
-                           scoped 'dryrun -TopModule "<modules>"' command.
+                   [WARN]  an AMBIGUOUS name: eval's throwaway module
+                           REQUIREs every loaded module, the real module only
+                           its REQUIRE closure (where the name may be unique)
+                           - never an error here, the full load decides;
+                           names after that statement are unchecked.
+                   [NEEDS DRYRUN]  follows every [SKIP] and [WARN]: the full
+                           module loader checks it; the summary prints the
+                           exact scoped 'dryrun -TopModule "<modules>"' command.
                  Coverage behind a [SKIP]: CLASS / TABLE stop eval's first
                  pass (syntax checked only up to that line, names nowhere);
                  every other refused construct stops the main pass (whole
                  file parsed, names checked only in the statements before it).
-                 Exit codes: 0 = no real error found ([OK] / [SKIP] /
+                 Exit codes: 0 = no real error found ([OK] / [SKIP] / [WARN] /
                  [NEEDS DRYRUN] only - the summary is never red for
                  pre-check limitations), 1 = at least one [FAIL], 3 = no
                  verdict (the endpoint could not be used: auth, wrong path,
@@ -4961,6 +5163,9 @@ Common options:
                         NOT re-download binaries - downloads are version-driven);
                         clone: allow a non-empty target dir.
   -NoWeb                Skip the web client (server + Action API only).
+  -Web                  restart only: restart Tomcat (the web client) as well.
+                        Needed after setup -RefreshWar or a changed
+                        -TomcatOpts / -WebPort - never for .lsf edits.
   -FullStart            Disable light start for this run (a full start also
                         re-syncs the Reflection tables and user-side prefs;
                         schema sync runs either way). The fix when code added
@@ -4982,102 +5187,25 @@ Common options:
 # When installed as a plugin, this script's real path carries the PLUGIN
 # VERSION (...\plugins\cache\<marketplace>\lsfusion-ai-skills\<version>\
 # skills\lsfusion-dev\scripts\lsfdev.ps1), so every plugin update kills any
-# remembered absolute path. Every run therefore maintains a
-# tiny forwarder at a VERSION-INDEPENDENT path:
+# remembered absolute path. A tiny forwarder therefore lives at a
+# VERSION-INDEPENDENT path:
 #
 #   %LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1
 #
 # which re-resolves the newest installed skill copy at call time and forwards
-# all arguments (and the exit code) to it. That path is the one to remember,
-# document, and put in session memories.
-function Sync-StableShim {
-    try {
-        if (-not $env:LOCALAPPDATA) { return $null }
-        $shimDir = Join-Path $env:LOCALAPPDATA "lsfusion-dev"
-        # Degenerate install guard: if THIS script already runs from the shim
-        # location, rewriting it would overwrite the running file with
-        # forwarder text and orphan the next call.
-        if ("$PSScriptRoot".TrimEnd('\') -ieq $shimDir.TrimEnd('\')) { return (Join-Path $shimDir "lsfdev.ps1") }
-        $self = Join-Path $PSScriptRoot "lsfdev.ps1"
-        # The cache root THIS copy is installed under (…\<root>\<marketplace>\
-        # lsfusion-ai-skills\<version>\skills\lsfusion-dev\scripts). Embedded
-        # into the shim as an extra search root, so nonstandard cache
-        # locations (relocated config dirs, custom cache env vars) keep
-        # working: a plugin update lands in the same root the current copy
-        # runs from. Empty when the layout is not a versioned plugin cache
-        # (e.g. a repo checkout) - the shim then relies on the other roots
-        # and the literal fallback path.
-        $cacheRoot = ""
-        try {
-            # scripts -> lsfusion-dev -> skills -> <version>; then the root is
-            # THREE more levels up (<version> -> lsfusion-ai-skills ->
-            # <marketplace> -> root), matching the shim's
-            # <root>\*\lsfusion-ai-skills\*\skills\... glob shape. Both the
-            # version-looking leaf and the plugin-dir name are asserted, so a
-            # repo checkout (or any other layout) embeds nothing.
-            $verDir = Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent
-            if ($verDir -and ((Split-Path $verDir -Leaf) -match '^\d+(\.\d+)*([.-].+)?$')) {
-                $pluginDir = Split-Path $verDir -Parent
-                if ($pluginDir -and ((Split-Path $pluginDir -Leaf) -ieq 'lsfusion-ai-skills')) {
-                    $cacheRoot = Split-Path (Split-Path $pluginDir -Parent) -Parent
-                }
-            }
-        } catch { }
-        $shimText = @'
-# Auto-generated by the lsfusion-dev skill - STABLE entry point for lsfdev.ps1.
-# The real script lives under the Claude plugin cache, whose path contains the
-# plugin VERSION and changes on every plugin update; THIS path never changes.
-# The shim re-resolves the newest installed copy on every call and forwards
-# all arguments and the exit code. Remember this path, not the versioned one.
-# Search roots: CLAUDE_CONFIG_DIR\plugins\cache (relocated config dir), the
-# cache root the generating copy was installed under, and the default
-# USERPROFILE\.claude\plugins\cache.
-$roots = @()
-if ($env:CLAUDE_CONFIG_DIR) { $roots += (Join-Path $env:CLAUDE_CONFIG_DIR 'plugins\cache') }
-$roots += '__CACHEROOT__'
-if ($env:USERPROFILE) { $roots += (Join-Path $env:USERPROFILE '.claude\plugins\cache') }
-$cands = @()
-foreach ($r in @($roots | Where-Object { $_ } | Select-Object -Unique)) {
-    $cands += @(Get-ChildItem (Join-Path $r '*\lsfusion-ai-skills\*\skills\lsfusion-dev\scripts\lsfdev.ps1') -ErrorAction SilentlyContinue)
-}
-$cands = @($cands | Sort-Object -Property FullName -Unique)
-$real = $null
-if ($cands.Count) {
-    $real = ($cands | Sort-Object -Property `
-        @{Expression = { Test-Path (Join-Path $_.Directory.Parent.Parent.Parent.FullName '.in_use') }; Descending = $true},
-        @{Expression = { try { [version]$_.Directory.Parent.Parent.Parent.Name } catch { [version]'0.0' } }; Descending = $true} |
-        Select-Object -First 1).FullName
-}
-if (-not $real -and (Test-Path '__FALLBACK__')) { $real = '__FALLBACK__' }
-if (-not $real) {
-    Write-Host "[FAIL] No installed lsfusion-dev skill found: the plugin cache glob matched nothing and the copy that generated this shim is gone. Reinstall the lsfusion-ai-skills plugin (or call its skills\lsfusion-dev\scripts\lsfdev.ps1 directly)." -ForegroundColor Red
-    exit 1
-}
-# An in-process caller reads $LASTEXITCODE afterwards; without this reset a
-# stale nonzero value from an unrelated earlier native command would leak
-# through when the real script completes without running one.
-$global:LASTEXITCODE = 0
-& $real @args
-exit $LASTEXITCODE
-'@
-        # Apostrophes in paths (C:\Users\O'Brien\...) must be doubled - the
-        # placeholders sit inside single-quoted literals in the shim text.
-        $shimText = $shimText.Replace('__FALLBACK__', $self.Replace("'", "''"))
-        $shimText = $shimText.Replace('__CACHEROOT__', "$cacheRoot".Replace("'", "''"))
-        $shimPath = Join-Path $shimDir "lsfdev.ps1"
-        $current = ""
-        if (Test-Path $shimPath) { try { $current = [IO.File]::ReadAllText($shimPath) } catch { } }
-        if ($current -ne $shimText) {
-            New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
-            [IO.File]::WriteAllText($shimPath, $shimText, (New-Object System.Text.UTF8Encoding($false)))
-        }
-        return $shimPath
-    } catch { return $null }
-}
+# all arguments (and the exit code) to it. The plugin's SessionStart hook
+# installs / refreshes it at the start of every session (so it exists before
+# the first lsfdev call and is re-pointed right after a plugin update), and
+# every run of this script refreshes it too. The writer is lsfdev-shim.ps1
+# next to this file, shared with the hook; without it (a lone copy of this
+# script) there is simply no shim. That path is the one to remember,
+# document, and put in session memories and permission rules.
+try { . (Join-Path $PSScriptRoot 'lsfdev-shim.ps1') } catch { }
 
 # ---------------------------------------------------------------- dispatch --
 
-$script:StableShimPath = Sync-StableShim
+$script:StableShimPath = $null
+if (Get-Command Sync-StableShim -ErrorAction SilentlyContinue) { $script:StableShimPath = Sync-StableShim -ScriptDir $PSScriptRoot }
 try {
     switch ($Command.ToLower()) {
         "clone"           { Cmd-Clone }
@@ -5088,16 +5216,33 @@ try {
         "start"        { Cmd-StartServer; Cmd-StartWeb }
         "restart" {
             Head "Restart"
+            # Contradictory switches are refused before anything is stopped:
+            # -Web would stop Tomcat and -NoWeb would then never start it.
+            if ($Web -and $NoWeb) { throw "-Web (restart Tomcat as well) and -NoWeb (never touch nor start it) contradict each other - pass one of them." }
             $cfg = Load-Config
-            $srvPorts = @(7652, 7651, 8887); $webPorts = @(8080)
-            if ($cfg) { $srvPorts = @($cfg.rmiPort, $cfg.httpPort, $cfg.webSocketPort); $webPorts = @($cfg.webPort) }
-            Stop-Tracked $ServerPid $srvPorts "Application server"
-            Stop-Tracked $TomcatPid $webPorts "Tomcat"
+            $webPorts = @(8080)
+            if ($cfg) { $webPorts = @($cfg.webPort) }
+            # An .lsf edit needs only the APPLICATION SERVER restarted: the
+            # web client reconnects to the new server on its next request
+            # (measured: a form opened fine right after), so a running
+            # Tomcat is left alone - restarting it cost about a minute per
+            # iteration for nothing. Tomcat is started when it is not
+            # running; -Web restarts it too (after setup -RefreshWar, a
+            # changed -TomcatOpts / -WebPort, or a web client that stopped
+            # answering); -NoWeb neither touches nor starts it. The app
+            # server itself is stopped by Cmd-StartServer (its "Previous
+            # application server ..." line is what the session-track hook
+            # keys on).
+            $webUp = [bool]($cfg -and (Test-TomcatUp $cfg))
+            if ($Web) { Stop-Tracked $TomcatPid $webPorts "Tomcat" }
+            elseif ($webUp -and -not $NoWeb) { Info "Tomcat (web client) is running and stays up - only the application server is restarted ('restart -Web' restarts both)." }
             # The session browser holds a page of the app being restarted -
             # a stale page after a schema change misleads more than it helps.
             if (Test-Path $PwSessionPid) { Stop-Tracked $PwSessionPid @() "Persistent verify-session browser" }
             Cmd-StartServer
-            if (-not $NoWeb) { Cmd-StartWeb }
+            if ($NoWeb) { Info $(if ($webUp) { "Web client (Tomcat) left as it is (-NoWeb)." } else { "Web client not started (-NoWeb)." }) }
+            elseif ($Web -or -not $webUp) { Cmd-StartWeb }
+            else { Confirm-WebAfterRestart $cfg }
         }
         "stop" {
             Head "Stop"

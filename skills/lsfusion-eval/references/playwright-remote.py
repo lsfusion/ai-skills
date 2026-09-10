@@ -2,13 +2,17 @@
 Reference: drive a deployed lsFusion install via Playwright.
 
 This is a copy-and-adapt template for visually verifying a deployed lsFusion
-server (any URL, local or remote, devmode ON or OFF). Use it when:
+server (any URL, local or remote, devmode ON or OFF).
 
-- the lsfusion-dev `verify` command isn't enough — it's local-only (its
-  direct open, click-through, -Do steps and asserts stop at the dev install);
-- you need to prove to a human (not just yourself) that a feature looks
-  right end-to-end on the deployed app — screenshots of the actual rendered
-  UI are unambiguous in a way that API counts are not.
+Start with lsfusion-dev's `verify` (add `-Url <base> -User .. -Password ..`
+for another host): it does the login, the direct form open, -Do steps,
+assertions and disk artifacts in one run. Adapt this template only when that
+wrapper is unavailable or cannot perform the operation - no set-up
+lsfusion-dev project on this box, no Windows PowerShell, an untrusted HTTPS
+certificate (this template passes ignore_https_errors=True), request /
+response evidence, or programmatic branching and value-dependent steps that
+a linear -Do chain cannot express. Needing screenshots, several forms, field
+entry or intermediate assertions is NOT a reason - verify does those.
 
 Prereqs:
 - Python 3.9+
@@ -20,7 +24,8 @@ Prereqs:
 Run:
     python playwright-remote.py
 Output:
-    ./screenshots/01-login.png, 02-navigator.png, ...
+    ./screenshots/01-login.png, 02-navigator.png, ... (relative to the
+    current working directory, not to this file)
 
 The script is self-contained on purpose — adapt the URL, credentials, and
 the `navigate_and_capture` body for whatever you want to verify.

@@ -75,8 +75,9 @@ you make from reading local code is wrong.
 The **fixed verification order** (rationale in the lsfusion-dev skill,
 step 5) is the same locally and remotely — never UI first: **server log**
 (`tail /var/log/lsfusion6-server/stdout.log` over SSH, or `lsfdev.ps1 log`)
-→ **API** (this skill's `/eval/action` and `/files/*`) → **UI** (Playwright:
-Part 3 for remote, lsfusion-dev `verify` for local). Direct `psql` is only
+→ **API** (this skill's `/eval/action` and `/files/*`) → **UI** (lsfusion-dev
+`verify` — the local install by default, any reachable host with `-Url`;
+Part 3 for its prerequisites, limits and the script fallback). Direct `psql` is only
 for what neither log nor API can answer (DBA recovery, physical-layout
 debugging) — and only after asking the user.
 
@@ -335,15 +336,22 @@ parse errors (`missing '}' at 'CLASS'`, `no viable alternative at input
 '='` at shifted columns) regardless of whether the code is fine. For a
 local lsfdev project don't hand-roll the curl at all: **`lsfdev.ps1
 precheck -Files 'src\main\lsfusion\My.lsf'`** does exactly this per file —
-strips the `MODULE`/`REQUIRE` header (a full module posted verbatim dies
-with `missing EOF at 'MODULE'`) while preserving line numbers, appends the
-`run() {}`, and labels each verdict by what was actually proven: `[OK]`
-(compiled, names proven), `[FAIL]` (a real error), `[SKIP]` + `[NEEDS
-DRYRUN]` (eval cannot check it — a limitation of the check, not an
-error). A file that declares its own `run()` is a `[SKIP]` instead of
-linted — `/eval` executes `run()`, and a linter must not run project
-actions. Only real `[FAIL]`s exit 1 (3 = no verdict, endpoint unusable);
-a run of nothing but `[SKIP]`s exits 0 with a `[NEEDS DRYRUN]` summary.
+strips the `MODULE`/`REQUIRE`/`NAMESPACE` headers (a full module posted
+verbatim dies with `missing EOF at 'MODULE'`) while preserving line
+numbers and **keeping `PRIORITY`** (eval's own wrapper header precedes
+the text, so the file's priority list applies as in the module; the
+module's own namespace goes first in that list when the server has it
+loaded, so its precedence applies too — `NAMESPACE` itself is stripped),
+appends the `run() {}`, and labels each verdict by what was
+actually proven: `[OK]` (compiled, names proven), `[FAIL]` (a real
+error), `[SKIP]` + `[NEEDS DRYRUN]` (eval cannot check it — a limitation
+of the check, not an error), `[WARN]` + `[NEEDS DRYRUN]` (an *ambiguous
+name*: eval resolves against every loaded module, the module only against
+its `REQUIRE` closure — the full load decides). A file that declares its
+own `run()` is a `[SKIP]` instead of linted — `/eval` executes `run()`,
+and a linter must not run project actions. Only real `[FAIL]`s exit 1 (3
+= no verdict, endpoint unusable); a run of nothing but `[SKIP]`s /
+`[WARN]`s exits 0 with a `[NEEDS DRYRUN]` summary.
 
 Limits — eval is a linter, **not** the loader: it does not validate the
 load-time semantics specific to forbidden constructs (constraint logic,
@@ -352,7 +360,12 @@ well-formedness beyond grammar), and it cannot judge `REQUIRE`
 completeness — the throwaway module depends on **every** loaded module,
 so names resolve even when the real module's `REQUIRE` list would not
 reach them (that failure surfaces only at a full load — the restart, or
-locally the `dryrun` described below). Parse errors come
+locally the `dryrun` described below) — and the posted file's own
+declarations live in a private namespace, so an overload set spanning
+several modules of one shared namespace (the file overloading a name
+another module of its namespace declares with a different signature) is
+not reproduced either; a `... is not found` on such a call is for the full
+load to judge. Parse errors come
 batched, but **name errors surface one per call** (fix and re-run — unless
 the server runs with `settings.batchScriptErrors=true`), a refused
 construct stops name checking from that statement on (see the phase
@@ -584,7 +597,7 @@ RETURN 'OK: ' + STRING((OVERRIDE (GROUP SUM 1 IF ...), 0));   // count proves it
 `applyMessage()` carries the human-readable constraint text — but it can be
 `NULL`, and `'CANCELED: ' + NULL` is `NULL` (an empty response that looks
 like success), so always wrap it in `OVERRIDE`. Alternatively verify with a
-separate count call or a Playwright screenshot of the list form (Part 3).
+separate count call or a `verify` screenshot of the list form (Part 3).
 Don't trust the transport-level 200 as data-level confirmation.
 
 **Asserting a computed value on the object you just created.** You can't read
@@ -751,7 +764,7 @@ the running jar is from a different commit — redeploy via the
 lsfusion-deploy skill (or git-checkout to whatever matches, depending on
 which direction is correct for the task).
 
-## Part 3: Visual verification via Playwright (browser-level)
+## Part 3: Visual verification in the browser (screenshots for the user)
 
 API calls prove things to you. **Screenshots prove things to the user.**
 When a task is "I added a field to this form" or "the new attribute should
@@ -759,32 +772,58 @@ appear in this column", a rendered screenshot is unambiguous in a way that
 a JSON count is not — and the user can see at a glance whether the result
 matches expectations.
 
-### When to write your own Playwright vs use `lsfdev.ps1 verify`
+### `verify` first — on a deployed host too
 
-The lsfusion-dev skill's `verify` command is **local-only** — it bakes the
-URL from `.lsfusion-dev/config.json` and logs in to the local dev install.
-It covers the landing page, a **direct form open** (`-OpenScript
-"SHOW …;"`, parameterizable down to one object's edit card — the mechanism
-below) and navigator click-throughs (`-Click` / `-DoubleClick`). For
-anything else — a deployed host (lsfusion-deploy target), a multi-step
-navigation, filling fields, multiple screenshots — write a small Python
-script with Playwright directly. The full reference template
-is in [references/playwright-remote.py](references/playwright-remote.py);
-copy it, adapt URL / credentials / the body of `navigate_and_capture()`,
-and run.
+The lsfusion-dev skill's `verify` command targets the local dev install by
+default and **any other web client with `-Url`**:
 
-**In-app browser instead of a script?** When the session has one (Claude
-Desktop's Browser pane, `mcp__Claude_Browser__*` tools), it can drive the
-target interactively — the direct-open URL mechanism below works there
-too, and reading the page (`get_page_text` / `read_page`) beats brittle
-text matchers. Its hard limits for deployed targets: the agent must not
-type passwords (devmode auto-auth is fine; a real login form ends the
-native path — the script logs in itself), screenshots are capped ~800 px
-wide with no region zoom (proof-grade shots for the user still come from
-Playwright), an invalid TLS cert on a staging host cannot be bypassed,
-and headless harnesses (CLI, CI, subagents) have no pane at all. Treat it
-as a convenience layer for interactive poking, not a replacement for this
-Part's script.
+```
+lsfdev.ps1 verify -Url https://host/app/ -User admin -Password '<pwd>' -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Coffee beans" -Do "assert-text:[lsfusion-form='Shop.items']=>Tea","screenshot:items"
+```
+
+One run gives you the login (detected automatically — pass the web
+client's base URL including its application context, and the target's own
+credentials), the direct form open (the mechanism below), `-Click` /
+`-DoubleClick` / `-Do` steps with `assert-text` / `assert-count` /
+`screenshot:<name>`, full-resolution PNGs + DOM + console on disk, a
+watchdog and exit codes CI can trust; `-Session` continues the same page
+across calls (repeat `-ProjectDir` and `-Url` on every continuation).
+Requirements: Windows PowerShell + Python 3, and a project already set up
+with lsfusion-dev — run it there (`-ProjectDir`): the project supplies the
+configuration and the artifact directory, while its own server, Tomcat and
+database need not be running (don't `setup` a project just for this — setup
+provisions a database). Limits: no insecure-TLS switch (the certificate
+must be valid), no network request capture, and a linear step list — no
+branching, no feeding a value read from the page into a later step (plain
+inspection is an `eval:` step). `-OpenScript` on a deployed install is also
+gated by the server: the `Eval` module must be in the build and the
+account needs the UI/API permissions listed in the shared reference below.
+
+### When a hand-written Playwright script is the tool
+
+**Only when `verify` is unavailable or cannot express the operation**: no
+set-up lsfusion-dev project on the box, no Windows PowerShell (Linux/macOS
+agent), an invalid or self-signed certificate, request/response evidence,
+or logic beyond a linear step list. Needing screenshots, several forms,
+field entry or assertions between steps is *not* a reason — `verify` does
+those. Then copy
+[references/playwright-remote.py](references/playwright-remote.py), adapt
+URL / credentials / the body of `navigate_and_capture()`, and run. It is an
+illustration of the pattern, not a maintained harness: `verify` carries
+readiness and login handling the template does not (see the gotchas below).
+
+**In-app browser: optional, after verification.** When the session has one
+(Claude Desktop's Browser pane, `mcp__Claude_Browser__*` tools), use it
+only after `verify` (or the script fallback) has done the check, for ONE
+attempt at reading an already-rendered page (`get_page_text` /
+`read_page` beat brittle text matchers) or a quick exploratory click, under
+lsfusion-dev's [references/verify.md](../lsfusion-dev/references/verify.md),
+section **"In-app browser vs `verify` — the split"**: stop at
+its first failure signature; never retry, resize, reload, or enter a
+password through it. Proof-grade screenshots and repeatable evidence come
+from `verify` or the script, never from the pane (its shots are capped
+~800 px wide, nothing lands on disk, and headless harnesses — CLI, CI,
+subagents — have no pane at all).
 
 ### Opening a specific form directly by URL (no navigator clicking)
 
@@ -800,8 +839,9 @@ FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
 
 **Before writing a script around this, read
 [references/form-open-url.md](references/form-open-url.md)** — the shared
-mechanism reference (also used by lsfusion-dev's `verify -OpenScript`, which
-is the no-hand-rolling path on a local dev install). It carries the rules
+mechanism reference (also behind lsfusion-dev's `verify -OpenScript`, the
+standard direct-open path: the configured local install by default, another
+host with `-Url`). It carries the rules
 that make the call work: `DOCKED` window mode (a bare `SHOW` floats and
 renders unrepresentative layout), the service-worker registration visit and
 stuck-page recovery, namespace-qualified names, URL-encoding, script errors
@@ -809,17 +849,21 @@ coming back as the 500 body, and the auth gates on non-devmode installs.
 
 ### Things that will cost you a debug cycle if you don't know them
 
-The reference script bakes in workarounds for each of these — read it
-before writing your own.
+The reference script carries a first-cut workaround for each of these —
+read it before writing your own, and tighten its waits for your target.
 
 - **Login form selectors.** When devmode is OFF (any deployed install) the
   login form is real. Platform-standard inputs: `input[name="username"]`
   and `input[name="password"]`, with an `input[name="submit"][type="submit"]`
   button. Default account `admin` / empty password unless rotated. After
-  clicking submit,
-  wait `networkidle` plus a 2–3 s settle for the SPA to render the
-  navigator. When devmode is ON, there's no form — your fill calls will
-  time out; treat that as a no-op, not a failure.
+  clicking submit, wait `networkidle` plus a 2–3 s settle for the SPA to
+  render the navigator, then **check the outcome** (password field gone,
+  navigator visible) regardless of what `login()` returned: the template
+  returns `False` on *any* timeout, which does not prove devmode, and it
+  can return `True` after rejected credentials when its calls complete
+  without timing out — it never checks that authentication succeeded.
+  When devmode really is ON, the app renders without a login form and
+  skipping the login is correct.
 - **A double-click on a grid row is not "open the card".** The platform
   decides per cell: an *editable* cell starts its in-place editor (no form);
   a *read-only* cell of an object whose class has an edit form (declared or
@@ -845,8 +889,19 @@ before writing your own.
   overlay to detach first: `page.wait_for_selector("text=Loading", state="detached")`,
   then `wait_for_load_state("networkidle")`, then an extra 2 s settle.
   Caveat: the word `Loading` may be localized on non-English installs —
-  wrap in `try` and fall back to a generous fixed wait so the script still
-  produces output, just maybe of the spinner.
+  the reliable wait is for the target form's own content (a caption, a
+  known cell value), not for the spinner's text; the template's
+  `wait_loading()` only falls back to fixed waits and can still capture
+  the spinner.
+- **Cold starts.** The first open of a form after a server restart takes
+  10–40 s (lazy form build; a Maven project may still be compiling): allow
+  40–60 s for the form's visible selector on that first navigation. Put the
+  budget in selector waits — `wait_for(..., timeout=60000)` returns the
+  instant the element renders, so an oversized budget costs nothing on a
+  fast run — and reserve fixed waits below 3 s for animation/focus settles
+  where no readiness selector exists (the template's short waits after
+  navigator clicks are that kind of settle, not a readiness wait). A
+  timeout alone does not prove the form is broken.
 - **Grids scroll horizontally.** A form's `EXTEND FORM ... PROPERTIES(i) myNewCol`
   appends `myNewCol` to the right end of the columns; on a 1600 px viewport
   with a typical Items grid it'll be off-screen. Focus the grid (click any
@@ -860,20 +915,20 @@ before writing your own.
 - **UI strings are locale-dependent.** The same deployed install can serve
   English / Polish / Russian / Ukrainian / ... depending on per-user
   preference and the resource bundles in the project. Don't hardcode UI
-  text as the only navigation strategy. The reference script tries text
-  first and prints "could not find" on miss; that miss is a signal to look
-  at a screenshot of where you actually ended up and pick a different
-  matcher, NOT a fatal error.
+  text as the only navigation strategy. The template's `try_click_text()`
+  tries text first and returns `False` on a miss — it prints nothing, so
+  check its result; a miss is a signal to look at a screenshot of where
+  you actually ended up and pick a different matcher, NOT a fatal error.
 
 ### What the reference script captures by default
 
 [references/playwright-remote.py](references/playwright-remote.py) ships
-with a `navigate_and_capture()` body that takes 6 screenshots — login,
+with a `navigate_and_capture()` body that takes 5 screenshots — login page,
 post-login navigator, items grid, items grid scrolled right, one item
-detail card, plus the price segments / categories list. Treat this as
-illustration of the pattern (`click navigator entry → wait → screenshot`)
-and replace the body with whatever your task needs. Output goes to
-`./screenshots/` next to the script.
+detail card. Treat this as illustration of the pattern (`click navigator
+entry → wait → screenshot`) and replace the body with whatever your task
+needs. Output goes to `./screenshots/` under the **current working
+directory** (not the script's folder).
 
 ## Notes & gotchas
 

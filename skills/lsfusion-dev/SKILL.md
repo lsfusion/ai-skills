@@ -59,34 +59,44 @@ syntax and semantics of every construct, before writing or changing code.
 
 ## The `lsfdev.ps1` CLI
 
-All environment and runtime operations go through one PowerShell script. Invoke
-it with a bypassed execution policy so it runs regardless of system settings:
+All environment and runtime operations go through one PowerShell script.
+**Call it through its STABLE path — `%LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1`,
+i.e. `C:\Users\<user>\AppData\Local\lsfusion-dev\lsfdev.ps1` — and through
+no other path**, with a bypassed execution policy so it runs regardless of
+system settings:
 
 ```
-powershell -ExecutionPolicy Bypass -File .claude/skills/lsfusion-dev/scripts/lsfdev.ps1 <command> [options]
+powershell -ExecutionPolicy Bypass -File "C:\Users\<user>\AppData\Local\lsfusion-dev\lsfdev.ps1" <command> [options]
 ```
 
-**Prefer the STABLE path — `%LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1`.** Every
-`lsfdev.ps1` run (any command) refreshes a tiny forwarder at that
-version-independent path; it re-resolves the newest installed skill copy at
-call time and forwards all arguments and the exit code. Once it exists (i.e.
-after the first lsfdev call ever on the machine), **call that path and put
-only that path in session memories / notes**. The reason: when the skill is
+(Spell the path out — `check`/`setup` print it. `%LOCALAPPDATA%` expands
+only in cmd; bash passes it literally, so there write the absolute path or
+`"$LOCALAPPDATA/lsfusion-dev/lsfdev.ps1"`; in a PowerShell tool
+`& "$env:LOCALAPPDATA\lsfusion-dev\lsfdev.ps1" <command>`, see below.) That
+file is a tiny forwarder: it re-resolves the newest installed skill copy at
+call time and forwards all arguments and the exit code. **The plugin's
+SessionStart hook installs and refreshes it at the start of every session**
+— so it exists before the first lsfdev call on a fresh install and is
+re-pointed right after a plugin update — and every `lsfdev.ps1` run
+refreshes it too (`check`/`setup` print it). Put only that path in session
+memories, notes and permission allow rules. The reason: when the skill is
 installed as a **plugin** (the usual case), the real script lives under the
 plugin cache at
 `C:\Users\<user>\.claude\plugins\cache\lsfusion\lsfusion-ai-skills\<ver>\skills\lsfusion-dev\scripts\lsfdev.ps1`
-— a path that **embeds the plugin version and dies on every plugin update**.
-A remembered stable path never rots this way.
+— a path that **embeds the plugin version and dies on every plugin update**:
+an allow rule or a remembered command pinned to it silently stops working at
+the next update (a rule still pointing at `…\0.1.0\…` was found this way).
 
-**First call on a fresh machine (no shim yet): resolve the real script path —
-it is often not `.claude/skills/…`.** The relative path above holds only for
-a project-local skill copy; invoking it under a plugin install fails with
-*"The argument … does not exist"* (exit 127). This `SKILL.md` file's own
-directory is the skill root: take the absolute path of the
-`scripts/lsfdev.ps1` next to it and use that (quoted) — the run itself then
-creates/updates the stable shim for every later call (`setup`/`check` print
-the shim path). The examples below keep writing the short relative form for
-brevity — substitute the stable path (or your resolved absolute path).
+**Shim missing?** That happens only where the plugin's hooks do not run — a
+harness without SessionStart hooks, or a project-local skill copy instead of
+the plugin. Then run the real script once: this `SKILL.md` file's own
+directory is the skill root — take the absolute path of the
+`scripts/lsfdev.ps1` next to it (quoted; the relative
+`.claude/skills/lsfusion-dev/scripts/lsfdev.ps1` holds only for a
+project-local copy, under a plugin install it fails with *"The argument …
+does not exist"*, exit 127). That run creates the shim, and every later call
+goes through the stable path. The examples below write the short form
+`lsfdev.ps1 <command>` for brevity — it always means the stable path.
 
 `-ExecutionPolicy Bypass` is **required** on a default Windows install: without
 it PowerShell refuses to load unsigned `.ps1` files with
@@ -103,7 +113,7 @@ execution-policy scope set to `Bypass` (check with `Get-ExecutionPolicy
 -List`). Inside such a tool, invoke the script directly:
 
 ```
-& "C:\<resolved skill root>\scripts\lsfdev.ps1" setup -DbPassword "<pwd>"
+& "$env:LOCALAPPDATA\lsfusion-dev\lsfdev.ps1" setup -DbPassword "<pwd>"
 ```
 
 The `.ps1` loads under the host's own policy — no `powershell.exe` child
@@ -129,7 +139,10 @@ when the user kicks off an lsFusion task. One-time toggle, no per-call
 prompts, and every subsequent invocation just works.
 
 If the user prefers a persistent fix, an allow entry such as
-`Bash(powershell -ExecutionPolicy Bypass -File .claude/skills/lsfusion-dev/scripts/lsfdev.ps1*)`
+`Bash(powershell -ExecutionPolicy Bypass -File "C:\Users\<user>\AppData\Local\lsfusion-dev\lsfdev.ps1"*)`
+— the stable path spelled out exactly as the commands spell it (bash passes
+`%LOCALAPPDATA%` literally, so a rule written with it never matches), never
+the versioned plugin-cache path, which stops matching at the next update —
 in `.claude/settings.local.json` also clears the classifier — but **you cannot
 add it yourself**. The classifier blocks Claude from editing its own
 permission config (including via the `update-config` skill) as
@@ -207,15 +220,15 @@ a running `verify -Session` browser, or anything else that happened before.
 | `start-server` | Start the application server, tail the log, and report a verdict (started / failed / inconclusive). |
 | `start-web` | Start Tomcat with the web client; wait until the UI responds. |
 | `start` | `start-server` then `start-web`. |
-| `restart` | Stop everything, then `start`. Use this after editing `.lsf` files. |
+| `restart` | Restart the **application server only** (stop + `start-server`) and leave a running Tomcat alone — the web client reconnects to the new server by itself (measured: a form opened right after), so an `.lsf` edit costs one server start, not a Tomcat cycle on top. Tomcat is started only when it is not running. **The command after editing `.lsf` files.** `-Web` restarts Tomcat as well (after `setup -RefreshWar` or a changed `-TomcatOpts`/`-WebPort` — never needed for `.lsf` edits); `-NoWeb` neither touches nor starts it. |
 | `stop` | Stop the application server and Tomcat — of **this project only** (its pid files, and its ports only when the process carries the project's `-Dlsfdev.project=` marker). |
 | `keep-running` | Exempt this project from the **session-end auto-stop** (the plugin's hooks stop the servers a Claude session started ~60 min after that session's process ended without being resumed — see [Servers, sessions and other processes on the box](#servers-sessions-and-other-processes-on-the-box)). `-Off` re-enables it. |
 | `status` | Show which processes/ports are up, plus `Database: <name> (N connections)` — the actually-observed DB binding (flags a mismatch for a running server); `Auto-stop: OFF` when `keep-running` is set. |
 | `log` | Print the tail of the server log and flag errors. |
-| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card, `DOCKED` to render it as in production (→ `verify-open.png`, assert with `-OpenExpect`; see step 5). `-Click "<navigator text>"` (chain with `>`) instead clicks into a form like a user would, and `-DoubleClick "<cell text>"` double-clicks that grid cell **as a gesture** and reports what the platform did with it — opened form / in-place editor / no reaction (→ `verify-dblclick.png`; by default an editable cell starts its in-place editor and only a read-only cell opens the object's edit form, while a `CHANGEMOUSE 'DBLCLK'` binding or a `CUSTOM` renderer overrides that — assert a card with `-DoubleClickExpect`, or open it deterministically with `-OpenScript "… SHOW EDIT <Class> = o DOCKED;"`, see step 5). `-Do "<verb:step>",...` runs generic interaction steps after that (click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text by any Playwright selector, resolved to the first VISIBLE match; `edit:` types into lsFusion in-place editors by cell caption; `screenshot:<name>` saves `<stem>-<name>.png` mid-chain, so one chain documents several screens) — the way to drive CUSTOM/React components incl. real drag gestures (`drag:`) and HTML5 drag-and-drop (`dnd:`, kanban boards) (→ `verify-do.png`). `-OutPrefix <stem>` renames the whole artifact set of a run (`<stem>-open.png`, …) so a batch loop over several forms keeps per-form evidence instead of overwriting `verify-*.png` each run. `-Session` keeps a persistent browser between calls so multi-step scenarios skip re-navigation (`-EndSession` closes it). The **whole run is bounded by a watchdog** (default 180 s, `-Timeout <s>` overrides): a page that wedges the web client (a form blocking the browser's renderer — a real lsFusion failure mode) is tree-killed with the hung step named (`navigate` / `open-wait: <form>` / `do 2/5: …`) and the browser-console tail printed, exit 1, artifacts collected so far kept — so a hang points at the form immediately instead of eating background tasks. `<stem>-console.txt` also carries **uncaught page exceptions** (`[pageerror]` lines with `resource:line:col` — e.g. a web resource that died while loading), reported as their own `[WARN]` lines and tied to the `'X' is not a component` they cause; on any **load timeout** (navigation, login page, direct open, a stuck `Loading` indicator, the watchdog kill) the report appends what `tomcat/logs/gwtlog-err.log` — the web client's error log — received during the run. |
+| `verify` | Playwright (headless Chromium) screenshot + DOM dump of the web UI into `.lsfusion-dev/`. `-OpenScript "SHOW <form> DOCKED;"` opens a specific form **directly** — no navigator clicking, parameterizable down to one object's edit card (→ `verify-open.png`, assert with `-OpenExpect`); `-Click "<navigator text>"` (chain with `>`) clicks into a form like a user, `-DoubleClick "<cell text>"` double-clicks that grid cell **as a gesture** and classifies what the platform did (opened form / in-place editor / no reaction; assert a card with `-DoubleClickExpect`); `-Do "<verb:step>",...` runs generic interaction steps by Playwright selector (click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text) — the way to drive CUSTOM/React components, real drag gestures and HTML5 drag-and-drop included (→ `verify-do.png`); `-OutPrefix <stem>` keeps per-form artifacts in a batch loop; `-Session` keeps a live browser between calls; `-Url <base>` (with `-User`/`-Password`) targets another web client. Strict exit codes (0 = every check passed, 2 = a check failed, 1 = tool error), a whole-run watchdog (default 180 s, `-Timeout`), classified failure diagnoses, uncaught page exceptions and custom-view failures called out, the web client's error-log delta on load timeouts. Short form in step 5, full contract in [references/verify.md](references/verify.md). |
 | `open` | Open the web UI in the user's default browser. |
 | `api` | Call the HTTP Action API via `-Script "<code>"` or `-ScriptFile "<path>"` (advanced verification / data seeding). **Action code only** — its `/eval/action` endpoint wraps the script in an action body, so declarations produce garbage parse errors; lint declarations with `precheck` instead. Use `-ScriptFile` (UTF-8) for any script with non-ASCII text. For a long-running action pass `-Timeout <s>` — it bounds the HTTP wait (default 30 s; 60 s when a large script is sent as a POST body); **a client timeout is not a server verdict** — the action keeps running and may still commit: check `log` / re-read state, never blindly re-run. Exit codes are trustworthy: **0** = HTTP success, **1** = request failed (HTTP error / connection refused), **3** = client timeout (no verdict — deliberately distinct from 1). |
-| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips `MODULE`/`REQUIRE` headers (line numbers preserved), posts to `/eval`, and gives each file one of four verdicts: **`[OK]`** (eval compiled it — syntax and names proven), **`[FAIL]`** (a real error in the code: parse error, unknown name, unclosed META, missing header), **`[SKIP]`** (eval *cannot* check it — a limitation of the pre-check, never an error: a construct the eval module refuses such as `CLASS` / `WHEN` / `CONSTRAINT`, one that crashes its compiler such as `EXTEND FORM`, a name declared in another project file the server has not loaded, an all-META/`EXTEND FORM` file, a file declaring `run()`), each `[SKIP]` followed by **`[NEEDS DRYRUN]`** — the full module loader checks it, and the summary prints the exact scoped `dryrun -TopModule "…"` command. The summary is red and the exit code 1 **only for `[FAIL]`**; a run whose only findings are pre-check limitations ends in `[NEEDS DRYRUN]` with exit 0 (exit 3 = no verdict, the endpoint could not be used). New-module code is mostly refused declarations, so iterate on the scoped `dryrun` there and keep precheck for files eval can fully check. See the `precheck` part of step 4. |
+| `precheck` | Sub-second **syntax + name lint** of `.lsf` files against the running dev server (~30 ms/file). `-Files 'a.lsf','b.lsf'` (project-relative or absolute; default: every `.lsf` under `src/main`). Strips the `MODULE`/`REQUIRE`/`NAMESPACE` headers (line numbers preserved) and keeps `PRIORITY` — eval's wrapper supplies its own `MODULE`/`REQUIRE`, so the file's priority list applies as in the module, and the module's own namespace is put first in that list when the server has it loaded, so the own-namespace precedence applies too (`NAMESPACE` itself is stripped) — posts to `/eval`, and gives each file one of these verdicts: **`[OK]`** (eval compiled it — syntax and names proven), **`[FAIL]`** (a real error in the code: parse error, unknown name, unclosed META, missing header, a header out of order or duplicated, a `PRIORITY` listing the module's own namespace), **`[SKIP]`** (eval *cannot* check it — a limitation of the pre-check, never an error: a construct the eval module refuses such as `CLASS` / `WHEN` / `CONSTRAINT`, one that crashes its compiler such as `EXTEND FORM`, a name declared in another project file the server has not loaded, an all-META/`EXTEND FORM` file, a file declaring `run()`), **`[WARN]`** (an *ambiguous name*: eval's throwaway module `REQUIRE`s every loaded module, the real module only its `REQUIRE` closure, where the name may be unique — never an error here, the full load decides), each `[SKIP]` / `[WARN]` followed by **`[NEEDS DRYRUN]`** — the full module loader checks it, and the summary prints the exact scoped `dryrun -TopModule "…"` command. The summary is red and the exit code 1 **only for `[FAIL]`**; a run whose only findings are pre-check limitations ends in `[NEEDS DRYRUN]` with exit 0 (exit 3 = no verdict, the endpoint could not be used). New-module code is mostly refused declarations, so iterate on the scoped `dryrun` there and keep precheck for files eval can fully check. See the `precheck` part of step 4. |
 | `dryrun` | **Full-fidelity validation without starting anything — the inner loop for new code (scoped) and the gate before a restart.** Launches the server JVM with `-Dsettings.dryRun=true`: every module in scope is parsed, metacode-expanded and name-resolved against its **real `REQUIRE` graph** — everything a restart checks at load time, `EXTEND FORM` and restart-only files included — then the JVM exits **before the DB sync**. Binds **no ports** (measured: zero listening sockets), opens **no DB connection at all** — no PostgreSQL needed — and never touches the running server, so it validates safely **next to a live instance**. `-TopModule <M>` (comma-separated list allowed — quote it) forces `logics.topModule` for the run, cutting the scope to the REQUIRE closure (measured: 772 → 11 modules = 9 s → 4 s). Exit 0 = OK, 1 = failed. See the `dryrun` part of step 4. |
 
 Key options: `-AppId` (the project's short identifier = its `db.name` **and**
@@ -226,7 +239,9 @@ its web context path; see step 2), `-DbPassword`, `-DbUser`, `-DbServer`, `-DbNa
 `-JvmArgs "-Duser.language=ru -Xmx4g"`; on `start`/`start-server`/
 `restart`/`dryrun` an explicit `-JvmArgs` is a one-shot for that run, not
 persisted),
-`-NoDevMode` (real auth for acceptance tests — see step 4), `-User` /
+`-NoDevMode` (real auth for acceptance tests — see step 4), `-Web`
+(restart: restart Tomcat as well — after `setup -RefreshWar` or a changed
+`-TomcatOpts`/`-WebPort`, never for `.lsf` edits), `-User` /
 `-Password` (the account `verify` logs in with and `api` calls as),
 `-FullStart`, `-RefreshWar` (setup:
 re-download the client war at the same version — the `-SNAPSHOT`
@@ -235,7 +250,8 @@ war↔server build-drift fix, see below), `-Url`, `-OpenScript` /
 `-DoubleClick` / `-DoubleClickExpect`, `-OutPrefix` (verify: per-run artifact filename stem — batch
 runs keep per-form screenshots), `-ViewportWidth` / `-ViewportHeight` / `-Locale` (verify), `-Script`,
 `-Do` (verify: generic click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/press/eval/wait/screenshot/assert-count/assert-text
-steps by Playwright selector, first visible match — see step 5), `-DoFile`
+steps by Playwright selector, first visible match — see
+[references/verify.md](references/verify.md)), `-DoFile`
 (verify: `-Do` steps from a file — JSON array or one per line; survives
 nested quoting), `-AllowWarnings` (verify: report-only exit 0 — by default
 any failed check exits 2), `-Session` / `-Reload` / `-EndSession`
@@ -261,7 +277,7 @@ no-pipe note in step 4), so don't inflate it "just in case":
 | `setup` — first run (downloads ~400 MB) | 600 s |
 | `setup` — re-run (ports, DB, settings tweaks) | default |
 | `setup -RefreshWar` (re-downloads the ~250 MB war) | 600 s |
-| `start` / `restart` — routine edit→restart cycle (lightstart) | 300 s |
+| `start` / `restart` — routine edit→restart cycle (lightstart; `restart` touches the application server only, so it is the shorter of the two) | 300 s |
 | `start-server` — first start on this DB, or major-version upgrade (raise the inner `-Timeout` to 300 as well) | 600 s |
 | `verify` — first ever run (installs Playwright + Chromium, ~120 MB) | 300 s |
 | `verify` — later runs | **240 s minimum** — the outer timeout must EXCEED the 180 s watchdog budget (`-Timeout <s>` changes it; keep outer ≈ budget + 60 s), or the outer kill fires first and eats the hung-step diagnosis. The command self-terminates on a hang and reports the hung step, so never park it in the background to "wait out" a hang |
@@ -543,7 +559,7 @@ You also need the PostgreSQL connection details. The defaults are server
 installation-specific — ask the user for it if `check` could not connect, then:
 
 ```
-powershell -ExecutionPolicy Bypass -File .claude/skills/lsfusion-dev/scripts/lsfdev.ps1 setup -AppId <short id> -DbPassword "<password>"
+powershell -ExecutionPolicy Bypass -File "C:\Users\<user>\AppData\Local\lsfusion-dev\lsfdev.ps1" setup -AppId <short id> -DbPassword "<password>"
 ```
 
 `setup` downloads ~410 MB (server jar 146 MB, client war 251 MB, Tomcat ~12 MB),
@@ -697,8 +713,11 @@ returns one of three verdicts:
 **Exit codes are strict**: only a confirmed healthy start exits 0 —
 **failed**, **inconclusive**, a `DATABASE MISMATCH`, and a web client that
 never answered HTTP all exit 1 (after printing their diagnostics), and the
-combined `start`/`restart` stops before Tomcat when the app server did not
-come up. Automation can trust `$LASTEXITCODE`; an unknown command name also
+combined `start` stops before Tomcat when the app server did not come up.
+`restart` leaves a running Tomcat as it was either way, and its probe of
+that kept web client afterwards is **advisory**: a `[WARN]` there does not
+change the exit code (the application server did restart) — `status`
+re-checks, `restart -Web` restarts Tomcat too. Automation can trust `$LASTEXITCODE`; an unknown command name also
 exits 1. One nuance on `start-web`: exit 1 with the "STILL RUNNING" WARN
 means **readiness was not confirmed within `-Timeout`** (honored in full,
 default 180 s — there is no internal cap), NOT that Tomcat is broken — it is
@@ -934,7 +953,8 @@ to apply**.
 
 **`precheck` — the sub-second linter.** It feeds each file to the
 running server's `/eval` endpoint
-(headers stripped, line numbers preserved), which compiles it in a fixed
+(`MODULE`/`REQUIRE`/`NAMESPACE` headers stripped, `PRIORITY` kept, line
+numbers preserved), which compiles it in a fixed
 order (parse → EVAL-restriction → name resolution) in ~30 ms:
 
 ```
@@ -949,10 +969,19 @@ names proven). `[FAIL]` = a real error: a parse error means bad syntax,
 you have not added). `[SKIP]` = eval **cannot** check the file, or the
 rest of it — a limitation of this pre-check, never a finding about the
 code — and every `[SKIP]` is followed by `[NEEDS DRYRUN]`, the loader
-that does check it. Only `[FAIL]` turns the summary red (exit 1); a run
-whose only findings are `[SKIP]`s ends in a `[NEEDS DRYRUN]` summary with
-exit 0 — do not read it as broken code, run the printed command. (Exit 3
-= no verdict at all: the endpoint could not be used.)
+that does check it. `[WARN]` = an **ambiguous name**: eval's throwaway
+module `REQUIRE`s *every* loaded module, so a name that is unique inside
+your module's `REQUIRE` closure can be ambiguous server-wide — the file's
+`PRIORITY` and its own namespace's precedence are applied in the check, so
+whatever they settle never shows up, and what remains is for the full load
+to decide (a real ambiguity fails
+there with the same message; fix it with `PRIORITY <namespace>;` in the
+header or by qualifying the name). Never a `[FAIL]`, `[NEEDS DRYRUN]`
+follows, and names after that statement stay unchecked. Only `[FAIL]`
+turns the summary red (exit 1); a run whose only findings are `[SKIP]`s /
+`[WARN]`s ends in a `[NEEDS DRYRUN]` summary with exit 0 — do not read it
+as broken code, run the printed command. (Exit 3 = no verdict at all: the
+endpoint could not be used.)
 
 What produces a `[SKIP]`, and how much was still proven (all measured):
 
@@ -988,13 +1017,20 @@ One blind spot the other way: eval's throwaway
 module depends on **every** loaded module, so a name your file uses
 without the matching `REQUIRE` still resolves — an incomplete `REQUIRE`
 list surfaces only at restart or `dryrun` (which checks the real
-`REQUIRE` graph — see below). The run summary prints the exact scoped
+`REQUIRE` graph — see below). Its other structural difference: the file's
+own declarations live in a private namespace, so an overload set spanning
+several modules of one shared namespace — your file overloading a name
+another module of that namespace declares with a different signature — is
+not reproduced, and a `... is not found` on such a call is one for the
+full load to judge. The run summary prints the exact scoped
 command — `dryrun -TopModule "<the skipped modules>"` — covering every
-`[SKIP]` in one go (one exception: a headerless `run()` eval probe is not
-a module, cannot be dry-run, and keeps only its `[SKIP]`). A PASS can
-still carry a narrow caveat worded per file — NAMESPACE/PRIORITY
-ambiguity, META bodies nothing in the file instantiates — those don't
-trigger the hint.
+`[SKIP]` / `[WARN]` in one go (one exception: a headerless `run()` eval
+probe is not a module, cannot be dry-run, and keeps only its `[SKIP]`). A
+PASS can still carry a narrow caveat worded per file — META bodies nothing
+in the file instantiates, or a namespace the server could not confirm (the
+module's own namespace outranks its `PRIORITY` list at load time; precheck
+reproduces that by putting the namespace first in the list when the server
+has it loaded) — those don't trigger the hint.
 
 **Know the restart-only file class — precheck names it upfront.** A file
 that is *entirely* META definitions / `@`-instantiations / `EXTEND FORM`
@@ -1063,13 +1099,11 @@ What makes it different from a restart (all measured):
 (plus system modules) by forcing `logics.topModule` for that run only —
 the project's `lsfusion.properties` is not touched. The value may be a
 **comma-separated list** (`-TopModule "Sales,Purchase"` — quote it so
-PowerShell passes one string); the union of the closures is checked.
-(A stale local build predating list support fails with
-`Module 'A,B' not found` — the command detects that and tells you to
-update the platform.) On the measured 772-module project
-the closure of a leaf module was 11 modules and the JVM phase dropped
-from ~9 s to ~4 s. Two hard caveats, both measured: modules **outside
-the closure are not checked at all** (not even parsed), and
+PowerShell passes one string); the union of the closures is checked. On
+the measured 772-module project the closure of a leaf module was 11
+modules and the JVM phase dropped from ~9 s to ~4 s. Two hard caveats,
+both measured: modules **outside the closure are not checked at all**
+(not even parsed), and
 **dependents of the listed modules are not checked either** — a
 signature change that breaks M's callers only surfaces in a full dryrun
 (or the restart). So scope iteration to the module you edit, but keep
@@ -1117,7 +1151,8 @@ under a new `?version=`, server untouched). So after editing such a file,
 **do not `restart` — reload the page**: a default `verify` starts a fresh
 browser (always a reload); a `verify -Session` deliberately does NOT reload
 the live page — pass `-Reload`, or re-run your `-OpenScript` (it re-navigates
-anyway; see step 5). If an edit "doesn't apply", the page was not reloaded —
+anyway; see [references/verify.md](references/verify.md)). If an edit
+"doesn't apply", the page was not reloaded —
 don't chase cache theories and don't restart the server. A `restart` is only
 needed when you also changed the **`.lsf`** side (e.g. the `CUSTOM 'name'`
 declaration, new form properties/actions the JS calls, the `onWebClientInit`
@@ -1235,518 +1270,80 @@ checking the unit-test output.
    canceled (readback stays empty even though the code ran).
 
 3. **UI, last.** When log + API agree the build is healthy, check the
-   UI. The workhorse is `verify` — it exists in every harness, and the
-   rest of this step documents it. **If the session exposes an in-app
-   browser** (Claude Desktop's Browser pane — `mcp__Claude_Browser__*`
-   tools — or a similar browser-automation surface), it may complement
-   `verify` for *reading* a rendered page — but `verify` comes first,
-   and the pane gets ONE attempt: the split and its bail-out signatures
-   are specified in **"In-app browser vs `verify`"** at the end of this
-   step. Either way the log → API → UI order stays.
+   UI. The workhorse is `verify` — it runs in every agent harness
+   (terminal CLI, desktop app, subagents, CI) because it needs no in-app
+   browser. **Its full contract — every option, the `-Do` step verbs, the
+   diagnosis lines, the watchdog, `-Session`, `-Url`, the in-app browser
+   rules — is in [references/verify.md](references/verify.md): read it
+   before the first run that uses `-Do`, `-DoubleClick`, `-Session` or
+   `-Url`, and whenever a run fails.** The short form:
 
-   `verify` drives **Playwright** (headless Chromium) to:
-   - screenshot the landing page → `.lsfusion-dev/verify-login.png`,
-   - **if a login form is present** (devmode off), log in — credentials
-     from `-User` / `-Password`, default `admin` / empty — and screenshot
-     the result → `.lsfusion-dev/verify-app.png`,
-   - dump the final DOM → `verify-dom.html` and the browser console →
-     `verify-console.txt` — `console.*` messages **and uncaught page
-     exceptions** (`[pageerror]` lines; Playwright delivers those
-     separately from the console stream, the DevTools console shows both).
-
-   In devmode lsFusion auto-authenticates, so there is **no login form**
-   and the landing screenshot already shows the navigator + forms. The
-   first `verify` ever installs Playwright + Chromium (~120 MB); one-time.
-
-   **To verify a specific form, open it directly with `-OpenScript` — the
-   default; don't click through the navigator.** `verify` navigates the
-   headless browser to `<web>/eval/action?script=<your code>` — the
-   direct-open URL mechanism (canonical reference, shared with the
-   lsfusion-eval skill:
-   [../lsfusion-eval/references/form-open-url.md](../lsfusion-eval/references/form-open-url.md))
-   — and the form opens exactly as if a user had opened it — screenshot →
-   `verify-open.png`. The payload is an ordinary action script, fully
-   parameterizable — a named form, a form with bound objects, or the edit
-   card of one specific object:
-
-   ```
-   # a navigator form by name - assert a value the form SHOWS (a grid cell,
-   # a panel value), never the form's own caption (see the -OpenExpect rule below)
-   lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Coffee beans"
-
-   # the edit card of one object, looked up by business key
-   lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;" -OpenExpect "Coffee beans"
-
-   # ...or by internal id (grab it beforehand with api: EXPORT FROM id = Shop.Item i, ...)
-   lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHOW EDIT Shop.Item = i DOCKED;"
-   ```
-
-   - **Open the form in the window mode it will have in production — for
-     navigator forms and edit cards that means `DOCKED`, as in every example
-     above.** A bare `SHOW` in this call context defaults to a small
-     *floating* window whose layout (column widths, flex fills, collapsed
-     containers) is not what the user will see — append `DOCKED` to judge
-     the actual `DESIGN`; keep `FLOAT`/`EMBEDDED`/`POPUP` only when the
-     form genuinely opens that way in prod (e.g. `DIALOG`, `SHOW … FLOAT`),
-     and when prod opens the form through a project action, call *that
-     action* — mode, filters and session come along (rationale: the shared
-     reference above).
-   - **Qualify every name with its namespace** (`Shop.items`, not `items`).
-     The script compiles against *all* loaded modules — a bare name that is
-     unique in your module (`name`, `date`, …) is routinely ambiguous here.
-     Same rule as `api` scripts.
-   - `-OpenExpect "<text>"` waits for that text on the opened form and
-     reports found / not-found — that's your assertion; without it you just
-     get the screenshot. It matches **visible text nodes AND the values of
-     visible inputs** (a form field's content is an input `value`, not a
-     text node), and the report says which kind matched: a plain
-     "visible" for text, "as the VALUE of a visible input" for field
-     content. **Never use the form's own caption as the expect text**: the
-     caption renders on the docked **tab** (and in the navigator) —
-     *outside* the form's `[lsfusion-form]` subtree — so the scoped check
-     reports it as `on the page but NOT inside the opened form` and strict
-     verify exits 2 even though the right form opened (the report then
-     names the tab-caption match as the likely cause). Assert something
-     that renders *inside* the form: a container/panel caption or a known
-     data value, like every example above.
-   - **The open itself is cross-checked against the DOM.** The report
-     prints the form really on screen (`Active form : tab '…'; visible
-     sID(s): …`) and compares it with the form/class the script names —
-     `[OK] Open check: the script's form is on screen ('…' - sID …)` is the
-     real pass (the trailing note says which evidence matched). A
-     `[WARN] Open check:` means the `SHOW` did not take effect (or its form
-     was covered): measured false positive — an app's own
-     `onWebClientStarted` opened a dashboard over the requested card, and
-     the card's name sitting in a dashboard grid still satisfied the text
-     search. When the matched form is a concrete DOM element, the
-     `-OpenExpect` hit is additionally **scoped to that form's subtree** —
-     text sitting only on another form reports as `on the page but NOT
-     inside the opened form`. For `SHOW EDIT/LIST <Class>` the DOM carries
-     no class identity (an auto form is just `_FORM_<n>`, a caption is just
-     text), so the open check alone is only *circumstantial* (Info, not
-     OK): **pair such opens with `-OpenExpect`** — a hit inside that form
-     is what verifies it. **A found `-OpenExpect` under a WARNed open check
-     is demoted to a WARN — never treat it as a pass**, and it fails the
-     strict exit (verify exits 2 on any failed check; `-AllowWarnings` for
-     report-only exit 0); same when the cross-check itself could not run or
-     confirm while the script names a form (`UNVERIFIED`). Only when the
-     script's form is merely *named* nothing like what it shows (custom
-     edit form named unlike its class) may a WARN be over-cautious — then
-     judge `verify-open.png` (and pass `-AllowWarnings` if that run must
-     exit 0).
-   - **Checking several forms in a row? Pass `-OutPrefix <stem>` per run.**
-     Every verify run wipes and rewrites its standard artifact set (the
-     `screenshot:<name>` files of `-Do` chains are left alone), so a batch loop
-     without it keeps only the *last* form's `verify-open.png` — the
-     evidence of the other runs is gone. With a per-form stem each run
-     writes its own set (`items-open.png`, `items-dom.html`,
-     `items-console.txt`, …) and the report's "judge …" messages name those
-     files:
+   - `verify` drives a headless Chromium (via Playwright): it screenshots
+     the landing page (`verify-login.png`), logs in when a login form is
+     present (devmode off; `-User`/`-Password`, default `admin`/empty →
+     `verify-app.png`), and dumps the DOM (`verify-dom.html`) and the
+     browser console incl. uncaught page exceptions (`verify-console.txt`)
+     into `.lsfusion-dev/`. In devmode there is no login form. The first
+     run installs Playwright + Chromium (~120 MB, once).
+   - **Open the form under test directly with `-OpenScript` — the
+     default; don't click through the navigator.** The payload is an
+     ordinary action script, navigated as `<web>/eval/action?script=…`
+     (shared mechanism reference:
+     [../lsfusion-eval/references/form-open-url.md](../lsfusion-eval/references/form-open-url.md)):
 
      ```
-     foreach ($f in 'items','partners','orders') {
-       lsfdev.ps1 verify -OpenScript "SHOW Shop.$f DOCKED;" -OutPrefix $f
-     }
+     lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Coffee beans"
+     lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;" -OpenExpect "Coffee beans"
      ```
 
-     Letters, digits, `.`, `_`, `-` only; the default stem stays `verify`.
-   - Non-ASCII script text (Cyrillic keys, localized captions) → UTF-8 file
-     + `-OpenScriptFile`, exactly like `api -ScriptFile` (see the UTF-8
-     pitfall in step 4).
-   - A script error (unknown form, missing namespace, typo) surfaces as the
-     server's error text in the verify output — fix and re-run; nothing to
-     screenshot-guess.
-   - Needs the web client up; in devmode it rides the auto-auth admin
-     session. The `SHOW EDIT` / `SHOW … OBJECTS` forms and the non-devmode
-     auth gating are in the shared reference above.
-
-   **To test the user's path, use `-Click` / `-DoubleClick`** — reach for
-   them when the *navigation itself* is what you're verifying (the navigator
-   entry exists, is reachable, opens the right form), or when the user's
-   double-click gesture on a grid cell is what you're testing (`-OpenScript`
-   or `-Click` brings up the list form, `-DoubleClick` double-clicks a cell
-   there):
-
-   ```
-   lsfdev.ps1 verify -Click "Master data > Items"
-   lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -DoubleClick "Coffee beans" -DoubleClickExpect "Shop.item"
-   ```
-
-   `-Click` clicks navigator entries by their visible text (chain with `>`
-   for tab-then-entry) → `verify-click.png`. **`-DoubleClick` is a gesture,
-   not "open the card"** — what a double-click does is decided per cell by
-   the platform (web client `GKeyStroke.isEditObjectEvent`, measured on 7.0):
-   an **editable** cell starts its **in-place editor** (the `CHANGE` event)
-   and opens no form; a **read-only** cell of an object whose class has an
-   edit form (declared `EDIT` form or the auto-generated one) opens that
-   form (`editObject`); a property with `CHANGEMOUSE 'DBLCLK'` runs *that*
-   action instead, editable or not; a `CUSTOM` renderer decides itself; in a `DIALOG` a double-click
-   is *OK* (`System.formOk` is bound to it). So `verify` **classifies the
-   outcome** after the gesture — `opened form <sID> (active tab '…')`,
-   `in-place editor`, or `no visible reaction` — screenshots it →
-   `verify-dblclick.png`, and never fails on the outcome by itself. **To
-   assert that a card opened, add `-DoubleClickExpect "<form sID | tab
-   caption | text inside the card>"`** — it passes only on a form the
-   double-click opened (unmet = failed check, exit 2). When the card itself
-   is what you need to see, skip the gesture: the direct open `-OpenScript
-   "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i
-   DOCKED;" -OpenExpect "…"` opens it regardless of the list's cell state.
-
-   **To drive elements `-Click` cannot reach — buttons/inputs inside `CUSTOM`
-   (React) components, filters, dialogs — pass `-Do`**: an ordered list of
-   generic interaction steps, run after the `-OpenScript` open /
-   `-Click`/`-DoubleClick` navigation, each `verb:rest` with **any Playwright
-   selector** (css, `text=...`, `button:has-text(...)`):
-
-   - `click:<selector>` / `dblclick:<selector>` — e.g. `click:text=Поставить`
-     hits a React button by its caption. Failures are **classified** like
-     `-Click`'s, never a bare `Timeout 15000ms`: *DISABLED* (for native
-     lsFusion controls that usually means a **server-side** state —
-     `DISABLEIF`/readonly, commonest real cause: a value typed just before
-     was never committed; CUSTOM/React components may also disable purely
-     client-side), *another element intercepts the pointer* (naming the
-     overlay), *became hidden*, *disappeared* — mixed retry histories
-     report the **last** observed state. **Grid-row action buttons**:
-     `click:text="▶"` hits the column **header** (the header carries the
-     caption text; the row buttons are icon-only) — scope by row instead:
-     `click:tr:has-text("<text unique to that row>") .btn`. Interaction
-     verbs take the *first visible* match, so the row text must identify
-     ONE row, and bare `.btn` is safe only when the row has exactly one
-     button — with several, use a button-specific class/attribute from
-     `verify-dom.html`;
-   - `hover:<selector>` — real mouse-over (tooltips, hover-revealed handles);
-   - `rclick:<selector>` — right button: the real `contextmenu` event
-     (grid/row context menus) — no synthetic `dispatchEvent` via `eval:`
-     needed;
-   - `drag:<selector>=><selector>` — a **real mouse gesture**: `mousedown` on
-     the source, intermediate `mousemove`s, `mouseup` on the target — what
-     drag-to-draw UIs (Gantt dependency links, resize handles, sliders)
-     actually listen for. `click`/`dblclick`/`rclick`/`hover`/`drag`/`dnd`
-     selectors accept an `@x,y` offset from the element's top-left corner
-     (`drag:.task-a@120,8=>.task-b@4,8` starts from a bar's edge connector);
-   - `dnd:<selector>=><selector>` — **HTML5 drag-and-drop**, the OTHER drag
-     protocol: real `DragEvent`s (`dragstart` → `dragover` → `drop` →
-     `dragend`) sharing one live `DataTransfer`, so what the component's
-     `dragstart` handler `setData()`s is readable in its `drop` handler.
-     Kanban boards, sortable lists and drop zones (`draggable="true"`
-     elements) listen to these and never see a mouse-event drag — a
-     component speaks one protocol or the other, so when `drag:` visibly
-     does nothing, use `dnd:`. The step reports whether `dragover` was
-     `preventDefault()`ed (a real browser fires `drop` only then — `NOT
-     preventDefault()ed` means the target isn't an armed drop zone) and the
-     `DataTransfer` types the source set;
-   - `mouse:down[@x,y]` / `mouse:up[@x,y]` / `mouse:move@x,y[,steps]` — raw
-     viewport-coordinate primitives when even `drag:` isn't enough (multi-leg
-     gestures, precise paths). `move` glides in 12 interpolated steps by
-     default — each waypoint is dispatched with a small settle, because rapid
-     CDP moves get coalesced into 1–2 DOM events on a busy page and drag-draw
-     handlers never see the path;
-   - `fill:<selector>=><value>` — set an input's value (`=>` separates
-     selector from value; a plain last `=` also works);
-   - `type:<selector>=><value>` — same but pressing real keys, for React
-     inputs that ignore programmatic fills;
-   - `edit:<caption>=><value>` — **the way to type into an lsFusion
-     panel/grid cell**: the in-place editor's `<input>` does not exist until
-     the cell gets focus, so `fill:`/`type:` can never reach it, and a blind
-     `dblclick@x,y` is viewport-fragile. `edit:` finds the panel cell by its
-     visible caption (the platform's own label→cell wiring, exact match then
-     substring; any Playwright selector also works as the target — that's
-     how you hit a *grid* cell), double-clicks it, selects all, types the
-     value and **commits with the right gesture for the editor kind**:
-     single-line editors commit on Enter, but **multiline editors (`TEXT`
-     properties → `textarea`, rich text → contenteditable) treat plain
-     Enter as a NEWLINE** — the value then never reaches the server and
-     e.g. a `DISABLEIF` on it stays on; for those `edit:` commits by
-     **blurring the editor** (measured: the reliable commit for the plain
-     `TEXT` textarea — a focus loss commits every editor kind, which is
-     also why a "sacrificial" click elsewhere works by hand).
-     A caption miss fails fast and prints the editable panel captions of
-     the page; a cell whose double-click opens no editor (read-only, action
-     property) fails with that diagnosis instead of typing into the void;
-   - `press:<key>` (e.g. `Enter`), `eval:<js>` (result lands in the report),
-     `wait:<ms>`;
-   - `screenshot:<name>` — a screenshot **at that point of the chain** →
-     `<stem>-<name>.png` (letters, digits, `.`, `_` — **no dash**: a stem
-     may contain dashes, and only a dash-free name makes the file split
-     unambiguously at its last dash, otherwise stem `orders` +
-     `archive-menu` and stem `orders-archive` + `menu` would silently share
-     one file; the run's own artifact names — `login`, `app`, `open`,
-     `click`, `dblclick`, `do`, `dom`, `console`, `phase` — are reserved).
-     One chain can document
-     several screens — the menu opened by `rclick:`, the state after
-     `press:Escape` — instead of one run per screen; the post-chain
-     `verify-do.png` is still taken;
-   - `assert-count:<selector>=><n>` / `assert-text:<selector>=><substring>` —
-     **native assertions**: exactly `n` visible matches / some visible
-     match's text, **its own value, or the value of any visible
-     `input`/`textarea`/`select` inside it** contains the substring
-     (case-insensitive) — so a container selector (a panel, a form, a
-     component root) sees what its fields show. Both poll up to 5 s (a render lagging the previous
-     action isn't a failure), then fail the step — and with it the strict
-     `verify` exit — with a concrete diagnosis (`3 visible match(es),
-     expected 4`; the texts actually found). Prefer these over eyeballing
-     `verify-do.png` for countable/textual expectations.
-
-   `-Do` interaction verbs resolve selectors to the **first VISIBLE match**
-   (the `assert-*` verbs consider **all** visible matches). The web client
-   keeps the full DOM of inactive docked tabs — toolbars included — so a
-   selector like `button:has-text("Zapisz")` routinely matches a hidden
-   duplicate first. Hidden matches are skipped automatically and reported
-   in the step result (`2 matched, 1 visible - using the first visible`);
-   when **every** match is hidden the step fails with exactly that diagnosis
-   (scope the selector or close the other tabs), and a selector that can't
-   be parsed fails fast with Playwright's own parse error. Appending
-   `:visible` by hand is unnecessary, though it remains valid.
-
-   ```
-   lsfdev.ps1 verify -Click "Расписание" -Do "edit:Комментарий=>Иванов", "drag:.gantt-task-a=>.gantt-task-b", "click:button:has-text('Поставить')"
-   ```
-
-   The chain stops at the first failed step; each step's ok/error (and every
-   `eval` result) is printed, and the post-chain state goes to
-   `verify-do.png`; each `screenshot:<name>` step reports the file it wrote
-   (earlier runs' custom screenshots are not wiped — only the standard set
-   is — so trust the step lines, not a directory listing). Non-ASCII values in `-Do` cross the same argv boundary as
-   `api -Script` — when calling through bash + `powershell.exe`, put Cyrillic
-   text in an `eval:` step or run the command via an in-process PowerShell
-   tool instead (see the UTF-8 pitfall in step 4). **Steps with commas or
-   nested quoting → `-DoFile <path>`**: a UTF-8 file with a JSON array of
-   steps or ONE step per line (`#` comments allowed) — a nested
-   `powershell -Command` collapses `-Do` array commas into one argument,
-   gluing steps into a single garbled selector (lsfdev warns when a step
-   looks glued); the file transport cannot be corrupted by quoting layers.
-
-   **`verify` is strict by default: exit 0 means every requested check
-   passed.** Any failed check — `-OpenExpect` not found or found on the
-   wrong form, a WARNed open check, a failed `-Click`/`-DoubleClick`/`-Do`
-   step (assertions included), an unmet `-DoubleClickExpect`, a login
-   failure, a Playwright error — exits
-   **2**, so scripts and CI can trust `$LASTEXITCODE` instead of parsing
-   `[WARN]` lines. `-AllowWarnings` restores report-only exit 0; tool-level
-   errors (missing python, bad usage) exit 1 either way. Browser console
-   errors are reported but never flip the exit code (apps log noise there)
-   — with two upgrades. **Uncaught page exceptions get their own `[WARN]
-   Uncaught page exception: <Name>: <message> @ <resource>:<line>:<col>`
-   lines** (deduplicated, `(xN)` for repeats). Playwright delivers them
-   separately from the console stream (`pageerror`), so before they were
-   recorded a web resource that died while loading (a `SyntaxError`: the
-   **whole file never ran**, nothing it defines exists on the page) left
-   no trace in `verify-console.txt` beyond the `'X' is not a component` it
-   caused later; now the exception is listed *above* that diagnosis, and
-   when it is located in a file named exactly after the missing component
-   (a resource is named after what it defines: `…/web/init/BrokenView.js`
-   for `'BrokenView'`) or its message names that identifier, the report
-   says that file died before defining it — otherwise it only tells you to
-   check. The resource and 1-based position after `@` name the file — a
-   compile-time error has no stack, so that is the only thing that does;
-   exceptions from web workers and cross-origin iframes (delivered by
-   Playwright only, no CDP location) appear without one. And
-   **custom-view failures get their own
-   `[WARN]` diagnosis lines above the total counter** (both kinds stay
-   included in its count). A broken `.jsx` web resource
-   is served by the platform as a `console.error` stub *instead of* its
-   script, so the report prints `.jsx transform FAILED: … <resource>:
-   <Babel error + source position>` (and any render-time `Custom view
-   error: … '<fn>' is not a component`) plus what it means: the component
-   function never got defined, so every form using it renders an **empty
-   custom container** — the typical broken-custom-view signature; that
-   blank area on the screenshot is this failure, not a layout or data
-   problem. Fix the `.jsx` at the reported position and re-run — web
-   resources are picked up on the next page load, no restart. Since these
-   lines alone don't flip the exit code, **pair the run with an assertion
-   on content the view renders** (`-OpenExpect`, or `-Do
-   "assert-text:..."`) when a broken custom view must fail the batch.
-
-   **A hung page cannot hang `verify`.** The whole Playwright run sits under
-   a watchdog (default 180 s; `-Timeout <s>` sets the budget). On overrun
-   the run is tree-killed and the report names the hung step (`open-wait:
-   <form> is rendering`, `do 2/5: …`) plus the browser-console tail — the
-   signature of a form that wedges the web client's renderer, which is an
-   app bug to fix, not a Playwright/Chromium/machine problem. Exit is 1
-   (tool failure; `-AllowWarnings` does not soften it), artifacts written
-   before the hang stay on disk, and in `-Session` mode the session browser
-   is closed too (it held the wedged page and would poison the next call).
-
-   **A load that times out is usually explained on the web client's server
-   side — the report goes there for you.** Every page-load timeout is
-   named as a `[WARN] Load timeout - …` line — the navigation without a
-   `load` event, a `/login` page that never rendered its form, a direct
-   open that never reached `/main`, a `Loading` indicator still on screen
-   after 60 s — and the watchdog kill counts as one too. Each is followed
-   by the tail of `.lsfusion-dev/tomcat/logs/gwtlog-err.log`, the web
-   client's error log (log4j WARN+, also where every exception the browser
-   reports back is logged): **only what the run appended**, labeled as
-   such, or the last lines explicitly marked as older when nothing was
-   appended — in exactly these cases the browser console tends to be
-   silent while that file has the answer (measured). Local web client
-   only; with an explicit `-Url` to another server read *its*
-   `gwtlog-err.log`. The `Removing navigator session…` ERROR lines in it
-   are normal session cleanup, and the report says so.
-
-   **Iterating on a multi-step scenario? Add `-Session`.** By default every
-   `verify` run starts a fresh browser and pays the navigation (and the slow
-   first form open) again. With `-Session` the skill keeps one persistent
-   headless browser per project (detached Chromium on a derived CDP port) and
-   **continues the same live page on the next call** — navigation state, the
-   open form, even your `eval:` JS globals survive. While the page is anywhere
-   on the app (the base URL or `/main`, where `-OpenScript` lands) a session
-   call **never reloads or re-navigates it implicitly**. So: navigate once
-   (`verify -Session -OpenScript "SHOW ...;"` or `-Click "Расписание"`), then
-   iterate cheaply (`verify -Session -Do "drag:..."`, look at `verify-do.png`,
-   adjust, run again). Two consequences of "the page lives on":
-   - **Edited JS/CSS are not picked up** until the page reloads (they are
-     fresh on *every* load — see the web-resources note in step 4 — but an
-     un-reloaded page keeps the code it already runs). Pass `-Reload` to
-     force a fresh page, or simply re-run the `-OpenScript` call — it
-     re-navigates, so one call both reloads the code and reopens the form.
-   - Any reload/navigation **resets the app to its default state** (the web
-     client boots a new server-side navigator, closing open forms) — that is
-     why `-Reload` is explicit and never implied.
-   The session ends with `verify -EndSession`, and `stop`/`restart` close it
-   too (a page from before a schema restart would be stale). `-Locale` has no
-   effect on an already-running session.
-
-   **When a `-Click` misses, the output tells you why — read it before
-   theorizing.** A failed click is classified from Playwright's own log and
-   reported as one of: **not found** (no element with that visible text — the
-   output then prints the actual clickable captions harvested from the
-   failure-time page: `Clickable navigator captions: ...`, so pick from that
-   list instead of guessing); **intercepted** (element found and visible, but
-   an overlay — loading glass, sliding panel, hover popup — swallowed every
-   click; a forced click is attempted automatically and reported);
-   **disabled** (found and visible but never enabled — for native lsFusion
-   controls usually a server-side `DISABLEIF`/readonly/permission state);
-   or **not visible** (the text exists in the DOM but is CSS-hidden, e.g.
-   icon-only navbar entries — text-based `-Click` cannot hit those, use
-   `-Do 'click:<css>'` with a selector from `verify-dom.html`). Captions and row
-   text are locale/data-dependent — trust the printed caption list and
-   `verify-app.png` / `verify-click.png` over any assumption about what the
-   captions "should" be. `-Click`/`-DoubleClick`/`-Do` cover "did it render"
-   checks and single-form interactions; for anything bigger — multi-form
-   flows, assertions between steps, remote hosts — **don't fight `verify`**:
-   drive the flow in the in-app browser when the session has one (see the
-   split below), or **write a real Playwright script.** The lsfusion-eval
-   skill's Part 3 ships a ready Python template (login, waits, and
-   lsFusion-specific selectors already handled) — start from it, not from
-   scratch (for the direct-open URL in a hand-written script, use the
-   shared reference linked above).
-
-   The viewport defaults to **1920×1080** — judge layout at a realistic
-   size before calling it broken: on a narrow viewport dense forms
-   (calendars, wide grids) legitimately collapse into `+N more`
-   placeholders and the screenshot *looks* buggy while the app is fine.
-   Override with `-ViewportWidth/-ViewportHeight`, and pass `-Locale`
-   (e.g. `ru-RU`) when the browser-side language matters for the shot.
-
-   **First form open after a `restart` is slow — use generous Playwright
-   timeouts.** Opening a non-trivial form the first time after a restart
-   takes ~10–40 s (the server lazily builds the form, and a Maven project
-   may still be finishing compile). A naive `wait_for_selector(..., timeout=15000)`
-   or short fixed wait will time out and look like a failure when the page
-   is merely still building. For the *first* navigation after a restart,
-   wait **40–60 s** for your target selector (and a few seconds' settle
-   after the navigator click before clicking into a form). Subsequent
-   opens in the same server lifetime are fast. A lone timeout here is
-   almost always cold-start latency — re-run with a longer wait before
-   concluding the UI is broken.
-
-   **Put the budget in selector timeouts, never in fixed sleeps.** A
-   selector wait (`wait_for(..., timeout=60000)`) returns the instant the
-   element renders — an oversized budget costs nothing on a fast run. A
-   fixed sleep (`wait_for_timeout(15000)` "to be safe") burns its full
-   duration on *every* run: three such sleeps in a screenshot script is
-   ~20 s of guaranteed dead time per invocation. Reserve fixed waits for
-   sub-3-second UI settles (animation, focus) where no selector exists.
-
-   **In-app browser vs `verify` — the split.** Some sessions expose an
-   in-app browser as tools (Claude Desktop's Browser pane:
-   `mcp__Claude_Browser__*` — `navigate`, `computer`, `read_page`,
-   `get_page_text`, `find`, `form_input`, `read_console_messages`,
-   `read_network_requests`). **`verify` is the default path for checking
-   a form** — direct open at production viewport, assertions, artifacts
-   on disk, one call. The pane is a convenience for *reading* a page
-   that is already rendering (its text / DOM / console) and for quick
-   clicks — and on some machines it does not work at all, so the rule
-   is: **one attempt; on the first failure signature below, stop and run
-   `verify` — do not retry, resize, or reload your way through it.**
-   Measured cost of doing otherwise on one box: five wasted calls, after
-   which `verify` did the entire check — direct open, screenshots, DOM
-   checks, scrolling, a card click, typing into a search — in one run.
-   When the pane is absent (terminal CLI, headless runs, subagents, CI),
-   `verify` is the only path.
-
-   Pane failure signatures — each means "switch to `verify` now":
-   - **"The tab for this application is already opened. Please check
-     it"** after navigating to `<base>/eval/action?script=…` (the
-     platform's `push.notification.tab.already.opened` page): the direct
-     open's 302 landed on `/push-notification` and the service worker
-     did not hand the action to an app tab — not registered in the pane
-     profile, or the pane holds another tab on the app. Loading the base
-     URL first is part of the ONE attempt, not a recovery step; this page
-     is the stop signal (`verify`'s own open handles the same case with a
-     built-in reload).
-   - **Screenshots timing out** (~5 s each measured on one box, ~30 s
-     each right after the pane opens on another) while
-     `navigate`/`read_page`/JS work — interaction actions are gated on
-     one prior successful screenshot, so nothing interactive will run;
-     stop signal.
-   - **A navigator entry outside the viewport** even after
-     `resize_window` — and the pane's viewport is not the layout under
-     test anyway.
-
-   What works in the pane, when it works (measured against 7.0-SNAPSHOT):
-   - **Direct form open is the same URL mechanism.** Load the app base
-     URL first (that registers the service worker), then navigate to
-     `<base>/eval/action?script=<SHOW ... DOCKED;>` (URL-encoded) — the
-     302 → `/push-notification` → service-worker → `/main` dance works
-     in the pane and the form opens exactly as with `-OpenScript`. All
-     the `-OpenScript` rules above (DOCKED, namespace-qualified names,
-     script errors returned as text) apply verbatim; the "already
-     opened" page above is its failure mode.
-   - **Assert by reading, not by pre-declared matchers.**
-     `get_page_text` / `read_page` return the rendered text — check the
-     caption / cell values off that instead of betting an `-OpenExpect`
-     string. This kills locale and lookalike-character misses (real
-     case: Latin `-OpenExpect "KH0001"` reported not-found while the
-     grid showed Cyrillic «КН0001»).
-   - Clicks, fills, and key presses (`computer` + `find` +
-     `form_input`) cover `-Click`/`-DoubleClick` and most `-Do` steps —
-     with JSON parameters, so none of the PowerShell argv/UTF-8
-     pitfalls.
-   - `read_console_messages` shows the same errors `verify-console.txt`
-     counts; `read_network_requests` adds the HTTP layer `verify` never
-     captures. The page also persists across your tool calls —
-     `-Session` semantics for free, with the same caveats (JS/CSS edits
-     appear only after a reload; any reload boots a new server-side
-     navigator and closes open forms).
-
-   Where the pane is NOT sufficient even when it works — use `verify`
-   (measured):
-   - **Layout at production viewport.** Pane screenshots come back
-     ~800 px wide regardless of viewport (1920×1080 → 800×450; dense
-     grids illegible), and region zoom is unsupported. To judge
-     `DESIGN` at 1920×1080 (the "+N more" collapse problem above), use
-     `verify`'s full-resolution PNGs and Read them from disk. Shrinking
-     the pane to ≤800 px is no workaround — that changes the layout
-     under test.
-   - **Real drag gestures.** The pane's drag delivers ~2 intermediate
-     mousemoves (349 px jumps measured on a 700 px path), and multi-leg
-     gestures are inexpressible — drag-to-draw UIs (Gantt links,
-     sliders, resize handles) won't track it. Use `verify -Do
-     "drag:..."` / `mouse:` steps, which interpolate the path — and for
-     HTML5 drag-and-drop (kanban boards), `dnd:`, since mouse events
-     never reach `dragstart`/`drop` listeners at all.
-   - **Evidence.** The pane leaves nothing on disk — no PNGs to attach,
-     no JSON verdict, nothing re-runnable. When the user needs proof or
-     a repeatable check, run `verify` even after eyeballing the pane.
-   - **Capture flake.** A screenshot timeout is a stop signal (see the
-     signatures above): `read_page`/`get_page_text` may still answer, but
-     nothing interactive runs until a capture succeeds, and waiting for
-     one is exactly the loop that wasted the calls — go to `verify`.
-   - **No password entry.** Typing credentials in the pane is
-     off-limits for the agent. Irrelevant in devmode (auto-auth, no
-     login form), blocking on a non-devmode target — there `verify` / a
-     Playwright script does its own login.
+     Three rules: open the form in its production window mode (`DOCKED`
+     for navigator forms and edit cards — a bare `SHOW` opens a small
+     floating window whose layout is not what the user sees); **qualify
+     every name with its namespace** (the script compiles against *all*
+     loaded modules); assert with `-OpenExpect` on something rendered
+     *inside* the form (a cell value, a panel caption) — **never the
+     form's own caption**, which renders on the docked tab outside the
+     form and fails the scoped check. The report cross-checks the opened
+     form against the DOM: `[OK] Open check:` is the real pass, a `[WARN]
+     Open check:` means the `SHOW` did not take effect, and a found expect
+     under it is demoted to a WARN. Checking several forms in a row: pass
+     `-OutPrefix <stem>` per run, or each run overwrites the evidence of
+     the previous one.
+   - `-Click "Tab > Entry"` clicks navigator entries like a user;
+     `-DoubleClick "<cell text>"` is a **gesture** whose outcome the
+     platform decides per cell (editable → in-place editor, read-only →
+     the object's edit form) — `verify` classifies and screenshots it,
+     and `-DoubleClickExpect` asserts an opened card. `-Do
+     "<verb:step>",…` runs generic interaction steps by Playwright
+     selector (click/dblclick/rclick/hover/drag/dnd/mouse/fill/type/edit/
+     press/eval/wait/screenshot/assert-count/assert-text) — the way to
+     drive CUSTOM/React components; steps with commas or nested quotes go
+     through `-DoFile`. `-Session` keeps one live browser between calls
+     (never an implicit reload — `-Reload` after JS/CSS edits); `-Url
+     <base>` with `-User`/`-Password` points the same run at another web
+     client.
+   - **`verify` is strict: exit 0 means every requested check passed, any
+     failed check exits 2** (`-AllowWarnings` for report-only exit 0), tool
+     errors exit 1, and a **watchdog** (default 180 s, `-Timeout`)
+     tree-kills a wedged page and names the hung step. **Browser console
+     errors, uncaught page exceptions and custom-view failures (a broken
+     `.jsx` → an empty custom container) are reported as `[WARN]` lines but
+     never flip the exit code** — when a custom view must fail the batch,
+     assert on content it renders (`-OpenExpect`, `-Do "assert-text:…"`).
+     Read the classified failure before theorizing: `not found` (with the
+     real captions listed), `intercepted`, `disabled`, `not visible`; a
+     load timeout is followed by what the web client's `gwtlog-err.log`
+     received during the run.
+   - **If the session exposes an in-app browser** (Claude Desktop's
+     Browser pane — `mcp__Claude_Browser__*` tools), it may complement
+     `verify` for *reading* an already-rendered page — `verify` comes
+     first, and the pane gets **one attempt**: stop at the first failure
+     signature (the "tab is already opened" page after a direct open,
+     screenshots timing out, an entry outside the viewport) and never
+     retry, resize, reload or type a password through it; layout at
+     production viewport, real drag gestures and on-disk evidence come from
+     `verify` only. The full split with the measured signatures is the
+     last section of [references/verify.md](references/verify.md).
 
 **Verify print forms headless via PDF — don't assume.** There's no
 browser/IDE preview here, so render server-side and read the result:
@@ -1915,3 +1512,8 @@ using whatever the resolution chain above produces.
 - Deeper runtime details, all config keys, and a troubleshooting table are in
   [references/runtime.md](references/runtime.md) — read it when a command fails
   or the user asks about configuration.
+- The full `verify` contract — every option, the `-Do` step verbs, diagnosis
+  lines, the watchdog, `-Session`, `-Url`, the in-app browser split — is in
+  [references/verify.md](references/verify.md): read it before the first run
+  that uses `-Do`, `-DoubleClick`, `-Session` or `-Url`, and whenever a
+  `verify` run fails.

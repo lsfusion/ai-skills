@@ -194,9 +194,9 @@ function Test-KeepRunning([string]$dir) {
 
 function Resolve-LsfdevScript {
     # The plugin copy next to these hooks; falls back to the stable shim
-    # (%LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1, maintained by every lsfdev run)
-    # when the plugin cache this hook came from was pruned by an update while
-    # a GC runner was still sleeping.
+    # (%LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1, installed by the SessionStart
+    # hook and refreshed by every lsfdev run) when the plugin cache this hook
+    # came from was pruned by an update while a GC runner was still sleeping.
     $sibling = Join-Path $PSScriptRoot '..\skills\lsfusion-dev\scripts\lsfdev.ps1'
     try { if (Test-Path -LiteralPath $sibling) { return (Resolve-Path -LiteralPath $sibling).Path } } catch { }
     if ($env:LOCALAPPDATA) {

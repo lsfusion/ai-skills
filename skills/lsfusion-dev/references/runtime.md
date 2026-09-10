@@ -20,7 +20,8 @@ configuration, or when you need to change ports/versions.
     │   └── logs/gwtlog-err.log   the web client's error log (log4j WARN+,
     │                       incl. every exception the browser reports back);
     │                       verify prints what a run appended to it on any
-    │                       load timeout
+    │                       load timeout — for the LOCAL web client only
+    │                       (a server reached via -Url keeps its own log)
     ├── server.out.log / server.err.log
     ├── tomcat.out.log
     ├── server.pid / tomcat.pid
@@ -443,15 +444,10 @@ start. `dryrun -TopModule <M>` overrides it per-run via
 `lsfusion.properties`). The value may be a **comma-separated list** —
 the union of the closures is loaded; quote it (`-TopModule
 "Sales,Purchase"`) so PowerShell passes one string (measured: an unknown
-name anywhere in the list fails with `Module 'X' not found`). A stale
-local build predating list support reads the whole list as ONE module
-name and fails with `Module 'A,B' not found` — the command detects the
-pattern, says to update the platform, and names per-module runs as the
-interim workaround. Everything
-outside the closure
-is dropped **before parsing** — a module outside the closure contributes
-nothing, not even syntax errors — and dependents of the listed modules
-are not loaded either.
+name anywhere in the list fails with `Module 'X' not found`). Everything
+outside the closure is dropped **before parsing** — a module outside the
+closure contributes nothing, not even syntax errors — and dependents of
+the listed modules are not loaded either.
 Fast iteration: scoped run on the edited subtree; the gate before a
 restart: the unscoped run. Never persist a narrowed `topModule` into the
 project config: a *real* start with it would drop the out-of-closure
@@ -467,7 +463,8 @@ no `-Ddb.*` mirror, no init-marker write, no PID-file/port takeover of
 the real server (a stuck *dry run* is reaped via its own
 `.lsfusion-dev/dryrun.pid`). Artifacts: `dryrun.out.log` /
 `dryrun.err.log` / `dryrun-cmd.txt` in `.lsfusion-dev/`. Error
-reporting mirrors a restart: parse errors batched per file, **one
-semantic error per run**, printed with `file:line:col` from the first
-`ERROR` line onward (the multi-KB `Class path:` preamble is filtered
-out of the tail).
+reporting: parse errors batched per file **and semantic errors batched
+across the run** (`dryRun` implies `batchScriptErrors` — unlike a
+restart, which stops at the first semantic error), printed with
+`file:line:col` from the first `ERROR` line onward (the multi-KB `Class
+path:` preamble is filtered out of the tail).

@@ -67,10 +67,12 @@ sessions (the MCP server may prompt for authentication on first use).
 > **After `claude plugin update` / `marketplace update`:** a session that is
 > already open keeps the **old** SKILL.md it loaded at startup — instructions
 > refresh only in a new session. The updated *scripts* (e.g.
-> `scripts/lsfdev.ps1`) are available immediately, though: they are resolved
-> from the plugin cache by path at call time, and the cache path changes with
-> the version (`...\lsfusion-ai-skills\<version>\skills\...`) — so re-resolve
-> the script path instead of reusing one cached earlier in the conversation.
+> `scripts/lsfdev.ps1`) are available immediately through the stable entry
+> point `%LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1` (installed by the plugin's
+> SessionStart hook, refreshed by every run): it forwards to the newest
+> installed copy at call time. The versioned cache path
+> (`...\lsfusion-ai-skills\<version>\skills\...`) changes with every update,
+> so never pin commands or permission rules to it.
 
 ## Use the skills without the plugin
 

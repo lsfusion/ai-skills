@@ -1,9 +1,9 @@
 # Opening a specific lsFusion form directly by URL (no navigator clicking)
 
-Shared mechanism reference for the **lsfusion-dev** skill (`verify -OpenScript`
-automates all of this against the local dev install) and the **lsfusion-eval**
-skill (hand-written Playwright scripts and in-app-browser drives against any
-host). Verified live on 7.0-SNAPSHOT.
+Shared mechanism reference for `verify -OpenScript` (lsfusion-dev skill —
+the local dev install by default, any host with `-Url`), for the
+hand-written-script fallback of the lsfusion-eval skill's Part 3, and for
+in-app-browser reads. Verified live on 7.0-SNAPSHOT.
 
 ## The mechanism
 
@@ -46,9 +46,12 @@ FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
 - **Visit `<base>` (or `/main`) once first, in the same browser context** —
   that registers the service worker which delivers the action. In a virgin
   context a direct hit sticks on `/push-notification` (worker not yet in
-  control); one reload of the stuck page recovers. Then wait for `**/main*`
-  and for the form's caption/selector with a generous timeout — the first open
-  after a restart lazily builds the form (10–40 s).
+  control). In a hand-written script one reload of the stuck page recovers a
+  freshly registered worker, and `verify` performs that reload itself; in the
+  in-app pane the resulting "already opened" page is a **stop signal** —
+  follow the split in lsfusion-dev step 5, do not reload. Then wait for
+  `**/main*` and for the form's caption/selector with a generous timeout — the
+  first open after a restart lazily builds the form (10–40 s).
 - **Qualify names with namespaces** (`Shop.items`, not `items`) — the script
   compiles against *all* loaded modules, so bare names that are unique in your
   module are routinely ambiguous.
@@ -65,12 +68,16 @@ FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
 
 ## Where this runs
 
-- **Local dev install:** don't hand-roll it — `lsfdev.ps1 verify -OpenScript
-  "..."` (or `-OpenScriptFile`) does all of the above, with a screenshot and
-  an `-OpenExpect` assertion (lsfusion-dev skill, step 5).
-- **Remote / deployed hosts:** a Playwright script — lsfusion-eval skill,
-  Part 3; the [playwright-remote.py](playwright-remote.py) template beside
-  this file already handles login and waits.
+- **Local dev install and any host reachable with `-Url`:** don't hand-roll
+  it — `lsfdev.ps1 verify -OpenScript "..."` (or `-OpenScriptFile`) does all
+  of the above, with a screenshot and an `-OpenExpect` assertion (lsfusion-dev
+  skill, step 5); add `-Url <base> -User … -Password …` for a deployed or
+  non-devmode target.
+- **Hand-written Playwright script** (lsfusion-eval skill, Part 3 — only when
+  `verify` is unavailable or cannot express the operation): the
+  [playwright-remote.py](playwright-remote.py) template beside this file
+  already handles login and waits.
 - **In-app browser pane:** the same URL works after loading the base URL once
-  in the pane; assert by reading the page (`get_page_text` / `read_page`)
-  rather than by pre-declared text matchers.
+  in the pane — but only after `verify`, for one attempt, under the split in
+  lsfusion-dev step 5; assert by reading the page (`get_page_text` /
+  `read_page`) rather than by pre-declared text matchers.

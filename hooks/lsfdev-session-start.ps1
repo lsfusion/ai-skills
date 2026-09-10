@@ -6,6 +6,10 @@
 # something to say. Its stdout is added to Claude's context - that is the
 # channel used to report an auto-stop, so nothing else may reach stdout.
 #
+#   0. The stable lsfdev entry point %LOCALAPPDATA%\lsfusion-dev\lsfdev.ps1
+#      is installed / refreshed from the plugin copy next to these hooks
+#      (skills\lsfusion-dev\scripts\lsfdev-shim.ps1): the one path the docs
+#      recommend, valid before the first lsfdev call and across plugin updates.
 #   1. A pending stop for THIS session id (the CLI process ended, the user came
 #      back before the grace ran out) -> restored into the live ledger. The
 #      auto-stop is cancelled; the session owns its servers again.
@@ -32,6 +36,25 @@ $cwd = [string]$in.cwd
 $cwdNorm = $cwd.TrimEnd('\', '/')
 
 $notes = New-Object System.Collections.Generic.List[string]
+
+# 0. stable shim: (re)written from the plugin copy next to these hooks, so it
+#    exists before the first lsfdev call of a fresh install and is re-pointed
+#    right after a plugin update - nobody has to run the versioned script
+#    first. The writer never prints; a rewrite is recorded in the hook log.
+try {
+    $shimLib = Join-Path $PSScriptRoot '..\skills\lsfusion-dev\scripts\lsfdev-shim.ps1'
+    if (Test-Path -LiteralPath $shimLib) {
+        . $shimLib
+        $shimScripts = Split-Path -Parent (Resolve-Path -LiteralPath $shimLib).Path
+        $shimPath = Sync-StableShim -ScriptDir $shimScripts
+        if ($shimPath -and $script:StableShimWritten) {
+            Write-HookLog 'start' ("session {0} source={1}: stable shim written: {2} (forwards to the newest installed copy; fallback {3})" -f $sid, $source, $shimPath, (Join-Path $shimScripts 'lsfdev.ps1'))
+        }
+    }
+} catch {
+    Write-HookLog 'start' "session $sid source=${source}: stable shim sync error $($_.Exception.Message)"
+}
+
 try {
     # 1. own pending stop -> live again
     $own = Get-PendingPath $sid
