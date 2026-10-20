@@ -59,20 +59,20 @@ card of one specific object:
 ```
 # a navigator form by name - assert a value the form SHOWS (a grid cell,
 # a panel value), never the form's own caption (see the -OpenExpect rule below)
-lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Coffee beans"
+lsfdev.ps1 verify -OpenScript "SHOW Shop.items WINDOW;" -OpenExpect "Coffee beans"
 
 # the edit card of one object, looked up by business key
-lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;" -OpenExpect "Coffee beans"
+lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i WINDOW;" -OpenExpect "Coffee beans"
 
 # ...or by internal id (grab it beforehand with api: EXPORT FROM id = Shop.Item i, ...)
-lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHOW EDIT Shop.Item = i DOCKED;"
+lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHOW EDIT Shop.Item = i WINDOW;"
 ```
 
 - **Open the form in the window mode it will have in production — for
-  navigator forms and edit cards that means `DOCKED`, as in every example
+  navigator forms and edit cards that means `WINDOW`, as in every example
   above.** A bare `SHOW` in this call context defaults to a small
   *floating* window whose layout (column widths, flex fills, collapsed
-  containers) is not what the user will see — append `DOCKED` to judge
+  containers) is not what the user will see — append `WINDOW` to judge
   the actual `DESIGN`; keep `FLOAT`/`EMBEDDED`/`POPUP` only when the
   form genuinely opens that way in prod (e.g. `DIALOG`, `SHOW … FLOAT`),
   and when prod opens the form through a project action, call *that
@@ -132,7 +132,7 @@ lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHO
 
   ```
   foreach ($f in 'items','partners','orders') {
-    lsfdev.ps1 verify -OpenScript "SHOW Shop.$f DOCKED;" -OutPrefix $f
+    lsfdev.ps1 verify -OpenScript "SHOW Shop.$f WINDOW;" -OutPrefix $f
   }
   ```
 
@@ -158,7 +158,7 @@ there):
 
 ```
 lsfdev.ps1 verify -Click "Master data > Items"
-lsfdev.ps1 verify -OpenScript "SHOW Shop.items DOCKED;" -DoubleClick "Coffee beans" -DoubleClickExpect "Shop.item"
+lsfdev.ps1 verify -OpenScript "SHOW Shop.items WINDOW;" -DoubleClick "Coffee beans" -DoubleClickExpect "Shop.item"
 ```
 
 `-Click` clicks navigator entries by their visible text (chain with `>`
@@ -179,7 +179,7 @@ caption | text inside the card>"`** — it passes only on a form the
 double-click opened (unmet = failed check, exit 2). When the card itself
 is what you need to see, skip the gesture: the direct open `-OpenScript
 "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i
-DOCKED;" -OpenExpect "…"` opens it regardless of the list's cell state.
+WINDOW;" -OpenExpect "…"` opens it regardless of the list's cell state.
 
 ## Generic interaction steps — `-Do`
 
@@ -507,10 +507,10 @@ Pane failure signatures — each means "switch to `verify` now":
 What works in the pane, when it works (measured against 7.0-SNAPSHOT):
 - **Direct form open is the same URL mechanism.** Load the app base
   URL first (that registers the service worker), then navigate to
-  `<base>/eval/action?script=<SHOW ... DOCKED;>` (URL-encoded) — the
+  `<base>/eval/action?script=<SHOW ... WINDOW;>` (URL-encoded) — the
   302 → `/push-notification` → service-worker → `/main` dance works
   in the pane and the form opens exactly as with `-OpenScript`. All
-  the `-OpenScript` rules above (DOCKED, namespace-qualified names,
+  the `-OpenScript` rules above (WINDOW, namespace-qualified names,
   script errors returned as text) apply verbatim; the "already
   opened" page above is its failure mode.
 - **Assert by reading, not by pre-declared matchers.**

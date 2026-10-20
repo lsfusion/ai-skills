@@ -3320,7 +3320,7 @@ function Cmd-Verify {
                     Ok "Double-click on '$($dc.target)' opened $what$tabNote - $dblShot"
                 }
                 'editor' {
-                    Warn "Double-click on '$($dc.target)' opened an IN-PLACE EDITOR ($($dc.editor)) - NO form opened. The cell is editable, so lsFusion starts cell editing there; a double-click opens the object's edit form only on a read-only cell (or through an explicit CHANGEMOUSE binding). For a deterministic card open use -OpenScript ""FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;"" with -OpenExpect."
+                    Warn "Double-click on '$($dc.target)' opened an IN-PLACE EDITOR ($($dc.editor)) - NO form opened. The cell is editable, so lsFusion starts cell editing there; a double-click opens the object's edit form only on a read-only cell (or through an explicit CHANGEMOUSE binding). For a deterministic card open use -OpenScript ""FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i WINDOW;"" with -OpenExpect."
                 }
                 'none' {
                     Warn "Double-click on '$($dc.target)' produced NO visible reaction (no form opened, no editor) - a CUSTOM renderer, an action without a double-click binding, or a cell the platform ignores; check $dblShot."
@@ -4806,7 +4806,7 @@ plugin-cache path embeds the plugin version and dies on every update.
   status         Show running processes and ports.
   log            Print the server log tail and a verdict.
   verify         Playwright (headless Chromium) screenshot + DOM dump of the web UI.
-                 -OpenScript "SHOW <form> DOCKED;" opens a form directly (no
+                 -OpenScript "SHOW <form> WINDOW;" opens a form directly (no
                  navigator clicking, parameterizable); -Click clicks through
                  the navigator like a user would; -DoubleClick double-clicks
                  a grid cell and classifies what the platform did with it
@@ -4964,9 +4964,9 @@ Common options:
   -OpenScript <code>    'verify' only: open a form DIRECTLY by navigating to
                         /eval/action?script=<code> - no navigator clicking.
                         The code is an lsFusion action script, typically
-                        SHOW <form> DOCKED; or
-                        FOR <key> DO SHOW EDIT <Class> = o DOCKED;
-                        (qualify names with the namespace; DOCKED renders the
+                        SHOW <form> WINDOW; or
+                        FOR <key> DO SHOW EDIT <Class> = o WINDOW;
+                        (qualify names with the namespace; WINDOW renders the
                         form as a tab like in production - without it the
                         form opens as a small floating window). Output goes
                         to verify-open.png (the stem follows -OutPrefix).
@@ -5014,7 +5014,7 @@ Common options:
                         unless -AllowWarnings). A deterministic card open
                         needs no gesture at all: -OpenScript "FOR
                         Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT
-                        Shop.Item = i DOCKED;" with -OpenExpect.
+                        Shop.Item = i WINDOW;" with -OpenExpect.
   -Do <step>[,<step>]   'verify' only: generic interaction steps, run in order
                         AFTER the -Click/-DoubleClick navigation - the way to
                         reach buttons/inputs inside CUSTOM (React) components

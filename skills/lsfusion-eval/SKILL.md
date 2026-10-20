@@ -504,6 +504,14 @@ didn't run" — the row is there, the value is just NULL (not yet computed, or
 genuinely empty). To keep the key present regardless, make the value
 non-NULL explicitly: `b = OVERRIDE g(x), 0` (or `''`).
 
+**Several `EXPORT`s in one script → only the last one comes back.** Each
+`EXPORT` overwrites the same result property (`exportFile()`), so a
+diagnostics script with five exports returns the fifth and silently drops the
+rest — it looks as if the earlier queries matched nothing (verified on
+7.0-SNAPSHOT: `EXPORT FROM a = 1; EXPORT FROM b = 2;` → `{"b":2}`). For scalar
+probes, combine the values in one `EXPORT FROM a = ..., b = ..., c = ...;`;
+probes over different row sets go into separate calls.
+
 **Don't wrap `EXPORT` in `NEWSESSION { ... }`.** The export lands in a
 session-local property (`exportFile()`), which the HTTP layer reads *after*
 the action finishes; a surrounding `NEWSESSION` throws that property away on
@@ -778,7 +786,7 @@ The lsfusion-dev skill's `verify` command targets the local dev install by
 default and **any other web client with `-Url`**:
 
 ```
-lsfdev.ps1 verify -Url https://host/app/ -User admin -Password '<pwd>' -OpenScript "SHOW Shop.items DOCKED;" -OpenExpect "Coffee beans" -Do "assert-text:[lsfusion-form='Shop.items']=>Tea","screenshot:items"
+lsfdev.ps1 verify -Url https://host/app/ -User admin -Password '<pwd>' -OpenScript "SHOW Shop.items WINDOW;" -OpenExpect "Coffee beans" -Do "assert-text:[lsfusion-form='Shop.items']=>Tea","screenshot:items"
 ```
 
 One run gives you the login (detected automatically — pass the web
@@ -833,8 +841,8 @@ service worker → `/main`), exactly as if the user had opened it — fully
 parameterizable down to one object's edit card:
 
 ```lsf
-SHOW Shop.items DOCKED;
-FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
+SHOW Shop.items WINDOW;
+FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i WINDOW;
 ```
 
 **Before writing a script around this, read
@@ -842,7 +850,7 @@ FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
 mechanism reference (also behind lsfusion-dev's `verify -OpenScript`, the
 standard direct-open path: the configured local install by default, another
 host with `-Url`). It carries the rules
-that make the call work: `DOCKED` window mode (a bare `SHOW` floats and
+that make the call work: `WINDOW` window mode (a bare `SHOW` floats and
 renders unrepresentative layout), the service-worker registration visit and
 stuck-page recovery, namespace-qualified names, URL-encoding, script errors
 coming back as the 500 body, and the auth gates on non-devmode installs.
@@ -873,7 +881,7 @@ read it before writing your own, and tighten its waits for your target.
   assume it does nothing either — check what opened: every form layout root
   carries `lsfusion-form="<sID>"`, a new visible one after the gesture is an
   opened form (`visible_forms()` in the template). Deterministic route: the
-  direct open `SHOW EDIT <Class> = <obj> DOCKED` (URL mechanism above,
+  direct open `SHOW EDIT <Class> = <obj> WINDOW` (URL mechanism above,
   `open_by_script()` in the template) — parameterized, locale-free. Toolbar
   route: select the row, then click the form's `Edit` action **inside that
   form's subtree** (`[lsfusion-form="<sID>"]`) by its *localized* caption —

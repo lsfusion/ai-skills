@@ -23,8 +23,8 @@ it is fully parameterizable — a named form, a form with bound objects, or the
 edit card of one specific object:
 
 ```lsf
-SHOW Shop.items DOCKED;
-FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
+SHOW Shop.items WINDOW;
+FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i WINDOW;
 ```
 
 `SHOW EDIT <Class> = <obj>` opens the class edit form (the one declared with
@@ -33,11 +33,11 @@ FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i DOCKED;
 
 ## Rules that make it work
 
-- **Window mode: open the form the way production opens it — `DOCKED` for
+- **Window mode: open the form the way production opens it — `WINDOW` for
   anything reachable from the navigator and for edit cards**, as in both
   examples. In this call context a bare `SHOW` is synchronous, which defaults
   to a small **floating** window — the rendered layout (column widths, flex
-  fills, collapsed containers) then does not match what a user sees. `DOCKED`
+  fills, collapsed containers) then does not match what a user sees. `WINDOW`
   opens the form as a tab filling the forms panel. Keep `FLOAT` (or
   `EMBEDDED`/`POPUP`) only when the form genuinely opens that way in
   production (e.g. it is shown via `DIALOG` or `SHOW … FLOAT` in the code) —

@@ -1134,7 +1134,7 @@ def main() -> int:
                     help="navigation timeout in ms")
     ap.add_argument("--open-script-file", default="",
                     help="path to a UTF-8 file with an lsFusion action script "
-                         "(e.g. \"SHOW myForm DOCKED;\" - DOCKED renders the "
+                         "(e.g. \"SHOW myForm WINDOW;\" - WINDOW renders the "
                          "form as a tab like in production); after landing, "
                          "navigate to <base>/eval/action?script=... - the "
                          "platform routes the interactive action back into "

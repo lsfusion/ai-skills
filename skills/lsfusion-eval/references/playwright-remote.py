@@ -40,7 +40,7 @@ wrote it — leave them in):
 - A double-click on a grid row is NOT "open the card": the platform decides
   per cell (editable -> in-place editor; read-only + class edit form -> the
   card; CHANGEMOUSE -> that action; CUSTOM -> whatever it renders). Open a
-  card deterministically with `open_by_script()` (SHOW EDIT ... DOCKED), or
+  card deterministically with `open_by_script()` (SHOW EDIT ... WINDOW), or
   select the row and click the form's own `Edit` toolbar action, scoped to
   that form (`open_detail_via_edit(page, form_sid=..., caption=...)`), and
   prove it with `visible_forms()` before/after.
@@ -158,8 +158,8 @@ def open_by_script(page, script, timeout=60000):
     it. Parameterizable down to one object's edit card and independent of
     what any cell does on double-click:
         open_by_script(page, "FOR Shop.name(Shop.Item i) = 'Coffee beans' "
-                             "DO SHOW EDIT Shop.Item = i DOCKED;")
-    Use DOCKED (production layout) and namespace-qualified names. The page
+                             "DO SHOW EDIT Shop.Item = i WINDOW;")
+    Use WINDOW (production layout) and namespace-qualified names. The page
     reloads, so forms opened earlier are gone; the app's beforeunload confirm
     is blocked by headless Chromium (no user gesture) — expected. A script
     error comes back as a 500 page instead of the redirect: its body is the
@@ -293,7 +293,7 @@ def navigate_and_capture():
             opened = open_detail_via_edit(page, form_sid="<Module.listForm>", caption="Edit")
             # Route B — no gesture at all, the card by object (parameterized):
             #   opened = open_by_script(page, "FOR Shop.name(Shop.Item i) = "
-            #       "'<visible row label>' DO SHOW EDIT Shop.Item = i DOCKED;")
+            #       "'<visible row label>' DO SHOW EDIT Shop.Item = i WINDOW;")
             print(f"  forms opened: {opened}")
             shot(page, "04-item-detail.png")
             page.keyboard.press("Escape")
