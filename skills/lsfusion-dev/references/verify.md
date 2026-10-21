@@ -64,7 +64,7 @@ lsfdev.ps1 verify -OpenScript "SHOW Shop.items WINDOW;" -OpenExpect "Coffee bean
 # the edit card of one object, looked up by business key
 lsfdev.ps1 verify -OpenScript "FOR Shop.name(Shop.Item i) = 'Coffee beans' DO SHOW EDIT Shop.Item = i WINDOW;" -OpenExpect "Coffee beans"
 
-# ...or by internal id (grab it beforehand with api: EXPORT FROM id = Shop.Item i, ...)
+# ...or by internal id (grab it beforehand with api: RETURN JSON FROM id = Shop.Item i, ...)
 lsfdev.ps1 verify -OpenScript "FOR LONG(Shop.Item i AS Shop.Item) = 32178 DO SHOW EDIT Shop.Item = i WINDOW;"
 ```
 

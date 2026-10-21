@@ -66,7 +66,7 @@ you make from reading local code is wrong.
 | Clean up all rows of a class | **This skill** — POST a delete-and-apply script to `/eval/action` |
 | Evaluate an lsFusion expression / call an action on a running server | **This skill** — HTTP Action API |
 | Confirm a class / property / form exists in the running schema | **This skill** — `RETURN OVERRIDE (GROUP SUM 1 IF Class c IS Class), 0;` over `/eval/action`: 200 + count = exists, 500 "not found" = it doesn't |
-| Count / sample data | **This skill** — `RETURN <expr>;` (or `EXPORT FROM ...` for tabular data) |
+| Count / sample data | **This skill** — `RETURN <expr>;` (or `RETURN JSON FROM ...` for tabular data) |
 | See the `.lsf` source actually loaded on a remote host | **This skill** — `/files/list`, `/files/read`, `/files/search` on the web port |
 | Inspect physical DB tables / columns / indexes | Direct `psql` — but this is a last resort; **first ask the user**, per the rule in the **lsfusion-dev** skill. lsFusion mangles names; raw SQL almost always misleads. |
 | Edit `.lsf` source | The lsfusion-dev skill + IDE MCP tools |
@@ -101,9 +101,9 @@ Most introspection ("does this class exist", "count rows", "send a value
 back") fits `/eval/action` — you write one line of action code that sends
 the answer back in the response body, the server runs it, you read the
 value (the status code alone only proves the script compiled). The
-value-returning statement is `RETURN <expr>;` for a scalar; for tabular /
-structured data use `EXPORT FROM ...;` — both are detailed in "Getting
-values back" below.
+value-returning statement is always `RETURN`: `RETURN <expr>;` for a
+scalar, `RETURN JSON FROM ...;` for tabular / structured data — both are
+detailed in "Getting values back" below.
 
 **Access control — `enableAPI` is the master gate; `@@api`/`@@noauth` are
 per-action overrides.** The `enableAPI` working parameter (default **`0`**;
@@ -264,15 +264,15 @@ is part of the workflow.
 | Status | Meaning |
 |---|---|
 | `HTTP 200`, empty body | Script compiled, name-resolved against the running schema, and ran — **nothing more**. A `MESSAGE` produces exactly this (its text is swallowed — see the gotchas), and so does a mutation whose `APPLY` was silently **canceled by a constraint**. An empty 200 is never data-level proof; write scripts that `RETURN` something. |
-| `HTTP 200`, body present | Script ended in `RETURN <expr>;` or declared an `EXPORT FROM ...` — the value/export is the body. See "Getting values back" below. |
+| `HTTP 200`, body present | Script ended in `RETURN <expr>;` (a scalar, or `RETURN JSON FROM ...` for structured data) — the value is the body. See "Getting values back" below. |
 | `HTTP 401` | Auth issue — see the trap table above. Usually means you sent the wrong `-u` form, NOT that the password is wrong. |
 | `HTTP 500`, body with `[error]:` | The script failed one of the compile phases (see "Syntax-checking" below for the exact order). Three error shapes, in the order the server checks them: a **parse error** (`no viable alternative`, `extraneous input`, `missing X`, `mismatched input`) = bad syntax; **`X cannot be used in EVAL module`** = a forbidden construct whose **syntax** is fine (this check preempts name resolution — see below); **`... is not found`** = an unknown class/property/action (the deployed config differs from yours, or a missing REQUIRE), reported only for scripts free of forbidden constructs. Genuine type mismatches (`... types don't match`, `should have integral class`) surface only when the value is realized — note INTEGER+STRING is **not** one (it coerces). **Parse** errors come batched (every statement's, in one response); **name** errors surface one per call — the body then ends with `Only the first error is reported: set 'batchScriptErrors' (or run with 'dryRun') to report several errors at once.` (a server started with `settings.batchScriptErrors=true` batches them instead and drops that trailer). |
 | `HTTP 404` | Endpoint not in this build (no `Eval` module REQUIREd, or wrong path). |
 
 The canonical "is this name in the running schema?" check against
 `/eval/action` is
-`EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF MyClass o IS MyClass), 0);`
-(or the `RETURN` one-liner) — a 500 "not found" answers *no*, a 200
+`RETURN OVERRIDE (GROUP SUM 1 IF MyClass o IS MyClass), 0;`
+— a 500 "not found" answers *no*, a 200
 with the count in the body answers *yes* (and tells you how many). Don't use
 `MESSAGE` for this: it yields the same empty 200 as half a dozen failure
 modes.
@@ -463,64 +463,90 @@ curl -sS -X POST \
 ```
 
 **One NULL annihilates a concatenated `RETURN` — build multi-value probes
-as `EXPORT` columns instead.** String `+` propagates NULL, so a probe like
+as `JSON FROM` columns instead.** String `+` propagates NULL, so a probe like
 `RETURN 'items=' + STRING(cntItems()) + ' orders=' + STRING(cntOrders());`
 returns an **empty body** the moment any single operand is NULL —
 indistinguishable from the other no-proof empty 200s, and the
-"empty body → use `RETURN`/`EXPORT`" hint won't rescue you because a
+"empty body → use `RETURN`" hint won't rescue you because a
 `RETURN` *was* there (measured: one NULL among a dozen concatenated
-counters blanked the whole probe). Give each value its own `EXPORT` column
-— a NULL column just drops out of the JSON while the rest survive
-(verified live: `EXPORT FROM a = 1, b = (1 IF 1>2), c = 'ok';` →
-`{"a":1,"c":"ok"}`; the missing-key rule below tells you how to read
-that). If you do concatenate into one `RETURN`, wrap **every** operand in
-`OVERRIDE ..., 0` / `OVERRIDE ..., ''` — as the two-counter recipe under
-Common recipes does; one bare operand is enough to blank the body.
+counters blanked the whole probe). Give each value its own column of a
+`RETURN JSON FROM` — a NULL column just drops out of the JSON while the
+rest survive (verified live: `RETURN JSON FROM a = 1, b = (1 IF 1>2), c = 'ok';`
+→ `{"a": 1, "c": "ok"}`; the missing-key rule below tells you how to read
+that — and if **every** column is NULL, the whole JSON is NULL and the body
+is empty again). If you do concatenate into one `RETURN`, wrap **every**
+operand in `OVERRIDE ..., 0` / `OVERRIDE ..., ''` — as the two-counter
+recipe under Common recipes does; one bare operand is enough to blank the
+body.
 
-**2. `EXPORT FROM` to stdout via the response body.** For tabular /
-structured data the
-action's `EXPORT` target becomes the HTTP response body — content type is
-derived from the format keyword.
+**2. `RETURN JSON FROM ...` — tabular / structured data.** The `JSON`
+operator builds a JSON value from a list of properties (or
+`JSON(formName OBJECTS ...)` from a form), and `RETURN` sends it back as the
+body with `Content-Type: application/json`.
 
 ```bash
 # (localhost devmode → NO -u; on production add -u 'admin:')
 curl -sS -X POST \
   -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
   --data-urlencode "script=
-EXPORT JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
+RETURN JSON FROM idItem = id(Item i), nameItem = name(i) WHERE i IS Item;
 " \
   http://localhost:7651/eval/action
 
-# scalars work via EXPORT too:
-#   EXPORT FROM res = 'hello';            → {"res":"hello"}
-#   EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Item i IS Item), 0);
+# a single object when no column has a parameter:
+#   RETURN JSON FROM res = 'hello';        → {"res": "hello"}
 ```
 
-**A missing JSON key means NULL, not a failed export.** `EXPORT JSON` simply
-**omits** a key whose value is NULL for that object: with `EXPORT JSON FROM
-a = f(X x), b = g(x)`, an object where `g` is NULL comes back as
-`{"a": ...}` — no `"b"` at all. Don't read absent keys as "the calculation
-didn't run" — the row is there, the value is just NULL (not yet computed, or
-genuinely empty). To keep the key present regardless, make the value
-non-NULL explicitly: `b = OVERRIDE g(x), 0` (or `''`).
+Two properties of a `JSON` value to keep in mind (verified on 7.0):
 
-**Several `EXPORT`s in one script → only the last one comes back.** Each
-`EXPORT` overwrites the same result property (`exportFile()`), so a
-diagnostics script with five exports returns the fifth and silently drops the
-rest — it looks as if the earlier queries matched nothing (verified on
-7.0-SNAPSHOT: `EXPORT FROM a = 1; EXPORT FROM b = 2;` → `{"b":2}`). For scalar
-probes, combine the values in one `EXPORT FROM a = ..., b = ..., c = ...;`;
-probes over different row sets go into separate calls.
+- **It is normalized** — key order and spacing are not kept
+  (`{"pop": 1, "name": "Brest"}` for columns declared `name, pop`). Parse it,
+  don't compare it as text.
+- **An empty JSON is NULL** — no matching rows (or only NULL values) gives an
+  **empty body**, not `[]`; an empty nested object group is dropped with its
+  key. When "no rows" must come back as `[]`, override it:
+  `RETURN OVERRIDE (JSON FROM ... WHERE ...), JSON('[]');`.
 
-**Don't wrap `EXPORT` in `NEWSESSION { ... }`.** The export lands in a
-session-local property (`exportFile()`), which the HTTP layer reads *after*
-the action finishes; a surrounding `NEWSESSION` throws that property away on
-exit, so the response comes back **empty with HTTP 200** (verified on
-7.0). This is specific to `EXPORT` — `RETURN` is control flow that
-propagates up the stack, so `NEWSESSION { ... RETURN x; }` *does* return `x`
-(verified on 7.0). Either way, one-shot eval scripts don't need `NEWSESSION`
-at all — every `/eval`/`/eval/action` call already runs in its own fresh
-session — so just keep the `EXPORT`/`RETURN` at the top level.
+**Other formats (CSV, XML, XLSX, ...) — `EXPORT ... TO` a local file, then
+`RETURN` it:**
+
+```lsf
+LOCAL f = FILE ();
+EXPORT CSV ';' HEADER FROM n = name(Item i) ORDER name(i) TO f;
+RETURN f();
+```
+
+The response then carries the file with the content type of its extension
+(`text/csv` here) — the same body a bare `EXPORT` gives. Likewise,
+`EXPORT JSON FROM ... TO f; RETURN f();` returns JSON byte for byte as exported
+(key order kept, `[]` for no rows).
+
+**A missing JSON key means NULL, not a failed export.** `JSON FROM` (like
+`EXPORT JSON`) simply **omits** a key whose value is NULL for that object:
+with `RETURN JSON FROM a = f(X x), b = g(x)`, an object where `g` is NULL
+comes back as `{"a": ...}` — no `"b"` at all. Don't read absent keys as "the
+calculation didn't run" — the row is there, the value is just NULL (not yet
+computed, or genuinely empty). To keep the key present regardless, make the
+value non-NULL explicitly: `b = OVERRIDE g(x), 0` (or `''`).
+
+**Don't answer with a bare `EXPORT` (no `TO`).** It writes the
+session-local `exportFile()`, which reaches the body only by accident: only
+when the action has **no `RETURN` with a value anywhere in its body** — not
+even on a branch that never runs — and only if nothing drops it first: a
+surrounding `NEWSESSION` throws it away on exit, and a later `APPLY`
+resets it, both giving an **empty body with HTTP 200** (verified on 7.0).
+And each bare `EXPORT` overwrites that same property, so a diagnostics
+script with five of them returns only the fifth — it looks as if the
+earlier queries matched nothing (`EXPORT FROM a = 1; EXPORT FROM b = 2;` →
+`{"b":2}`). With `RETURN` the first one executed ends the script, so put
+several values into one `RETURN JSON FROM a = ..., b = ...`, and several
+row sets into one as nested columns:
+`RETURN JSON FROM items = (JSON FROM n = name(Item i)), orders = (JSON FROM n = number(Order o));`
+(a nested JSON with no rows is dropped with its key).
+`RETURN` has none of these traps — its value survives `NEWSESSION` and
+`APPLY` (`NEWSESSION { ... RETURN x; }` *does* return `x`, verified on 7.0).
+One-shot eval scripts don't need `NEWSESSION` at all anyway — every
+`/eval`/`/eval/action` call already runs in its own fresh session.
 
 For one-off introspection (just confirming a class exists), `RETURN` is also
 the shortest form — the same one-liner as a compile-probe, but the count
@@ -529,25 +555,23 @@ comes back in the body instead of an ambiguous empty 200.
 ### Common recipes
 
 Each answers in the response body (verified live on 7.0-SNAPSHOT).
-Any scalar `EXPORT` form can be shortened to `RETURN <the same expr>;`.
 
 ```lsf
 // Does class X exist, and how many objects? 200 + count = yes; 500 "not found" = no.
-EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF X x IS X), 0);
-// shorthand: RETURN OVERRIDE (GROUP SUM 1 IF X x IS X), 0;
+RETURN OVERRIDE (GROUP SUM 1 IF X x IS X), 0;
 
 // Does property p(Class) exist, and on how many objects is it set?
-EXPORT FROM res = STRING((OVERRIDE (GROUP SUM 1 IF p(Class c)), 0)) + ' / ' +
-                  STRING((OVERRIDE (GROUP SUM 1 IF c IS Class), 0));
+RETURN STRING((OVERRIDE (GROUP SUM 1 IF p(Class c)), 0)) + ' / ' +
+       STRING((OVERRIDE (GROUP SUM 1 IF c IS Class), 0));
 
 // First 5 names from class X (sample). ORDER by the PROPERTY, not the alias:
 // ORDER nm compiles but fails at runtime with a misleading
-// "Set operations is invalid" 500.
-EXPORT JSON FROM nm = name(X x) ORDER name(x) TOP 5;
+// "Set operations is invalid" 500. No rows -> empty body (an empty JSON is NULL).
+RETURN JSON FROM nm = name(X x) ORDER name(x) TOP 5;
 
 // Module loaded? Reference an element only that module defines — a class
 // works best: 200 = loaded, 500 "not found" = not in the running config.
-EXPORT FROM cnt = (OVERRIDE (GROUP SUM 1 IF Task t IS Task), 0);   // probes the Task module
+RETURN OVERRIDE (GROUP SUM 1 IF Task t IS Task), 0;   // probes the Task module
 ```
 
 (For the `Eval` module specifically no probe is needed — a working
@@ -586,16 +610,9 @@ when the script *compiled and ran* — but a failed `APPLY` (constraint
 violation, missing required field, etc.) cancels silently and returns the
 same 200 with an empty body. Make every mutation script self-checking; no
 `NEWSESSION` wrapper is needed (an eval call already runs in its own
-session) — and with `EXPORT` it would even *break* the readback (see the
-note in "Getting values back"):
+session):
 
 ```lsf
-// with EXPORT:
-// ... NEW / assignments ...
-APPLY;
-EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');
-
-// alternative with RETURN:
 // ... NEW / assignments ...
 APPLY;
 IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message');

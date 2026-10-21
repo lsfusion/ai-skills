@@ -163,7 +163,7 @@ Then verify against the live server and your local source (see the **lsfusion-ev
 
   ```bash
   curl -s -u admin: -X POST https://<host>/eval/action \
-    --data-urlencode 'script=EXPORT FROM n = STRING(GROUP SUM 1 IF <AppClass> o IS <AppClass>);'
+    --data-urlencode 'script=RETURN OVERRIDE (GROUP SUM 1 IF <AppClass> o IS <AppClass>), 0;'
   ```
 
 - **`/files/*`** source API on the web port — list/read the `.lsf` actually deployed on the running server.

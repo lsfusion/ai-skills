@@ -1215,22 +1215,25 @@ checking the unit-test output.
    canonical recipes are in the lsfusion-eval skill** ("Getting values
    back", "Chaining and verifying"). In short: `RETURN <expr>;` sends a
    scalar back in the response body (for **several** values give each its
-   own `EXPORT FROM a = ..., b = ...` column rather than concatenating one
-   `RETURN` — string `+` propagates NULL, so one NULL operand blanks the
-   whole body, while a NULL EXPORT column just drops out of the JSON), a
+   own column of `RETURN JSON FROM a = ..., b = ...` rather than
+   concatenating one string — `+` propagates NULL, so one NULL operand
+   blanks the whole body, while a NULL column just drops out of the JSON;
+   don't answer with a bare `EXPORT` — it reaches the body only when the
+   action has no `RETURN` with a value, and is lost in `NEWSESSION` /
+   after `APPLY`), a
    plain `MESSAGE` is visible **nowhere** over HTTP (not in the response
    and not in the server log — only `MESSAGE ... NOWAIT` leaves a
    `Server message:` log line), and a constraint-canceled `APPLY`
    returns the **same empty 200 as success** — so end every mutation script
-   with a top-level self-check (no `NEWSESSION` wrapper), e.g.
-   `APPLY; EXPORT FROM res = (OVERRIDE 'CANCELED: ' + applyMessage(), 'OK');`.
+   with a self-check, e.g.
+   `APPLY; IF canceled() THEN RETURN 'CANCELED: ' + (OVERRIDE applyMessage(), 'no message'); RETURN 'OK';`.
    The `api` command adds two safety nets of its own: it prints a
    recipe hint whenever the body comes back empty (the full
    explanation once per session, a recipe one-liner on later calls), and it
    tails the server log for `Server message:` lines after every call —
    which surfaces `MESSAGE ... NOWAIT` output and the constraint text a
    canceled `APPLY` logs, but **cannot rescue a plain `MESSAGE`** (no
-   `NOWAIT` → no log line → nothing to tail; use `RETURN`/`EXPORT` for
+   `NOWAIT` → no log line → nothing to tail; use `RETURN` for
    anything you need to read back).
 
    **The `Server message:` log line is a no-client-context behavior — not a

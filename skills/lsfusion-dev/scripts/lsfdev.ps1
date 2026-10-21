@@ -4600,7 +4600,7 @@ function Cmd-Api {
         }
         Ok "HTTP $($resp.StatusCode)"
         # Decode the response body explicitly as UTF-8 so non-ASCII output
-        # (e.g. EXPORT FROM with Cyrillic values) prints correctly.
+        # (e.g. RETURN JSON FROM with Cyrillic values) prints correctly.
         $bytes = $resp.RawContentStream.ToArray()
         if ($bytes.Length) { Write-Host ([System.Text.Encoding]::UTF8.GetString($bytes)) }
         else {
@@ -4615,20 +4615,21 @@ function Cmd-Api {
                 (((Get-Date) - (Get-Item $hintMarker).LastWriteTime).TotalHours -lt 6)
             if ($explained) {
                 Info "(empty response body - carries no proof; a plain MESSAGE is invisible over HTTP; a concatenated"
-                Info " RETURN blanks when ANY operand is NULL - prefer EXPORT FROM columns or OVERRIDE each operand."
+                Info " RETURN blanks when ANY operand is NULL - prefer RETURN JSON FROM columns or OVERRIDE each operand."
                 Info " For mutations, end the script with: $recipe)"
             } else {
-                Info "(empty response body - normal for actions without RETURN/EXPORT, but carries no proof either:"
+                Info "(empty response body - normal for actions without a RETURN value, but carries no proof either:"
                 Info " a plain MESSAGE (no NOWAIT) is visible NOWHERE over HTTP - not here and not in the server"
                 Info " log, so the log tail below cannot surface it either; only MESSAGE ... NOWAIT leaves a log"
                 Info " line. A constraint-canceled APPLY still answers 200."
                 Info " If the script DID have a RETURN: a concatenated RETURN goes empty when ANY operand is NULL"
-                Info " (string + propagates NULL) - give each value its own EXPORT FROM column (a NULL column just"
+                Info " (string + propagates NULL) - give each value its own RETURN JSON FROM column (a NULL column just"
                 Info " drops out of the JSON while the rest survive), or wrap every operand in OVERRIDE ..., 0/''."
-                Info " Also: EXPORT must be at the TOP LEVEL - its result is a session-local property, so inside"
-                Info " NEWSESSION{} it is discarded with the session and never reaches the HTTP response (RETURN is"
-                Info " fine inside NEWSESSION - it propagates up the stack - but an /eval/action script already runs"
-                Info " in its own session, so no NEWSESSION wrapper is needed anyway)."
+                Info " A RETURN JSON FROM with no matching rows (or only NULL values) is NULL too - an empty JSON is"
+                Info " NULL; use OVERRIDE (JSON FROM ...), JSON('[]') when an empty list must come back as []."
+                Info " A bare EXPORT (no TO) is not a way to answer: it reaches the body only when the action has no"
+                Info " RETURN with a value, and inside NEWSESSION{} or before an APPLY it is dropped - return the"
+                Info " value with RETURN (EXPORT ... TO f; RETURN f(); for CSV/XML/... files)."
                 Info " For mutations, end the script with: $recipe)"
             }
             New-Item -ItemType File -Force -Path $hintMarker | Out-Null
@@ -4645,7 +4646,7 @@ function Cmd-Api {
         if ($webEx -and $webEx.Status -eq [System.Net.WebExceptionStatus]::Timeout) {
             Bad "No HTTP response within $httpTimeout s - the CLIENT gave up waiting; this says nothing about the server."
             Warn "The action is likely STILL RUNNING and may yet finish and APPLY its changes. Do not treat this as failure, do not restart the server, and do NOT re-run a mutation script unchecked - it could apply twice."
-            Info "Check first: 'lsfdev.ps1 log' until the action finishes, then re-read state with a read-only api call (RETURN/EXPORT). For long actions pass -Timeout <seconds> (bounds this HTTP wait); raise the outer tool-call timeout to match."
+            Info "Check first: 'lsfdev.ps1 log' until the action finishes, then re-read state with a read-only api call (RETURN). For long actions pass -Timeout <seconds> (bounds this HTTP wait); raise the outer tool-call timeout to match."
             Info "Exit code will be 3: NO VERDICT (client timeout) - distinct from 1 (request failed) exactly so automation cannot misread it either way."
             $apiFail = 3
         } else {
