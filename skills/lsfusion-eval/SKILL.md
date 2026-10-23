@@ -1,22 +1,20 @@
 ---
 name: lsfusion-eval
 description: >-
-  Run lsFusion code against a running server (local dev install or deployed
-  production) and inspect what code is actually loaded on that server. Triggers
-  whenever the user wants to: evaluate an lsFusion expression or run a script
-  via HTTP (/exec, /eval, /eval/action endpoints), call a project action by
-  name remotely, check that a class / property / form / module exists in the
-  running config, count or sample data through the lsFusion layer instead of
-  hitting PostgreSQL directly, or read / grep the `.lsf` sources that are
-  actually deployed on a remote host (via the `/files/*` API on the running
-  web port). Use this skill any time the task is "ask the server" rather
-  than "edit code locally" — it's the canonical way to verify
-  remote-server state before changing things, debug what's actually running,
-  and answer "is the schema in sync with the source I have?". Triggers on
-  phrases like "call action via HTTP", "/eval", "eval/action", "run lsfusion
-  script remotely", "check what's on the server", "what logic is running on
-  the server", "look at .lsf on the server", "count via API", "API check",
-  "verify class/property on the server".
+  Run lsFusion code against a running server (local dev or deployed production)
+  and inspect what code is actually loaded there. Use when the user wants to:
+  evaluate an lsFusion expression or run a script via HTTP (/exec, /eval,
+  /eval/action), call a project action by name remotely, check that a class /
+  property / form / module exists in the running config, count or sample data
+  through the lsFusion layer instead of PostgreSQL directly, or read / grep the
+  `.lsf` sources deployed on a remote host (the `/files/*` API on the web port).
+  Use it when the task is "ask the server" rather than "edit code locally": the
+  canonical way to verify server state before changing things, debug what's
+  actually running, and answer "is the schema in sync with my source?". Triggers
+  on "call action via HTTP", "/eval", "eval/action", "run lsfusion script
+  remotely", "check what's on the server", "what logic is running on the
+  server", "look at .lsf on the server", "count via API", "API check", "verify
+  class/property on the server".
 ---
 
 # lsFusion HTTP Action API & remote-install introspection
