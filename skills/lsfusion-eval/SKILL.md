@@ -517,7 +517,12 @@ RETURN f();
 The response then carries the file with the content type of its extension
 (`text/csv` here) — the same body a bare `EXPORT` gives. Likewise,
 `EXPORT JSON FROM ... TO f; RETURN f();` returns JSON byte for byte as exported
-(key order kept, `[]` for no rows).
+(key order kept, `[]` for no rows). The two paths differ on strings, though:
+`EXPORT JSON` writes a string value that starts and ends with a square or
+curly bracket as nested JSON if the value parses as JSON (`'[a, b]'` →
+`["a","b"]`), while `JSON FROM` keeps it a string
+(`"[a, b]"`), so a value read through `RETURN JSON FROM` can differ from what
+the application's own `EXPORT JSON` sends.
 
 **A missing JSON key means NULL, not a failed export.** `JSON FROM` (like
 `EXPORT JSON`) simply **omits** a key whose value is NULL for that object:
