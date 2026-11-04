@@ -1137,38 +1137,80 @@ Treat it as a fast probe, not a gate: the moment it answers `[SKIP]` /
 prints, not another precheck round — and never read that summary as a
 failure of the code.
 
-**Web resources (JS / CSS / images) need NO restart in devmode — any page
-load picks them up; browser cache is NOT a factor.** Files under
-`src/main/resources/**` that the browser fetches — `CUSTOM`-component
-`.js`/`.jsx`/`.css` (registered via `onWebClientInit`, or auto-loaded from
-`web/init/`), icons, web assets — are served
-live from source: on every page load the devmode server re-reads them from
-`src/main/resources` and emits them under a content-hash URL
-(`/file/dev/...?version=<hash of the bytes>`) with `Cache-Control: no-store`,
-so the browser cannot hold a stale copy (verified: after a `.css` edit an
-ordinary reload — no hard-reload, no cache bypass — served the new bytes
-under a new `?version=`, server untouched). So after editing such a file,
-**do not `restart` — reload the page**: a default `verify` starts a fresh
-browser (always a reload); a `verify -Session` deliberately does NOT reload
-the live page — pass `-Reload`, or re-run your `-OpenScript` (it re-navigates
-anyway; see [references/verify.md](references/verify.md)). If an edit
-"doesn't apply", the page was not reloaded —
-don't chase cache theories and don't restart the server. A `restart` is only
-needed when you also changed the **`.lsf`** side (e.g. the `CUSTOM 'name'`
-declaration, new form properties/actions the JS calls, the `onWebClientInit`
-registration itself) — that's schema. Pure JS/CSS iteration is a sub-second
-reload loop, not a 30 s restart loop.
+**Web resources (JS / CSS / images) need NO restart — the next page load
+picks up a changed file; browser cache is NOT a factor.** The server reads
+`CUSTOM`-component `.js`/`.jsx`/`.css` (registered via `onWebClientInit`,
+or auto-loaded from `web/init/`) and other web assets from its
+**classpath** — the first match in classpath order, normally the staged
+copy under `target/classes/`, not your source file — keeps the bytes in
+memory, and a watcher on every classpath directory drops that copy the
+moment a file there changes; the next page load then gets the new bytes
+under a new content-hash URL (`/file/dev/...?version=<hash of the bytes>`
+in devmode, `/file/static/...` with devmode off; served
+`Cache-Control: no-store` on top), so the browser cannot hold a stale
+copy. Two kinds of asset live elsewhere and change only with a restart:
+the `IMAGE 'x.png'` icons of navigator elements, actions and containers
+(read once into the server's image cache, which that watcher does not
+touch), and — with devmode off only — the login-page resources of
+`onLoginInit` (the web client caches the server settings that carry them;
+`restart -Web` refreshes them). What carries your edit into
+`target/classes` is a second,
+**devmode-only** watcher that mirrors file changes under
+`src/main/resources/**` and `src/main/lsfusion/**` into the build directory
+— every file with an extension other than `.lsf`; extension-less names,
+`~` backups and `.tmp.<hex>` editor temp files are skipped — active only
+while that Maven layout exists, i.e. at least one of those two source roots
+next to `target/classes`, which is exactly the layout `start-server`
+builds `target/classes` from (measured: a saved `.css` or `.jrxml` is in
+`target/classes` within seconds). `start-server` / `restart` print which
+case you are in (`Source mirroring ON` / `OFF`). Four gaps: a **flat
+project** (loose `.lsf` files in the project root) stages only those
+`.lsf`/`.properties` — no web resource or `.jrxml` reaches the classpath at
+all — so move the WHOLE project to the Maven layout (`.lsf` →
+`src/main/lsfusion/`, `lsfusion.properties` and web assets →
+`src/main/resources/`; creating either source root switches the root-file
+fallback off, so a half-moved project loses its modules); with **devmode
+off** (`-NoDevMode`) nothing is mirrored — edit the staged copy under
+`target/classes/` (picked up on the next load; a non-Maven `restart` wipes
+and re-stages `target/classes` from source, while Maven's incremental
+`mvn compile` keeps a staged file that is newer than its source and the
+staged copies of sources you deleted or renamed — stop the server, `mvn
+clean`, start to reset it) or `restart`; and a **folder
+created after the server started** is neither mirrored nor watched (a
+folder name has no extension) — the first file of a new `web/init/` needs
+one `restart`; and **compiled web sources** (`src/main/web/**`, bundled by
+the platform parent POM's `web-compile` plugin into `web/.compiled/*.js`
+and `.css` at build time) are not mirrored at all — in Maven mode a
+`restart` rebuilds them (`mvn compile`), and the non-Maven staging never
+compiles them, so such a project needs Maven on `PATH`. So after editing
+a copied file, **do not `restart` — reload
+the page**: a default `verify` starts a fresh browser (always a reload); a
+`verify -Session` deliberately does NOT reload the live page — pass
+`-Reload`, or re-run your `-OpenScript` (it re-navigates anyway; see
+[references/verify.md](references/verify.md)). If an edit "doesn't apply",
+check, in this order, and never the browser cache: whether the file is on
+the classpath at all and which copy you edited (mirroring OFF: only the
+classpath copy counts, normally `target/classes`); whether the copy in
+`target/classes` already equals your source — the mirror is asynchronous
+(seconds), and a copy that failed is logged once in the server log as
+`FilesChangeWatcher processFile error` and not retried, so save the file
+again; whether the page was actually reloaded; whether the file sits in a
+folder created since the last start. Apart from that new-folder case, a
+`restart` is only needed when you also changed the **`.lsf`** side (e.g.
+the `CUSTOM 'name'` declaration, new form properties/actions the JS calls,
+the `onWebClientInit` registration itself) — that's schema. Pure JS/CSS
+iteration is a reload loop of seconds, not a 30 s restart loop.
 
-**Report templates (`.jrxml`) — NO restart in devmode; iterate via
-`target/classes`.** Like JS/CSS web resources, JasperReports templates are
-read from the classpath at print time, so in devmode they are re-read live —
-no server restart needed. The catch: `start-server` stages
-`src/main/resources/**` into `target/classes/` only at startup, so editing
-`src/main/resources/<name>.jrxml` alone does not take effect until the next
-restart. To iterate without restarting, edit the staged copy
-`target/classes/<name>.jrxml` directly and re-print; once the layout is
-right, mirror it back to `src/main/resources/<name>.jrxml` (the source of
-truth) so a later restart doesn't overwrite your work.
+**Report templates (`.jrxml`) follow the same rule — NO restart.**
+JasperReports templates are read from the classpath at print time (the
+bytes are not cached), so the next `PRINT` — not a page reload — uses the
+edited template, via the same mirroring: in devmode with the Maven layout,
+editing `src/main/resources/<name>.jrxml` is enough (give the mirror its
+seconds); with devmode off edit the staged `target/classes/<name>.jrxml`
+and re-print, then copy the finished layout back into your source tree
+(the staged copy is not the source of truth: a non-Maven `restart`
+overwrites it, Maven's incremental compile keeps whichever file is newer);
+a flat project stages no `.jrxml` at all.
 
 The lsfusion-eval skill talks to the live server's HTTP endpoints
 (`/exec`, `/eval`, `/eval/action`) and accepts arbitrary

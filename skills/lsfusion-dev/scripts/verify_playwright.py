@@ -1233,7 +1233,9 @@ def main() -> int:
                          "the page is already on the app. A page load is what "
                          "picks up JS/CSS edits in devmode (resources are "
                          "served no-store under a content-hash ?version=, so "
-                         "an ordinary reload always fetches fresh bytes) - but "
+                         "an ordinary reload always fetches the server's "
+                         "current bytes - once the edit reached "
+                         "target/classes) - but "
                          "it also boots a new server-side navigator, closing "
                          "open forms. No-op without --session-port (a "
                          "throwaway browser always navigates).")
@@ -1493,7 +1495,8 @@ def main() -> int:
                 # /login, a stuck /eval/action error page, a foreign site) is
                 # not a continuable app page and is navigated away from.
                 # --reload forces the navigation (that is how JS/CSS edits are
-                # picked up; devmode serves them fresh on every page load).
+                # picked up - a load fetches the server's current classpath
+                # copy, which devmode mirrors from the sources within seconds).
                 def _on_app_page(cur: str, base: str) -> bool:
                     cur = cur.split("#")[0]
                     if not cur.startswith(base):

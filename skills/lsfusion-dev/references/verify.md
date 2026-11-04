@@ -344,8 +344,11 @@ error: … '<fn>' is not a component`) plus what it means: the component
 function never got defined, so every form using it renders an **empty
 custom container** — the typical broken-custom-view signature; that
 blank area on the screenshot is this failure, not a layout or data
-problem. Fix the `.jsx` at the reported position and re-run — web
-resources are picked up on the next page load, no restart. Since these
+problem. Fix the `.jsx` at the reported position and re-run — once the
+devmode mirror has copied the saved file into `target/classes` (seconds),
+the next page load picks it up, no restart; the web-resources note in
+SKILL.md step 4 has the cases where it does not (flat project, devmode
+off, a folder created after start). Since these
 lines alone don't flip the exit code, **pair the run with an assertion
 on content the view renders** (`-OpenExpect`, or `-Do
 "assert-text:..."`) when a broken custom view must fail the batch.
@@ -391,9 +394,11 @@ call **never reloads or re-navigates it implicitly**. So: navigate once
 (`verify -Session -OpenScript "SHOW ...;"` or `-Click "Расписание"`), then
 iterate cheaply (`verify -Session -Do "drag:..."`, look at `verify-do.png`,
 adjust, run again). Two consequences of "the page lives on":
-- **Edited JS/CSS are not picked up** until the page reloads (they are
-  fresh on *every* load — see the web-resources note in step 4 — but an
-  un-reloaded page keeps the code it already runs). Pass `-Reload` to
+- **Edited JS/CSS are not picked up** until the page reloads (a load
+  fetches the server's current classpath copy — normally `target/classes`
+  — under a new content-hash URL; the web-resources note in step 4 says
+  how your edit gets there and when it does not — but an un-reloaded page
+  keeps the code it already runs). Pass `-Reload` to
   force a fresh page, or simply re-run the `-OpenScript` call — it
   re-navigates, so one call both reloads the code and reopens the form.
 - Any reload/navigation **resets the app to its default state** (the web

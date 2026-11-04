@@ -108,13 +108,20 @@ through two paths and bail out with *"module 'X' has already been added"*.
   `src/main/java/**` Java sources with `javac -d target/classes`, and
   launches Java with classpath `target\classes;<server jar>`. The
   `lsfusion-server-<ver>.jar` downloaded by `setup` provides the
-  built-in `System` modules.
+  built-in `System` modules. In devmode the server then keeps
+  `target/classes` in step with `src/main/resources` and
+  `src/main/lsfusion` by itself (file edits mirrored within seconds — not
+  a new folder, not `.lsf`), so a JS/CSS/`.jrxml` edit needs no restart:
+  the web-resources note in SKILL.md step 4.
 
 - **Flat project (no `src/main/*`)** — the non-Maven branch still stages
   to `target/classes`: it picks up loose `*.lsf` files and any
   `*.properties` other than `settings.properties` from the project root
   and copies them in. The same `target\classes;<server jar>` classpath
-  is used. This is the path for ad-hoc single-file experiments.
+  is used. This is the path for ad-hoc single-file experiments. Nothing
+  else is staged — a `web/init/` or a `.jrxml` in a flat project never
+  reaches the classpath; move the whole project to the Maven layout for
+  those (creating either `src/main/*` root switches this fallback off).
 
 The `clone` command does not change this — it just places the repo under the
 project folder; the Maven-vs-fallback choice happens at `setup` / `start-server`

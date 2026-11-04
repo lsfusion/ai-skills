@@ -2024,6 +2024,44 @@ function Cmd-StartServer {
             Info "One-shot JVM args (this run only, not persisted): $($oneShotJvm -join ' ')"
         }
     }
+    # Which copy of a web resource / .jrxml the running server reads, said
+    # up front so nobody guesses: the server reads them from its classpath
+    # (target\classes) and drops its in-memory copy whenever a file in a
+    # classpath directory changes (every mode). In devmode it ALSO mirrors
+    # file edits under src\main\resources and src\main\lsfusion (files with
+    # an extension other than .lsf) into the build directory - but only
+    # while at least one of those roots exists next to target\classes, the
+    # layout Build-ServerClasspath stages; the flat fallback stages only
+    # root .lsf / .properties, so a flat project has no web resources on
+    # the classpath at all. A folder created after this start is not
+    # watched in any mode (restart once). Devmode is judged like the JVM
+    # does - by the LAST -Dlsfusion.server.devmode on the command line, so
+    # a persisted or one-shot -JvmArgs value overrides $devMode here.
+    $mirrorRoots = @(@("src\main\resources", "src\main\lsfusion") | Where-Object { Test-Path (Join-Path $ProjectDir $_) })
+    $effectiveDevMode = $devMode
+    foreach ($a in $extraJvm) {
+        # java.exe's argv parser strips double quotes ("-Dx=y" and -Dx="y"
+        # both reach the JVM as -Dx=y); a property NAME is case-sensitive in
+        # Java, the VALUE is lowercased before its "true" test.
+        $arg = "$a" -replace '"', ''
+        if ($arg -cmatch '^-Dlsfusion\.server\.devmode(?:=(.*))?$') { $effectiveDevMode = ("$($Matches[1])" -eq 'true') }
+    }
+    if (-not $mirrorRoots.Count) {
+        if ($mode.UseMaven) {
+            # A Maven project may keep its modules in dependencies and hold
+            # only src\main\web (compiled bundles) locally: mvn compile still
+            # fills target\classes, so this is not the flat fallback.
+            Info "Source mirroring OFF (neither src\main\resources nor src\main\lsfusion exists - nothing for the server to mirror): the classpath is what mvn compile built into target\classes - edit the staged copy (web resources live on the next page load, .jrxml on the next PRINT) or restart to rebuild (compiled src\main\web bundles included)."
+        } else {
+            Info "Source mirroring OFF (flat project - no src\main\resources or src\main\lsfusion: only root *.lsf / *.properties are staged, no web resources / .jrxml at all): move the whole project to the Maven layout (.lsf -> src\main\lsfusion, lsfusion.properties + web assets -> src\main\resources) and restart - creating either root switches the root-file fallback off."
+        }
+    } elseif (-not $effectiveDevMode) {
+        $why = if ($devMode) { "devmode off via -Dlsfusion.server.devmode in the JVM args" } else { "devmode off" }
+        $restage = if ($mode.UseMaven) { "a restart's incremental mvn compile keeps a staged file that is newer than its source and the copies of deleted/renamed sources - stop, mvn clean, start resets it" } else { "the next restart wipes and re-stages target\classes from source" }
+        Info "Source mirroring OFF ($why): web resources / .jrxml are read from target\classes - edit the staged copy (web resources live on the next page load, .jrxml on the next PRINT; $restage) or restart. IMAGE icons (navigator / action / container, cached by the server) need a restart; login-page resources (onLoginInit) are cached by the web client while devmode is off - restart -Web refreshes them."
+    } else {
+        Info "Source mirroring ON: the server copies file edits under $($mirrorRoots -join ' / ') into target\classes (seconds) - web resources are live on the next page load, .jrxml on the next PRINT; a NEW folder, IMAGE icons (navigator / action / container, cached by the server) and compiled src\main\web sources (Maven web-compile bundles) need a restart."
+    }
     Show-LocaleAdvice $cfg -Brief
     $jvmArgs = @() + (Add-Opens $java.Major) + $devArgs + $dbArgs + @(
         "-Xmx2g", "-Dfile.encoding=UTF-8") + $extraJvm + @(
@@ -3439,7 +3477,7 @@ function Cmd-Verify {
         }
     }
     if ($sawJsxFail) {
-        Info "A broken .jsx is served as that console-error stub INSTEAD of its script, so the component function never gets defined and every form using it renders an EMPTY custom container (short inline error in it) - that blank area on the screenshot is THIS failure, not a layout or data problem. Fix the .jsx at the position in the message and re-run: devmode serves web resources fresh on every page load, no restart needed."
+        Info "A broken .jsx is served as that console-error stub INSTEAD of its script, so the component function never gets defined and every form using it renders an EMPTY custom container (short inline error in it) - that blank area on the screenshot is THIS failure, not a layout or data problem. Fix the .jsx at the position in the message and re-run once the fix reached the server's classpath copy - devmode mirrors src\main\resources into target\classes within seconds (see the 'Source mirroring' line start-server printed; a copy that failed is logged once as 'FilesChangeWatcher processFile error' in the server log and not retried - save the file again); no restart needed."
     } elseif ($sawNotComponent) {
         Info "The named function is not a drawable component on this page: typo in the .lsf 'custom'/CUSTOM name, the defining web resource not loaded/registered, or its script died earlier (then the cause is usually a line above or in $($r.artifacts.console)). The affected container renders EMPTY except a short inline error."
         if ($pgErrs.Count) {
@@ -5133,12 +5171,16 @@ Common options:
                         stop/restart also close it. -Locale has no effect on
                         an existing session.
   -Reload               'verify -Session' only: force a page reload before the
-                        steps - the reloaded page fetches fresh JS/CSS (devmode
-                        serves web resources no-store with a content-hash URL,
-                        so an ordinary reload is always enough) but the app
-                        resets to its default state: open forms close (reopen
-                        in the same call via -OpenScript). Without -Session
-                        every verify starts a fresh browser anyway.
+                        steps - the reloaded page fetches fresh JS/CSS (a
+                        changed web resource gets a new content-hash URL and
+                        is served no-store, so an ordinary reload is always
+                        enough - provided the edit reached the server's
+                        classpath copy, normally target\classes: see the
+                        'Source mirroring' line start-server prints)
+                        but the app resets to its default state: open forms
+                        close (reopen in the same call via -OpenScript).
+                        Without -Session every verify starts a fresh browser
+                        anyway.
   -EndSession           'verify' only: close the persistent session browser.
   -CdpPort <port>       'verify -Session' only: override the derived CDP port.
   -ViewportWidth/-ViewportHeight
