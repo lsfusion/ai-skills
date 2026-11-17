@@ -80,7 +80,7 @@ The `skills/` folder follows the open Agent Skills format, so it works anywhere:
 
 - **Claude Code (manual):** copy a skill folder into `~/.claude/skills/` (global) or
   `.claude/skills/` (per project). Add the MCP server separately with
-  `claude mcp add --transport http lsfusion-ai https://ai.lsfusion.org/mcp`.
+  `claude mcp add --transport http lsfusion-ai "https://ai.lsfusion.org/mcp?via=dev&with=skills"`.
 - **Claude.ai / Claude Desktop:** zip a skill folder and upload it under
   Settings → Capabilities → Skills.
 - **Claude API / Agent SDK:** mount the skill folder into the agent's working directory.

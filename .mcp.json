@@ -2,7 +2,7 @@
   "mcpServers": {
     "lsfusion-ai": {
       "type": "http",
-      "url": "https://ai.lsfusion.org/mcp"
+      "url": "https://ai.lsfusion.org/mcp?via=dev&with=skills"
     }
   }
 }
